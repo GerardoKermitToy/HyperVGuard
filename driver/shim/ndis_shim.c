@@ -7,6 +7,7 @@
 
 #define TAG 'gVHH'
 #define MAX_TOKENS 2048
+#define MAX_EVENT_POOL_BYTES (16u * 1024u * 1024u)
 #define VERSION_IOCTL CTL_CODE(40000, 0x800, METHOD_BUFFERED, FILE_READ_DATA | FILE_WRITE_DATA)
 #define SHUTDOWN_IOCTL CTL_CODE(40000, 0x801, METHOD_BUFFERED, FILE_READ_DATA | FILE_WRITE_DATA)
 
@@ -58,6 +59,7 @@ static BOOLEAN Stopping;
 static KTIMER Timer;
 static KDPC TimerDpc;
 static volatile LONG64 NextAdapter;
+static volatile LONG64 EventPoolBytes;
 static NDIS_STRING Friendly = RTL_CONSTANT_STRING(L"HyperV Guard Rust Host Adapter LWF");
 static NDIS_STRING Unique = RTL_CONSTANT_STRING(L"{6E76EAD1-7BCB-49C4-9547-D3E6B3488F71}");
 static NDIS_STRING ServiceName = RTL_CONSTANT_STRING(L"HyperVGuard");
@@ -85,6 +87,29 @@ ULONG_PTR hv_lock(void) {
 }
 void hv_unlock(ULONG_PTR irql) { KeReleaseSpinLock(&PolicyLock, (KIRQL)irql); }
 UINT64 hv_now(void) { return KeQueryInterruptTime() / 10000; }
+void* hv_allocate(SIZE_T size) {
+    LONG64 used;
+    void* data;
+    if (size == 0 || size > MAX_EVENT_POOL_BYTES) return NULL;
+    used = InterlockedCompareExchange64(&EventPoolBytes, 0, 0);
+    for (;;) {
+        LONG64 previous;
+        if (used > MAX_EVENT_POOL_BYTES - (LONG64)size) return NULL;
+        previous = InterlockedCompareExchange64(&EventPoolBytes, used + (LONG64)size, used);
+        if (previous == used) break;
+        used = previous;
+    }
+    data = ExAllocatePool2(POOL_FLAG_NON_PAGED | POOL_FLAG_UNINITIALIZED, size, TAG);
+    if (data == NULL) InterlockedAdd64(&EventPoolBytes, -(LONG64)size);
+    return data;
+}
+void hv_free(void* data, SIZE_T size) {
+    LONG64 remaining;
+    ExFreePoolWithTag(data, TAG);
+    remaining = InterlockedAdd64(&EventPoolBytes, -(LONG64)size);
+    NT_ASSERT(remaining >= 0);
+    UNREFERENCED_PARAMETER(remaining);
+}
 __declspec(noreturn) void hv_bugcheck(void) {
     KeBugCheckEx(DRIVER_VERIFIER_DETECTED_VIOLATION, 0x48565253, 0, 0, 0);
 }
@@ -548,7 +573,7 @@ NTSTATUS HvDispatch(PDEVICE_OBJECT device, PIRP irp) {
         } else if (stack->MajorFunction == IRP_MJ_DEVICE_CONTROL) {
             ULONG code = stack->Parameters.DeviceIoControl.IoControlCode;
             if (code == VERSION_IOCTL) {
-                static const UCHAR version[4] = {0,2,1,0};
+                static const UCHAR version[4] = {0,3,0,0};
                 if (stack->Parameters.DeviceIoControl.OutputBufferLength < sizeof(version)) status = STATUS_BUFFER_TOO_SMALL;
                 else {RtlCopyMemory(irp->AssociatedIrp.SystemBuffer, version, sizeof(version)); transferred = sizeof(version);}
             } else if (code == SHUTDOWN_IOCTL) HvDisconnect();
@@ -678,7 +703,7 @@ NTSTATUS hv_initialize(PDRIVER_OBJECT driver, PUNICODE_STRING registry) {
     c.Header.Revision = NDIS_FILTER_CHARACTERISTICS_REVISION_2;
     c.Header.Size = NDIS_SIZEOF_FILTER_DRIVER_CHARACTERISTICS_REVISION_2;
     c.MajorNdisVersion = 6; c.MinorNdisVersion = 40;
-    c.MajorDriverVersion = 0; c.MinorDriverVersion = 2;
+    c.MajorDriverVersion = 0; c.MinorDriverVersion = 3;
     c.FriendlyName = Friendly; c.UniqueName = Unique; c.ServiceName = ServiceName;
     c.AttachHandler = HvFilterAttach; c.DetachHandler = HvFilterDetach;
     c.RestartHandler = HvFilterRestart; c.PauseHandler = HvFilterPause;

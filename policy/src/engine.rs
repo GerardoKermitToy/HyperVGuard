@@ -1,11 +1,14 @@
 use crate::packet::{Flow, NdisPath, Packet};
+use alloc::vec::Vec;
 use core::fmt::{self, Write};
 use hyperv_protocol::{
-    Connection, Direction, MAX_RECORD, Verdict, encode_bandwidth, encode_connection, encode_log,
+    Connection, Direction, MAX_LOG_RECORD, MAX_PAYLOAD, MAX_RECORD, Verdict, connection_header_len,
+    encode_bandwidth, encode_connection_header, encode_log,
 };
 
 pub const MAX_PENDING: usize = 256;
 pub const MAX_EVENTS: usize = 512;
+pub const MAX_EVENT_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_CACHE: usize = 1024;
 pub const MAX_ADAPTERS: usize = 32;
 const WAYS: usize = 4;
@@ -110,22 +113,31 @@ impl Cached {
         expires: 0,
     };
 }
-#[derive(Clone, Copy)]
 struct Event {
-    len: u16,
-    read: u16,
+    read: usize,
     slot: u16,
     id: u64,
-    data: [u8; MAX_RECORD],
+    data: Vec<u8>,
 }
 impl Event {
     const EMPTY: Self = Self {
-        len: 0,
         read: 0,
         slot: NO_SLOT,
         id: 0,
-        data: [0; MAX_RECORD],
+        data: Vec::new(),
     };
+}
+
+// Only fallible allocation is used. In the driver the allocator enforces a
+// separate 16 MiB nonpaged budget, including records not yet in the event queue.
+pub fn allocate_record(len: usize) -> Option<Vec<u8>> {
+    if len > MAX_RECORD {
+        return None;
+    }
+    let mut data = Vec::new();
+    data.try_reserve_exact(len).ok()?;
+    data.resize(len, 0);
+    Some(data)
 }
 #[derive(Clone, Copy)]
 struct Bandwidth {
@@ -172,8 +184,8 @@ impl Stats {
     };
 }
 
-// All storage is fixed-size nonpaged .data in the driver. Callers serialize access
-// with one spin lock, but parsing and every NDIS call happen OUTSIDE that lock.
+// Metadata is fixed-size; queued records own bounded nonpaged allocations.
+// Parsing and full packet copies happen OUTSIDE the policy spin lock.
 pub struct Engine {
     adapters: [Adapter; MAX_ADAPTERS],
     pending: [Pending; MAX_PENDING],
@@ -182,6 +194,7 @@ pub struct Engine {
     bandwidth: [Bandwidth; MAX_BANDWIDTH],
     head: usize,
     count: usize,
+    queued_bytes: usize,
     next_id: u64,
     online: bool,
     fail_closed: bool,
@@ -204,10 +217,11 @@ impl Engine {
             }; MAX_ADAPTERS],
             pending: [Pending::EMPTY; MAX_PENDING],
             cache: [Cached::EMPTY; MAX_CACHE],
-            events: [Event::EMPTY; MAX_EVENTS],
+            events: [const { Event::EMPTY }; MAX_EVENTS],
             bandwidth: [Bandwidth::EMPTY; MAX_BANDWIDTH],
             head: 0,
             count: 0,
+            queued_bytes: 0,
             next_id: 1,
             online: false,
             fail_closed: false,
@@ -234,19 +248,44 @@ impl Engine {
     pub fn pending_count(&self) -> usize {
         self.pending.iter().filter(|p| p.id != 0).count()
     }
-    pub fn connect(&mut self) {
-        self.online = true;
+    fn clear_events(&mut self) {
+        for event in &mut self.events {
+            *event = Event::EMPTY;
+        }
         self.head = 0;
         self.count = 0;
+        self.queued_bytes = 0;
+    }
+    fn has_room(&self, len: usize) -> bool {
+        self.count < MAX_EVENTS && len <= MAX_EVENT_BYTES - self.queued_bytes
+    }
+    fn push_event(&mut self, data: Vec<u8>, slot: u16, id: u64) {
+        self.queued_bytes += data.len();
+        self.events[(self.head + self.count) % MAX_EVENTS] = Event {
+            read: 0,
+            slot,
+            id,
+            data,
+        };
+        self.count += 1;
+    }
+    fn pop_event(&mut self) {
+        self.queued_bytes -= self.events[self.head].data.len();
+        self.events[self.head] = Event::EMPTY;
+        self.head = (self.head + 1) % MAX_EVENTS;
+        self.count -= 1;
+    }
+    pub fn connect(&mut self) {
+        self.online = true;
+        self.clear_events();
         self.clear_cache();
         self.bandwidth.fill(Bandwidth::EMPTY);
-        self.log(3, "HyperVGuard LWF: PID=0; direction=0 outbound/1 inbound from guest side (host receive/send); no TID, redirects, UpdateV4/V6 or synthetic END");
+        self.log(3, "HyperVGuard LWF: full IP packets; no process ID; direction=0 outbound/1 inbound from guest side (host receive/send); no TID, redirects, UpdateV4/V6 or synthetic END");
     }
     // Complete actions using take_due() after dropping the lock.
     pub fn disconnect(&mut self) {
         self.online = false;
-        self.head = 0;
-        self.count = 0;
+        self.clear_events();
         self.clear_cache();
         self.bandwidth.fill(Bandwidth::EMPTY);
     }
@@ -369,6 +408,17 @@ impl Engine {
         self.stats.overflow = self.stats.overflow.saturating_add(1);
         self.stats.dropped = self.stats.dropped.saturating_add(1);
     }
+    // This is only an allocation/copy optimization, not a reservation. submit()
+    // rechecks session, epoch, cache and capacity after the unlocked packet copy.
+    pub fn wants_event(&self, key: &Key, packet: &Packet, now: u64) -> bool {
+        self.live(key)
+            && self.online
+            && (!packet.cacheable || self.cache_lookup(key, now).is_none())
+            && self
+                .has_room(connection_header_len(&packet.connection) + packet.payload_len as usize)
+            && self.pending_count() < MAX_PENDING
+            && self.next_id != u64::MAX
+    }
     pub fn submit(
         &mut self,
         key: Key,
@@ -376,6 +426,7 @@ impl Engine {
         token: usize,
         cancel: usize,
         now: u64,
+        record: Option<Vec<u8>>,
     ) -> Submission {
         self.stats.received = self.stats.received.saturating_add(1);
         let immediate = if !self.live(&key) {
@@ -398,8 +449,22 @@ impl Engine {
                 finish: if allow { Finish::Allow } else { Finish::Drop },
             });
         }
+        let payload_len = packet.payload_len as usize;
+        let expected = connection_header_len(&packet.connection) + payload_len;
+        if payload_len > MAX_PAYLOAD || record.as_ref().is_some_and(|data| data.len() != expected) {
+            self.stats.malformed = self.stats.malformed.saturating_add(1);
+            self.account(&packet, false);
+            return Submission::Finish(Action {
+                token,
+                finish: Finish::Drop,
+            });
+        }
         let slot = self.pending.iter().position(|p| p.id == 0);
-        if self.count == MAX_EVENTS || slot.is_none() || self.next_id == u64::MAX {
+        if !self.has_room(expected)
+            || slot.is_none()
+            || self.next_id == u64::MAX
+            || record.is_none()
+        {
             self.stats.overflow = self.stats.overflow.saturating_add(1);
             let finish = self.fallback();
             self.account(&packet, finish == Finish::Allow);
@@ -408,11 +473,8 @@ impl Engine {
         let slot = slot.unwrap_or(0);
         let id = self.next_id;
         self.next_id += 1;
-        let tail = (self.head + self.count) % MAX_EVENTS;
-        let event = &mut self.events[tail];
-        let len = encode_connection(&mut event.data, id, &packet.connection).unwrap_or(0);
-        // Parser-produced Connection always fits MAX_RECORD.
-        if len == 0 {
+        let mut data = record.unwrap_or_default();
+        if encode_connection_header(&mut data, id, &packet.connection, payload_len).is_err() {
             self.stats.malformed = self.stats.malformed.saturating_add(1);
             self.account(&packet, false);
             return Submission::Finish(Action {
@@ -420,11 +482,7 @@ impl Engine {
                 finish: Finish::Drop,
             });
         }
-        event.len = len as u16;
-        event.read = 0;
-        event.slot = slot as u16;
-        event.id = id;
-        self.count += 1;
+        self.push_event(data, slot as u16, id);
         self.pending[slot] = Pending {
             id,
             token,
@@ -507,33 +565,33 @@ impl Engine {
             let stale =
                 e.slot != NO_SLOT && e.read == 0 && self.pending[usize::from(e.slot)].id != e.id;
             if stale {
-                self.head = (self.head + 1) % MAX_EVENTS;
-                self.count -= 1;
+                self.pop_event();
                 continue;
             }
-            let n = (usize::from(e.len - e.read)).min(out.len() - written);
-            let start = usize::from(e.read);
-            out[written..written + n].copy_from_slice(&e.data[start..start + n]);
-            e.read += n as u16;
+            let n = (e.data.len() - e.read).min(out.len() - written);
+            out[written..written + n].copy_from_slice(&e.data[e.read..e.read + n]);
+            e.read += n;
             written += n;
-            if e.read == e.len {
-                self.head = (self.head + 1) % MAX_EVENTS;
-                self.count -= 1;
+            if e.read == e.data.len() {
+                self.pop_event();
             }
         }
         written
     }
     pub fn log(&mut self, severity: u8, message: &str) {
-        if !self.online || self.count == MAX_EVENTS {
+        if !self.online {
             return;
         }
-        let e = &mut self.events[(self.head + self.count) % MAX_EVENTS];
-        if let Ok(len) = encode_log(&mut e.data, severity, message) {
-            e.len = len as u16;
-            e.read = 0;
-            e.slot = NO_SLOT;
-            e.id = 0;
-            self.count += 1;
+        let mut bytes = [0; MAX_LOG_RECORD];
+        let Ok(len) = encode_log(&mut bytes, severity, message) else {
+            return;
+        };
+        if !self.has_room(len) {
+            return;
+        }
+        if let Some(mut data) = allocate_record(len) {
+            data.copy_from_slice(&bytes[..len]);
+            self.push_event(data, NO_SLOT, 0);
         }
     }
     fn bandwidth_add(&mut self, p: &Packet) {
@@ -570,18 +628,22 @@ impl Engine {
         }
     }
     pub fn bandwidth(&mut self) {
-        for b in &mut self.bandwidth {
-            if !b.active || self.count == MAX_EVENTS {
+        for i in 0..MAX_BANDWIDTH {
+            let b = self.bandwidth[i];
+            if !b.active {
                 continue;
             }
-            let e = &mut self.events[(self.head + self.count) % MAX_EVENTS];
-            if let Ok(n) = encode_bandwidth(&mut e.data, &b.connection, b.tx, b.rx) {
-                e.len = n as u16;
-                e.read = 0;
-                e.slot = NO_SLOT;
-                e.id = 0;
-                self.count += 1;
-                b.active = false;
+            let mut bytes = [0; MAX_LOG_RECORD];
+            let Ok(len) = encode_bandwidth(&mut bytes, &b.connection, b.tx, b.rx) else {
+                continue;
+            };
+            if !self.has_room(len) {
+                continue;
+            }
+            if let Some(mut data) = allocate_record(len) {
+                data.copy_from_slice(&bytes[..len]);
+                self.push_event(data, NO_SLOT, 0);
+                self.bandwidth[i].active = false;
             }
         }
     }
@@ -593,8 +655,10 @@ impl Engine {
         let s = self.stats;
         let _ = write!(
             text,
-            "HyperVGuard: fixed_bytes={} pending={}/{} cached={} rx={} allow={} drop={} queued={} cache_hits={} timeout={} overflow={} cancel={} invalidated={} malformed={} non_ip={}",
+            "HyperVGuard: fixed_bytes={} event_bytes={}/{} pending={}/{} cached={} rx={} allow={} drop={} queued={} cache_hits={} timeout={} overflow={} cancel={} invalidated={} malformed={} non_ip={}",
             core::mem::size_of::<Self>(),
+            self.queued_bytes,
+            MAX_EVENT_BYTES,
             self.pending_count(),
             MAX_PENDING,
             self.cache.iter().filter(|c| c.valid).count(),
@@ -639,7 +703,7 @@ impl Write for Text {
 mod tests {
     extern crate std;
     use super::*;
-    use std::boxed::Box;
+    use std::{boxed::Box, vec};
     fn engine() -> Box<Engine> {
         let mut e = Box::new(Engine::new());
         assert!(e.attach(1));
@@ -653,6 +717,7 @@ mod tests {
         p.flow.protocol = 17;
         p.connection.protocol = 17;
         p.ip_len = 100;
+        p.payload_len = 100;
         p
     }
     fn key(e: &Engine, vlan: u32) -> Key {
@@ -663,10 +728,13 @@ mod tests {
             ..Key::EMPTY
         }
     }
+    fn record(p: &Packet) -> Option<Vec<u8>> {
+        allocate_record(connection_header_len(&p.connection) + p.payload_len as usize)
+    }
     fn submit(e: &mut Engine, k: Key, t: usize) -> u64 {
         let mut p = packet();
         p.orient(k.path);
-        match e.submit(k, p, t, 42, 100) {
+        match e.submit(k, p, t, 42, 100, record(&p)) {
             Submission::Pending(id) => id,
             _ => panic!("expected pending"),
         }
@@ -684,7 +752,7 @@ mod tests {
             }
         );
         assert!(matches!(
-            e.submit(k, packet(), 12, 42, 102),
+            e.submit(k, packet(), 12, 42, 102, record(&packet())),
             Submission::Finish(Action {
                 finish: Finish::Allow,
                 ..
@@ -760,7 +828,7 @@ mod tests {
         assert_ne!(k.epoch, new_key.epoch);
         let _ = submit(&mut e, new_key, 2);
         assert!(matches!(
-            e.submit(k, packet(), 3, 42, 102),
+            e.submit(k, packet(), 3, 42, 102, record(&packet())),
             Submission::Finish(Action {
                 finish: Finish::Drop,
                 ..
@@ -807,13 +875,13 @@ mod tests {
         p.orient(NdisPath::Receive);
         assert_eq!(p.connection.direction, Direction::Outbound);
         assert!(matches!(
-            e.submit(receive, p, 1, 0, 100),
+            e.submit(receive, p, 1, 0, 100, record(&p)),
             Submission::Pending(_)
         ));
         p.orient(NdisPath::Send);
         assert_eq!(p.connection.direction, Direction::Inbound);
         assert!(matches!(
-            e.submit(send, p, 2, 0, 100),
+            e.submit(send, p, 2, 0, 100, record(&p)),
             Submission::Pending(_)
         ));
         assert_eq!(e.cancel(1, 0).unwrap().token, 2);
@@ -836,7 +904,7 @@ mod tests {
         e.take_due(2100);
         let n = e.read(&mut b);
         assert_eq!(prefix[0], 1);
-        assert_eq!(n, 37);
+        assert_eq!(n, 129);
         assert_eq!(u64::from_le_bytes(b[2..10].try_into().unwrap()), id);
     }
     #[test]
@@ -847,7 +915,7 @@ mod tests {
             let _ = submit(&mut e, k, i + 1);
         }
         assert!(matches!(
-            e.submit(k, packet(), 999, 42, 100),
+            e.submit(k, packet(), 999, 42, 100, record(&packet())),
             Submission::Finish(Action {
                 token: 999,
                 finish: Finish::Allow
@@ -861,16 +929,201 @@ mod tests {
         assert_eq!(e.pending_count(), 0);
     }
     #[test]
+    fn maximum_packets_survive_chunked_reads_and_timeout_without_truncation() {
+        for ipv6 in [false, true] {
+            let mut e = engine();
+            assert!(e.read(&mut [0; MAX_LOG_RECORD]) > 0);
+            let k = key(&e, 1);
+            let mut p = packet();
+            p.connection.ipv6 = ipv6;
+            p.payload_len = MAX_PAYLOAD as u32;
+            p.ip_len = p.payload_len;
+            p.cacheable = false;
+            let prefix = connection_header_len(&p.connection);
+            let mut data = record(&p).unwrap();
+            for (i, byte) in data[prefix..].iter_mut().enumerate() {
+                *byte = (i % 251) as u8;
+            }
+            let Submission::Pending(id) = e.submit(k, p, 7, 0, 100, Some(data)) else {
+                panic!("expected full-packet event");
+            };
+            assert_eq!(e.queued_bytes, prefix + MAX_PAYLOAD);
+            let mut chunk = vec![0; 65536];
+            let mut received = Vec::new();
+            assert_eq!(e.read(&mut chunk), chunk.len());
+            received.extend_from_slice(&chunk);
+            assert_eq!(e.take_due(2100).unwrap().token, 7);
+            loop {
+                let n = e.read(&mut chunk);
+                if n == 0 {
+                    break;
+                }
+                received.extend_from_slice(&chunk[..n]);
+            }
+            assert_eq!(received.len(), prefix + MAX_PAYLOAD);
+            assert_eq!(u64::from_le_bytes(received[5..13].try_into().unwrap()), id);
+            assert_eq!(received[13], 0);
+            assert_eq!(
+                u32::from_le_bytes(received[prefix - 4..prefix].try_into().unwrap()) as usize,
+                MAX_PAYLOAD
+            );
+            assert!(
+                received[prefix..]
+                    .iter()
+                    .enumerate()
+                    .all(|(i, b)| *b == (i % 251) as u8)
+            );
+            assert_eq!(e.queued_bytes, 0);
+            assert_eq!(e.count, 0);
+            assert_eq!(e.pending_count(), 0);
+        }
+    }
+    #[test]
+    fn unread_expired_full_packet_releases_its_queue_bytes() {
+        let mut e = engine();
+        e.read(&mut [0; MAX_LOG_RECORD]);
+        let k = key(&e, 1);
+        let mut p = packet();
+        p.payload_len = 70000;
+        let _ = e.submit(k, p, 9, 0, 100, record(&p));
+        assert!(e.queued_bytes > 65536);
+        assert_eq!(e.take_due(2100).unwrap().token, 9);
+        assert_eq!(e.read(&mut [0; 16]), 0);
+        assert_eq!(e.queued_bytes, 0);
+        assert_eq!(e.count, 0);
+    }
+    #[test]
+    fn event_byte_budget_falls_back_and_disconnect_frees_all_records() {
+        let mut e = engine();
+        e.read(&mut [0; MAX_LOG_RECORD]);
+        let k = key(&e, 1);
+        let mut p = packet();
+        p.payload_len = MAX_PAYLOAD as u32;
+        p.cacheable = false;
+        let size = connection_header_len(&p.connection) + MAX_PAYLOAD;
+        let mut tokens = 0;
+        while e.wants_event(&k, &p, 100) {
+            tokens += 1;
+            assert!(matches!(
+                e.submit(k, p, tokens, 0, 100, record(&p)),
+                Submission::Pending(_)
+            ));
+        }
+        assert_eq!(tokens, MAX_EVENT_BYTES / size);
+        assert_eq!(e.queued_bytes, tokens * size);
+        assert!(e.queued_bytes <= MAX_EVENT_BYTES);
+        assert_eq!(
+            e.submit(k, p, 999, 0, 100, record(&p)),
+            Submission::Finish(Action {
+                token: 999,
+                finish: Finish::Allow
+            })
+        );
+        assert_eq!(e.stats().overflow, 1);
+        e.disconnect();
+        assert_eq!(e.queued_bytes, 0);
+        assert_eq!(e.count, 0);
+        let mut released = 0;
+        while e.take_due(101).is_some() {
+            released += 1;
+        }
+        assert_eq!(released, tokens);
+    }
+    #[test]
+    fn missing_capture_uses_fallback_without_publishing_a_short_packet() {
+        for fail_closed in [false, true] {
+            let mut e = engine();
+            e.read(&mut [0; MAX_LOG_RECORD]);
+            e.configure(2000, 60000, fail_closed);
+            let k = key(&e, 1);
+            assert_eq!(
+                e.submit(k, packet(), 77, 0, 100, None),
+                Submission::Finish(Action {
+                    token: 77,
+                    finish: if fail_closed {
+                        Finish::Drop
+                    } else {
+                        Finish::Allow
+                    },
+                })
+            );
+            assert_eq!(e.pending_count(), 0);
+            assert_eq!(e.queued_bytes, 0);
+            assert_eq!(e.stats().overflow, 1);
+            assert_eq!(e.stats().malformed, 0);
+        }
+    }
+    #[test]
+    fn truncated_capture_is_dropped_not_encoded_as_a_complete_packet() {
+        let mut e = engine();
+        e.read(&mut [0; MAX_LOG_RECORD]);
+        let k = key(&e, 1);
+        let p = packet();
+        let mut data = record(&p).unwrap();
+        data.pop();
+        assert_eq!(
+            e.submit(k, p, 88, 0, 100, Some(data)),
+            Submission::Finish(Action {
+                token: 88,
+                finish: Finish::Drop
+            })
+        );
+        assert_eq!(e.pending_count(), 0);
+        assert_eq!(e.queued_bytes, 0);
+        assert_eq!(e.stats().malformed, 1);
+    }
+    #[test]
+    fn allocation_preflight_does_not_bypass_disconnect_or_invalidation() {
+        let mut e = engine();
+        let k = key(&e, 1);
+        let p = packet();
+        assert!(e.wants_event(&k, &p, 100));
+        let data = record(&p);
+        e.disconnect();
+        assert_eq!(
+            e.submit(k, p, 1, 0, 100, data),
+            Submission::Finish(Action {
+                token: 1,
+                finish: Finish::Allow
+            })
+        );
+        assert_eq!(e.queued_bytes, 0);
+        e.connect();
+        e.read(&mut [0; MAX_LOG_RECORD]);
+        assert!(e.wants_event(&k, &p, 100));
+        let data = record(&p);
+        e.invalidate(1, true);
+        assert_eq!(
+            e.submit(k, p, 2, 0, 100, data),
+            Submission::Finish(Action {
+                token: 2,
+                finish: Finish::Drop
+            })
+        );
+        assert_eq!(e.queued_bytes, 0);
+        assert_eq!(e.pending_count(), 0);
+    }
+    #[test]
+    fn pending_metadata_does_not_contain_packet_sized_arrays() {
+        assert!(core::mem::size_of::<Packet>() < 256);
+        assert!(core::mem::size_of::<Pending>() < 512);
+        assert!(core::mem::size_of::<Engine>() < 512 * 1024);
+        assert!(allocate_record(MAX_RECORD + 1).is_none());
+    }
+    #[test]
     fn uncacheable_fragments_always_request_even_permanent() {
         let mut e = engine();
         let k = key(&e, 1);
         let mut p = packet();
         p.cacheable = false;
-        let Submission::Pending(id) = e.submit(k, p, 1, 0, 0) else {
+        let Submission::Pending(id) = e.submit(k, p, 1, 0, 0, record(&p)) else {
             panic!()
         };
         e.verdict(id, Verdict::PermanentAccept, 1).unwrap();
-        assert!(matches!(e.submit(k, p, 2, 0, 2), Submission::Pending(_)));
+        assert!(matches!(
+            e.submit(k, p, 2, 0, 2, record(&p)),
+            Submission::Pending(_)
+        ));
     }
     #[test]
     fn ttl_expiry_requires_a_new_decision() {
@@ -879,14 +1132,14 @@ mod tests {
         let id = submit(&mut e, k, 1);
         e.verdict(id, Verdict::PermanentDrop, 101).unwrap();
         assert!(matches!(
-            e.submit(k, packet(), 2, 0, 60100),
+            e.submit(k, packet(), 2, 0, 60100, record(&packet())),
             Submission::Finish(Action {
                 finish: Finish::Drop,
                 ..
             })
         ));
         assert!(matches!(
-            e.submit(k, packet(), 3, 0, 60101),
+            e.submit(k, packet(), 3, 0, 60101, record(&packet())),
             Submission::Pending(_)
         ));
     }
@@ -898,7 +1151,7 @@ mod tests {
         let mut rx = tx;
         rx.orient(NdisPath::Send);
         rx.ip_len = 75;
-        let Submission::Pending(id) = e.submit(k, tx, 1, 0, 100) else {
+        let Submission::Pending(id) = e.submit(k, tx, 1, 0, 100, record(&tx)) else {
             panic!()
         };
         e.verdict(id, Verdict::Accept, 101).unwrap();
@@ -906,7 +1159,7 @@ mod tests {
             path: NdisPath::Send,
             ..k
         };
-        let Submission::Pending(id) = e.submit(inbound, rx, 2, 0, 102) else {
+        let Submission::Pending(id) = e.submit(inbound, rx, 2, 0, 102, record(&rx)) else {
             panic!()
         };
         e.verdict(id, Verdict::Accept, 103).unwrap();

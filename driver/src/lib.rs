@@ -6,9 +6,17 @@ compile_error!("Build the kernel driver with --release only.");
 #[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
 compile_error!("The driver supports Windows x64 only.");
 
-use core::{cell::UnsafeCell, ffi::c_void, panic::PanicInfo};
+extern crate alloc;
+
+use alloc::vec::Vec;
+use core::{
+    alloc::{GlobalAlloc, Layout},
+    cell::UnsafeCell,
+    ffi::c_void,
+    panic::PanicInfo,
+};
 use hyperv_policy::{
-    engine::{Action, Engine, Finish, Key, Submission},
+    engine::{Action, Engine, Finish, Key, Submission, allocate_record},
     packet::{self, NdisPath, Packet, SNAPSHOT},
 };
 use hyperv_protocol::{self as wire, Command};
@@ -23,6 +31,8 @@ unsafe extern "C" {
     fn hv_lock() -> usize;
     fn hv_unlock(irql: usize);
     fn hv_now() -> u64;
+    fn hv_allocate(size: usize) -> *mut u8;
+    fn hv_free(data: *mut u8, size: usize);
     fn hv_finish(token: usize, finish: u32);
     fn hv_first_nb(token: usize) -> Handle;
     fn hv_next_nb(nb: Handle) -> Handle;
@@ -38,6 +48,23 @@ unsafe extern "C" {
     ) -> u32;
     fn hv_bugcheck() -> !;
 }
+struct NonPagedAllocator;
+// SAFETY: the shim returns nonpaged pool aligned to at least 16 bytes and uses
+// atomic accounting to bound all live allocations, including unlocked captures.
+unsafe impl GlobalAlloc for NonPagedAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        if layout.align() > 16 {
+            return core::ptr::null_mut();
+        }
+        unsafe { hv_allocate(layout.size()) }
+    }
+    unsafe fn dealloc(&self, data: *mut u8, layout: Layout) {
+        unsafe { hv_free(data, layout.size()) }
+    }
+}
+#[global_allocator]
+static ALLOCATOR: NonPagedAllocator = NonPagedAllocator;
+
 struct State(UnsafeCell<Engine>);
 // The C shim initializes the spin lock before ANY callback or control device is
 // published. Every engine access is under it; no references escape with_state.
@@ -133,6 +160,35 @@ pub extern "C" fn HvCancel(id: u64, cancel: usize) {
     }
 }
 
+// The retained token keeps the first NB stable. Copy Ethernet+IP directly into
+// the record allocation; submit() overwrites Ethernet with the small wire prefix.
+// No packet-sized local arrays or NDIS buffer accesses under the policy lock.
+fn capture_packet(nb: Handle, token: usize, packet: &Packet) -> Result<Option<Vec<u8>>, ()> {
+    let layout = packet.capture_layout().ok_or(())?;
+    let Some(mut data) = allocate_record(layout.record_len) else {
+        return Ok(None);
+    };
+    let (mut copied, mut trusted, mut frame_len, mut offload) = (0, 0, 0, 0);
+    // SAFETY: the C caller owns this NB until HvClassify returns or publishes its
+    // pending token. The destination is an exclusively owned nonpaged allocation.
+    let ok = unsafe {
+        hv_snapshot(
+            nb,
+            token,
+            data[layout.frame_start..].as_mut_ptr(),
+            layout.frame_len as u32,
+            &mut copied,
+            &mut trusted,
+            &mut frame_len,
+            &mut offload,
+        )
+    };
+    if ok == 0 || copied as usize != layout.frame_len || trusted < copied || frame_len < copied {
+        return Err(());
+    }
+    Ok(Some(data))
+}
+
 // Return -1 if the engine now owns token; otherwise the caller finishes it after
 // releasing the per-module classification lock. No NDIS calls occur under the
 // global policy lock. Adapter/epoch identities never leave the driver.
@@ -208,6 +264,10 @@ pub extern "C" fn HvClassify(
                 }
                 saw_non_ip = true;
             }
+            Err(packet::ParseError::TooLarge) => {
+                with_state(|e| e.resource_drop());
+                return 1;
+            }
             Err(_) => {
                 with_state(|e| e.malformed());
                 return 1;
@@ -231,7 +291,19 @@ pub extern "C" fn HvClassify(
         vlan,
         flow: packet.flow,
     };
-    match with_state(|e| e.submit(key, packet, token, cancel, unsafe { hv_now() })) {
+    let wants_event = with_state(|e| e.wants_event(&key, &packet, unsafe { hv_now() }));
+    let record = if wants_event {
+        match capture_packet(unsafe { hv_first_nb(token) }, token, &packet) {
+            Ok(record) => record,
+            Err(()) => {
+                with_state(|e| e.malformed());
+                return 1;
+            }
+        }
+    } else {
+        None
+    };
+    match with_state(|e| e.submit(key, packet, token, cancel, unsafe { hv_now() }, record)) {
         Submission::Pending(_) => -1,
         Submission::Finish(a) => match a.finish {
             Finish::Allow => 0,

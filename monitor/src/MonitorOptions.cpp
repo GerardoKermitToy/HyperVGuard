@@ -127,10 +127,10 @@ bool ParseOptions(int argc, const wchar_t* const* argv, Options& opt, std::strin
             error = "--sys/automatic SCM installation is not supported; use dist/Install.exe and bind the LWF explicitly";
             return false;
         } else if (arg == L"--suspend-pid-on-verdict-delay") {
-            error = "PID suspension is not supported: NDIS LWF events have process_id=0 and no process owner";
+            error = "PID suspension is not supported: NDIS LWF events have no process owner";
             return false;
         } else if (arg == L"--no-inbound-udp-pid-fallback") {
-            error = "PID fallback is not supported at the NDIS LWF layer (process_id is always 0)";
+            error = "PID fallback is not supported at the NDIS LWF layer (connection events have no process ID)";
             return false;
         } else if (arg == L"--verdict") {
             std::wstring_view verdict;
@@ -172,14 +172,6 @@ bool ParseOptions(int argc, const wchar_t* const* argv, Options& opt, std::strin
             }
             opt.has_filter_protocol = true;
             opt.filter_protocol = static_cast<uint8_t>(protocol);
-        } else if (arg == L"--filter-pid") {
-            uint64_t pid = 0;
-            if (!number(std::numeric_limits<uint64_t>::max(), pid) || pid != 0) {
-                error = "--filter-pid supports only 0: this NDIS layer does not expose a process owner";
-                return false;
-            }
-            opt.has_filter_pid = true;
-            opt.filter_pid = 0;
         } else {
             error = "unknown option or positional driver path; use --help (automatic driver loading is not supported)";
             return false;
@@ -199,7 +191,7 @@ bool MatchesEndpoint(const Endpoint& endpoint, const std::string& ip, uint16_t p
 }
 
 bool ShowConnection(const Options& opt, const Connection& c) {
-    if (!opt.show_connections || (opt.has_filter_pid && opt.filter_pid != c.process_id) ||
+    if (!opt.show_connections ||
         (opt.has_filter_protocol && opt.filter_protocol != c.protocol)) return false;
     // IP and optional port must belong to the SAME endpoint.
     return !opt.filter.present || MatchesEndpoint(opt.filter, c.LocalIpString(), c.local_port) ||
@@ -226,12 +218,11 @@ void PrintUsage(FILE* out) {
         "  --out FILE       write records to FILE, flushed per record.\n"
         "  --poll N         request logs/bandwidth every N ms (default 1000).\n"
         "  --timestamps     prefix records with local HH:MM:SS.mmm.\n"
-        "  --payload        dump captured IP packet bytes as one hex string.\n"
+        "  --payload        dump the complete IP packet as one hex string.\n"
         "  --memory-stats   request compatible memory-stat LogLine records each poll.\n\n"
         "Display filters (do not change verdicts):\n"
         "  --filter-ip IP[:PORT]  match local or remote; [IPv6]:PORT for IPv6.\n"
         "  --filter-protocol N    protocol number 0..255 (e.g. 1, 6, 17, 58).\n"
-        "  --filter-pid 0         only PID 0 exists; no host process owner is inferred.\n"
         "  --only-logs            suppress connection/end/bandwidth records.\n"
         "  --no-conn              suppress connection/end records.\n"
         "  --no-bandwidth         suppress bandwidth records.\n\n"
@@ -253,8 +244,8 @@ void PrintUsage(FILE* out) {
         "  CONN is one event/verdict per NBL, not a process-owned socket.\n"
         "  direction=0 outbound, 1 inbound relative to the guest side;\n"
         "  local=guest endpoint, remote=peer. Host receive=outbound, send=inbound.\n"
-        "  PID=0; no thread-ID IOCTL.\n"
-        "  payload_layer=3 is a captured (possibly shortened) IP packet.\n"
+        "  Connection events carry no process/thread identity.\n"
+        "  payload_layer=3 is the complete logical IP packet (up to 1 MiB, no truncation).\n"
         "  Mixed/unsupported batches are dropped rather than misreported.\n"
         "  Bandwidth: admitted IP bytes, tx=outbound, rx=inbound; no PID.\n"
         "  CleanEndedConnections sweeps TTLs; no END is fabricated on expiry/timeout.\n"
@@ -265,7 +256,7 @@ void PrintUsage(FILE* out) {
         "  hyperv_monitor.exe\n"
         "  hyperv_monitor.exe --duration 10 --only-logs\n"
         "  hyperv_monitor.exe --duration 30 --out run.log --timestamps --payload\n"
-        "  hyperv_monitor.exe --duration 30 --filter-pid 0 --filter-protocol 17\n"
+        "  hyperv_monitor.exe --duration 30 --filter-protocol 17\n"
         "  hyperv_monitor.exe --duration 30 --verdict block --match 192.0.2.10:53\n");
 }
 

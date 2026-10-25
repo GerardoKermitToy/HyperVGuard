@@ -33,8 +33,6 @@ struct Options {
     bool has_alt = false;
     Endpoint match;
     Endpoint filter;
-    bool has_filter_pid = false;
-    uint64_t filter_pid = 0;
     bool has_filter_protocol = false;
     uint8_t filter_protocol = 0;
 };

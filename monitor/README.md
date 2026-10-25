@@ -1,6 +1,6 @@
 # HyperVGuard monitor
 
-Standalone C++20 monitor/client library for the Rust host-adapter NDIS LWF for the Default Switch host vNIC. It preserves the familiar `pmkext::Driver`, `Handlers`, `Connection`, verdict values, event fields and direct device access, without depending on a Portmaster source tree at build/run time.
+Standalone C++20 monitor/client library for the Rust host-adapter NDIS LWF for the Default Switch host vNIC. It keeps the familiar `pmkext::Driver`, `Handlers`, verdict values and direct device access, without depending on a Portmaster source tree at build/run time. The 0.3.0.0 Connection API intentionally removes `process_id` and carries complete IP packets.
 
 ## Build and no-driver tests
 
@@ -39,26 +39,27 @@ With a **positive `--duration N`**, device-open failure exits immediately withou
 .\build\Release\hyperv_monitor.exe  # Interactive: wait for startup, then Ctrl+C exits.
 .\build\Release\hyperv_monitor.exe --duration 10 --only-logs
 .\build\Release\hyperv_monitor.exe --duration 30 --out run.log --timestamps --payload
-.\build\Release\hyperv_monitor.exe --duration 30 --filter-pid 0 --filter-protocol 17
+.\build\Release\hyperv_monitor.exe --duration 30 --filter-protocol 17
 .\build\Release\hyperv_monitor.exe --duration 30 --verdict block --match 192.0.2.10:53
 ```
 
-Supported options include `--out`, `--filter-ip IP[:PORT]` (`[IPv6]:PORT` for IPv6), `--filter-protocol`, `--filter-pid 0`, `--match`, `--verdict`, `--no-verdicts`, `--payload`, `--poll`, `--timestamps`, `--memory-stats` and `--verdict-delay-ms`. `--only-logs`, `--no-conn` and `--no-bandwidth` are retained. Numeric values and ports are validated without truncation or wrapping. Display filters combine with AND, never change verdicts, and IP/port pairs must match the same endpoint. `--match` selects the normalized `remote` endpoint in both directions.
+Supported options include `--out`, `--filter-ip IP[:PORT]` (`[IPv6]:PORT` for IPv6), `--filter-protocol`, `--match`, `--verdict`, `--no-verdicts`, `--payload`, `--poll`, `--timestamps`, `--memory-stats` and `--verdict-delay-ms`. `--only-logs`, `--no-conn` and `--no-bandwidth` are retained. Numeric values and ports are validated without truncation or wrapping. Display filters combine with AND, never change verdicts, and IP/port pairs must match the same endpoint. `--match` selects the normalized `remote` endpoint in both directions.
 
 Duration/console-stop checks run at most 100 ms apart regardless of a longer `--poll`; requesting an enormous poll interval does not extend the requested monitoring period. The startup event wait also checks console-stop requests every 100 ms, without periodically reopening the device. In-progress I/O completion can still add bounded completion time. Ctrl+C requests session shutdown or cancels startup waiting. The independent singleton is `Global\HyperVGuardMonitor.Singleton`, so the WFP monitor's singleton is not reused.
 
-## Exact wire compatibility and NDIS semantics
+## Wire format and NDIS semantics
 
-* Event framing is unchanged: **`[u8 type][u32 payload length LE][payload]`**. Existing IPv4/IPv6 `Connection` field order and sizes are unchanged; no TID, switch, switch-port or NIC fields were added.
-* `IOCTL_VERSION` is `CTL_CODE(40000, 0x800, METHOD_BUFFERED, FILE_READ_DATA | FILE_WRITE_DATA)` and returns `[0,2,1,0]`. Shutdown uses function `0x801`. There is **no thread-ID IOCTL** or thread-ID query/printing.
-* `process_id` is always **0**: this NDIS layer cannot identify a process owner. `direction=0` is guest/Sandbox outbound (host NDIS receive); `1` is guest/Sandbox inbound (host NDIS send). `local` is the guest-side endpoint and `remote` the peer. Host-send source/destination are normalized without modifying the captured packet. The 0.2.1.0 monitor rejects older SYS versions with host-oriented semantics.
+* Event framing is unchanged: **`[u8 type][u32 body length LE][body]`**. Connection types 1/2 have no process-ID bytes; their complete prefixes, including the framing header, are 32/56 bytes for IPv4/IPv6. This is a breaking change from 0.2.1.0. No TID, switch, switch-port or NIC fields were added.
+* `IOCTL_VERSION` is `CTL_CODE(40000, 0x800, METHOD_BUFFERED, FILE_READ_DATA | FILE_WRITE_DATA)` and returns `[0,3,0,0]`. Shutdown uses function `0x801`. There is **no thread-ID IOCTL** or thread-ID query/printing.
+* `Connection` contains **no `process_id`**: this NDIS layer cannot identify a process owner. `--filter-pid` is rejected; unused END compatibility types retain PID=0. `direction=0` is guest/Sandbox outbound (host NDIS receive); `1` is guest/Sandbox inbound (host NDIS send). `local` is the guest-side endpoint and `remote` the peer. Host-send source/destination are normalized without modifying the captured packet. The monitor requires device version **0.3.0.0** and rejects older SYS versions before reading events.
 * Each `CONN`/verdict refers to **one owned NBL** (an original or a deep-copied resources receive), not a process-owned socket. Unsupported/mixed batches are dropped by the driver rather than representing just their first packet as the entire batch.
-* `payload_layer=3`; `payload` contains captured IP bytes (capture may be shortened). `payload_size` is the captured byte count, not the original full IP packet length. Current protocol limits are 256 captured bytes and a maximum 512-byte record.
+* `payload_layer=3`; `payload` contains the **complete observed IP packet**, without Ethernet/VLAN headers or padding. `payload_size` is its full length, not a 256-byte capture. The maximum payload is **1048576 bytes (1 MiB)** and maximum complete record **1048632 bytes**. Oversized logical packets are dropped, never truncated into a Connection event. LSO/RSC payloads describe NDIS logical packets, not necessarily wire segments. A homogeneous multi-NB NBL still has one verdict and the complete first NB packet, not concatenated payloads.
+* RecordStream uses bounded heap storage to assemble records across the unchanged 65536-byte device reads. Kernel captures are copied outside the policy spin lock into fallibly allocated nonpaged storage with a **16 MiB global allocation budget**, including in-flight copies; queued records also have a 16 MiB byte budget. Event-buffer exhaustion uses the configured fallback without emitting a partial packet. Log records keep their 512-byte bound.
 * Device reads are **nonblocking**. A successful zero-byte read means the queue is empty, not EOF. `ReaderLoop` waits on its stop event for 10 ms before retrying. Fragmented/coalesced records are handled using bounded storage; an oversized header terminates the session rather than inventing a synchronization boundary.
 * Commands retain their original **unframed** byte IDs and fixed layouts. Supported IDs are Shutdown=0, Verdict=1, ClearCache=4, GetLogs=5, GetBandwidthStats=6, PrintMemoryStats=7, CleanEndedConnections=8. UpdateV4=2/UpdateV6=3 names remain for source compatibility, but **are rejected**, as requested.
 * Verdict bytes **2..7** retain Accept/PermanentAccept/Block/PermanentBlock/Drop/PermanentDrop meanings. Redirect/undecided/failed values remain named in the enum for source compatibility but cannot be written. The entire command batch is validated before any write; the driver must independently validate at its own trust boundary.
 * Permanent cache TTL is **60 seconds**. Pending timeout defaults to **2 seconds**, with **fail-open by default**. No new configuration wire protocol was introduced. `--no-verdicts` or a long delayed verdict may leave a packet pending until that timeout; they do not imply indefinite blocking.
-* `GetBandwidthStats` emits compatible type-5/type-6 tuple records: `transmitted_bytes` counts admitted guest outbound IP bytes and `received_bytes` admitted guest inbound IP bytes, grouped by the normalized guest/peer tuple. Records contain no PID; PID display filtering therefore suppresses them. These are guest-side admission counters on the host-vNIC path, not process/socket attribution or proof of final delivery.
+* `GetBandwidthStats` emits compatible type-5/type-6 tuple records: `transmitted_bytes` counts admitted guest outbound IP bytes and `received_bytes` admitted guest inbound IP bytes, grouped by the normalized guest/peer tuple. Records contain no PID. These are guest-side admission counters on the host-vNIC path, not process/socket attribution or proof of final delivery.
 * `PrintMemoryStats`/`GetLogs` use compatible `LogLine` records. `CleanEndedConnections` only sweeps expired cache state. **No fake END event** is generated for timeout, cache expiry or monitor shutdown. Legacy END/bandwidth structs and callbacks remain available for compatible real input records.
 
 The default automatic verdict is `PermanentAccept`; `--verdict` without `--match` applies to every observed event. Block/drop decisions can interrupt target host-vNIC traffic, including remote sessions. Delayed verdicts use the existing queue and do not suspend any process. Delays do not extend the driver's pending lifetime, and unsent work is discarded at shutdown.
@@ -67,7 +68,7 @@ The default automatic verdict is `PermanentAccept`; `--verdict` without `--match
 
 The monitor uses only the existing driver device. All complete raw device records are decoded and delivered to the local `Handlers`; local automatic/delayed verdicts write directly to that device. There is no named-pipe server, handshake, attached-client state, external command forwarding, trusted-client executable check, or exclusive external record ownership.
 
-The standalone `winrpc/` source directory is not a dependency of this monitor. Removing it from a deployment or source bundle does not affect monitor targets. The driver wire format and required version remain **0.2.1.0**. Removal of the old transport needed no SYS change; the separate driver-start event described above does require the updated SYS.
+The standalone `winrpc/` source directory is not a dependency of this monitor. Removing it from a deployment or source bundle does not affect monitor targets. The required device/wire version is now **0.3.0.0**. Full packet delivery and the PID-free Connection layout require the matching rebuilt SYS and monitor; the older transport removal alone did not require a SYS change.
 
 ## Source provenance and license
 
@@ -81,9 +82,15 @@ These are independent copies/adaptations of the local `C:\portmaster_v3` source 
 
 The original repository's **GNU GPL version 3** license is preserved verbatim as `LICENSE`; this adaptation retains that license. Source provenance does not imply that the original WFP driver's lifecycle or host process semantics apply to a host-adapter NDIS LWF.
 
-## Startup-event validation
+## Full-packet/PID-free validation
 
-The startup-event/default-password Release build passed **17/17 no-driver CTest suites**, including **11** startup scenarios with fake device openers and private local events: duration/no-wait, already available, signal-before-event-open/wait, asynchronous signaling, stale/repeated signals, cancellation and named-object type collision. The startup suite also passed 50 consecutive offline repetitions; a separate build-options suite verifies eight default/environment/argument password-precedence cases. These tests do not open the installed device or exercise the real kernel notification/Ctrl+C path. Driver wire version remains **0.2.1.0**; the SYS must be rebuilt for startup signaling.
+The **0.3.0.0** Release build passed **17/17 no-driver CTest suites** and **44 Rust tests** (28 policy unit tests, five full-payload integration tests, four guest-direction tests and seven protocol tests). Codec coverage includes exact PID-free IPv4/IPv6 layouts, complete packets beyond 256 and 65536 bytes, maximum 1 MiB payloads, fragmented/coalesced reads, malformed bounds and version rejection. The codec suite also passed **50 consecutive offline repetitions**. Rust tests cover VLAN/padding exclusion, logical offload packets, queue byte pressure, allocation fallback, stale-event cleanup and partial reads surviving timeout. Formatting and strict host/kernel Clippy passed.
+
+The rebuilt SYS, notify DLL, setup EXEs and catalog were signed; Authenticode and catalog membership passed, including the native setup tool's read-only package verification. No driver was installed, loaded, bound or opened, and no live monitor/traffic test was run. Actual NDIS full-buffer copies and filtering remain user-run validation; the matching SYS and monitor are both required.
+
+## Historical startup-event validation
+
+Before the full-packet/PID-free change, the startup-event/default-password Release build passed **17/17 no-driver CTest suites**, including **11** startup scenarios with fake device openers and private local events: duration/no-wait, already available, signal-before-event-open/wait, asynchronous signaling, stale/repeated signals, cancellation and named-object type collision. The startup suite also passed 50 consecutive offline repetitions; a separate build-options suite verifies eight default/environment/argument password-precedence cases. These tests do not open the installed device or exercise the real kernel notification/Ctrl+C path. That snapshot used wire version **0.2.1.0**; startup signaling required its rebuilt SYS.
 
 ## Device-only validation
 
@@ -97,4 +104,4 @@ SYS, INF, CAT and the signed notify DLL in `dist/` were verified unchanged. No d
 
 The initial native setup integration changed monitor help and unsupported-installation diagnostics to point to `dist/Install.exe` rather than the removed PowerShell installer. That Release build passed **14/14 no-driver CTest suites**, including the native setup workflow, INF and help/invalid-CLI tests. That snapshot's `dist/hyperv_monitor.exe`: **94720 bytes**, SHA-256 **6CB99E7BED9BD2825DAC12D17BFE18F80EDD5932DEE13E03BBC420DBFD2B56C9**. The driver protocol remained **0.2.1.0**; SYS/INF/CAT/notify DLL were unchanged in that snapshot. See [native setup validation](../install/console/README.md#offline-validation).
 
-The later driver-store package **0.2.1.4** corrects setup/notify GUID inspection and non-PnP target lifecycle and passed **15/15** no-driver suites. Its authorized real installation completed with exit 0 and only the Default Switch binding enabled; this monitor and wire version 0.2.1.0 remain unchanged. No live monitor/traffic test was run. Current package and retry instructions: [NetCfg identity fix](../docs/NETCFG-IDENTITY-FIX.md).
+The later driver-store package **0.2.1.4** corrects setup/notify GUID inspection and non-PnP target lifecycle and passed **15/15** no-driver suites. Its authorized real installation completed with exit 0 and only the Default Switch binding enabled; this monitor and wire version 0.2.1.0 remain unchanged. No live monitor/traffic test was run. Historical package and retry instructions: [NetCfg identity fix](../docs/NETCFG-IDENTITY-FIX.md).

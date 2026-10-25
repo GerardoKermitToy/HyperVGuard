@@ -24,6 +24,11 @@ uint64_t ReadU64(const uint8_t* p) noexcept {
 
 } // namespace
 
+bool IsCompatibleVersion(const uint8_t version[4]) noexcept {
+    return version != nullptr &&
+           std::equal(kRequiredDeviceVersion.begin(), kRequiredDeviceVersion.end(), version);
+}
+
 bool IsSupportedVerdict(uint8_t verdict) noexcept {
     return verdict >= static_cast<uint8_t>(Verdict::Accept) &&
            verdict <= static_cast<uint8_t>(Verdict::PermanentDrop);
@@ -87,7 +92,7 @@ bool EncodeVerdict(uint64_t id, Verdict verdict,
 bool DispatchRecord(const uint8_t* bytes, size_t length, const Handlers& handlers,
                     std::string& error) {
     if (bytes == nullptr || length < kRecordHeaderSize || length > kMaxRecordSize) {
-        error = "record length is outside the 5..512 byte limit";
+        error = "record length is outside the 5..1048632 byte limit";
         return false;
     }
     const size_t size = ReadU32(bytes + 1);
@@ -99,8 +104,8 @@ bool DispatchRecord(const uint8_t* bytes, size_t length, const Handlers& handler
     const uint8_t* p = bytes + kRecordHeaderSize;
     switch (type) {
         case InfoType::LogLine: {
-            if (size < 1 || p[0] < 1 || p[0] > 7) {
-                error = "invalid LogLine severity or empty payload";
+            if (length > kMaxLogRecordSize || size < 1 || p[0] < 1 || p[0] > 7) {
+                error = "invalid LogLine severity, empty payload or record over 512 bytes";
                 return false;
             }
             LogLine line;
@@ -113,7 +118,8 @@ bool DispatchRecord(const uint8_t* bytes, size_t length, const Handlers& handler
         case InfoType::ConnectionIpv6: {
             const bool v6 = type == InfoType::ConnectionIpv6;
             const size_t addr_size = v6 ? 16 : 4;
-            const size_t fixed = 8 + 8 + 1 + 1 + addr_size * 2 + 2 + 2 + 1 + 4;
+            const size_t fixed = (v6 ? kConnectionIpv6PrefixSize : kConnectionIpv4PrefixSize) -
+                                 kRecordHeaderSize;
             if (size < fixed) {
                 error = "Connection record too short";
                 return false;
@@ -122,7 +128,6 @@ bool DispatchRecord(const uint8_t* bytes, size_t length, const Handlers& handler
             c.ipv6 = v6;
             size_t offset = 0;
             c.id = ReadU64(p + offset); offset += 8;
-            c.process_id = ReadU64(p + offset); offset += 8;
             c.direction = p[offset++];
             c.protocol = p[offset++];
             std::memcpy(c.local_ip, p + offset, addr_size); offset += addr_size;
@@ -131,8 +136,12 @@ bool DispatchRecord(const uint8_t* bytes, size_t length, const Handlers& handler
             c.remote_port = ReadU16(p + offset); offset += 2;
             c.payload_layer = p[offset++];
             c.payload_size = ReadU32(p + offset); offset += 4;
-            if (c.process_id != 0 || c.direction > 1 || c.payload_layer != 3) {
-                error = "invalid HyperVGuard Connection metadata (expected PID 0, outbound/inbound, IP payload)";
+            if (c.direction > 1 || c.payload_layer != 3) {
+                error = "invalid HyperVGuard Connection metadata (expected outbound/inbound, IP payload)";
+                return false;
+            }
+            if (c.payload_size > kMaxPayloadSize) {
+                error = "Connection IP packet exceeds the 1 MiB payload limit";
                 return false;
             }
             if (c.payload_size != size - offset) {
@@ -224,16 +233,16 @@ bool RecordStream::Feed(const uint8_t* bytes, size_t length, const Callback& cal
     }
     while (length != 0) {
         const size_t take = std::min(length, wanted_ - used_);
-        std::memcpy(record_.data() + used_, bytes, take);
+        std::memcpy(record_.get() + used_, bytes, take);
         used_ += take;
         bytes += take;
         length -= take;
         if (used_ < wanted_) continue;
         if (wanted_ == kRecordHeaderSize) {
-            const uint32_t payload_size = ReadU32(record_.data() + 1);
+            const uint32_t payload_size = ReadU32(record_.get() + 1);
             if (payload_size > kMaxRecordSize - kRecordHeaderSize) {
                 failed_ = true;
-                error = "driver record exceeds the 512-byte protocol limit";
+                error = "driver record exceeds the 1048632-byte protocol limit";
                 return false;
             }
             wanted_ = kRecordHeaderSize + payload_size;
@@ -242,7 +251,7 @@ bool RecordStream::Feed(const uint8_t* bytes, size_t length, const Callback& cal
         const size_t complete = wanted_;
         used_ = 0;
         wanted_ = kRecordHeaderSize;
-        if (callback) callback(record_.data(), complete);
+        if (callback) callback(record_.get(), complete);
     }
     error.clear();
     return true;

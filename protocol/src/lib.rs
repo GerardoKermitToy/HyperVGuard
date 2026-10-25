@@ -1,9 +1,12 @@
 #![no_std]
 
-// Portmaster's byte protocol, deliberately independent of Rust/C structure layout.
-pub const VERSION: [u8; 4] = [0, 2, 1, 0];
-pub const CAPTURE: usize = 256;
-pub const MAX_RECORD: usize = 512;
+// Explicit byte protocol, deliberately independent of Rust/C structure layout.
+pub const VERSION: [u8; 4] = [0, 3, 0, 0];
+pub const MAX_PAYLOAD: usize = 1024 * 1024;
+pub const CONNECTION_V4_HEADER: usize = 32;
+pub const CONNECTION_V6_HEADER: usize = 56;
+pub const MAX_RECORD: usize = CONNECTION_V6_HEADER + MAX_PAYLOAD;
+pub const MAX_LOG_RECORD: usize = 512;
 pub const IOCTL_VERSION: u32 = ctl_code(0x800);
 pub const IOCTL_SHUTDOWN: u32 = ctl_code(0x801);
 const fn ctl_code(function: u32) -> u32 {
@@ -122,8 +125,6 @@ pub struct Connection {
     pub remote_ip: [u8; 16],
     pub local_port: u16,
     pub remote_port: u16,
-    pub capture_len: u16,
-    pub capture: [u8; CAPTURE],
 }
 impl Connection {
     pub const EMPTY: Self = Self {
@@ -134,8 +135,6 @@ impl Connection {
         remote_ip: [0; 16],
         local_port: 0,
         remote_port: 0,
-        capture_len: 0,
-        capture: [0; CAPTURE],
     };
 }
 
@@ -180,31 +179,61 @@ impl<'a> Writer<'a> {
     }
 }
 
-pub fn encode_connection(out: &mut [u8], id: u64, c: &Connection) -> Result<usize, Error> {
-    let capture = c
-        .capture
-        .get(..usize::from(c.capture_len))
-        .ok_or(Error::Malformed)?;
+pub const fn connection_header_len(c: &Connection) -> usize {
+    if c.ipv6 {
+        CONNECTION_V6_HEADER
+    } else {
+        CONNECTION_V4_HEADER
+    }
+}
+
+// Encode only the small prefix: callers can copy the full packet directly into
+// its final nonpaged allocation before publishing the event under the policy lock.
+pub fn encode_connection_header(
+    out: &mut [u8],
+    id: u64,
+    c: &Connection,
+    payload_len: usize,
+) -> Result<usize, Error> {
+    if payload_len > MAX_PAYLOAD {
+        return Err(Error::Malformed);
+    }
     let addr_len = if c.ipv6 { 16 } else { 4 };
-    let size = 8 + 8 + 1 + 1 + addr_len * 2 + 2 + 2 + 1 + 4 + capture.len();
+    let size = connection_header_len(c) - 5 + payload_len;
     let mut w = Writer::new(out);
     w.u8(if c.ipv6 { 2 } else { 1 })?;
     w.u32(size as u32)?;
     w.u64(id)?;
-    w.u64(0)?; // No process identity exists at this NDIS layer.
-    w.u8(c.direction as u8)?; // Relative to the guest side, not host NDIS send/receive or a process.
+    w.u8(c.direction as u8)?; // Guest side, not host NDIS send/receive.
     w.u8(c.protocol)?;
     w.bytes(&c.local_ip[..addr_len])?;
     w.bytes(&c.remote_ip[..addr_len])?;
     w.u16(c.local_port)?;
     w.u16(c.remote_port)?;
     w.u8(3)?;
-    w.u32(capture.len() as u32)?;
-    w.bytes(capture)?;
+    w.u32(payload_len as u32)?;
     Ok(w.len())
 }
+
+pub fn encode_connection(
+    out: &mut [u8],
+    id: u64,
+    c: &Connection,
+    payload: &[u8],
+) -> Result<usize, Error> {
+    if payload.len() > MAX_PAYLOAD {
+        return Err(Error::Malformed);
+    }
+    let len = connection_header_len(c) + payload.len();
+    if out.len() < len {
+        return Err(Error::BufferTooSmall);
+    }
+    let start = encode_connection_header(out, id, c, payload.len())?;
+    out[start..len].copy_from_slice(payload);
+    Ok(len)
+}
 pub fn encode_log(out: &mut [u8], severity: u8, message: &str) -> Result<usize, Error> {
-    if message.len() > MAX_RECORD - 6 {
+    if message.len() > MAX_LOG_RECORD - 6 {
         return Err(Error::Malformed);
     }
     let mut w = Writer::new(out);
@@ -232,44 +261,106 @@ pub fn encode_bandwidth(out: &mut [u8], c: &Connection, tx: u64, rx: u64) -> Res
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
     use super::*;
+    use std::{vec, vec::Vec};
+
     #[test]
-    fn exact_v4_abi_pid_zero_no_extra_fields() {
+    fn exact_v4_abi_without_process_id() {
         let mut c = Connection::EMPTY;
         c.protocol = 17;
         c.local_ip[..4].copy_from_slice(&[10, 0, 0, 1]);
         c.remote_ip[..4].copy_from_slice(&[10, 0, 0, 2]);
         c.local_port = 0x1234;
         c.remote_port = 53;
-        c.capture_len = 2;
-        c.capture[..2].copy_from_slice(&[0x45, 0]);
-        let mut b = [0xff; MAX_RECORD];
-        let n = encode_connection(&mut b, 0x0102030405060708, &c).unwrap();
-        assert_eq!(n, 42);
-        assert_eq!(&b[..5], &[1, 37, 0, 0, 0]);
-        assert_eq!(&b[5..13], &[8, 7, 6, 5, 4, 3, 2, 1]);
-        assert_eq!(&b[13..21], &[0; 8]);
-        assert_eq!(&b[21..23], &[0, 17]);
-        assert_eq!(&b[31..40], &[0x34, 0x12, 53, 0, 3, 2, 0, 0, 0]);
-        assert_eq!(&b[40..n], &[0x45, 0]);
+        let mut b = [0xff; 64];
+        let n = encode_connection(&mut b, 0x0102030405060708, &c, &[0x45, 0]).unwrap();
+        assert_eq!(n, 34);
+        assert_eq!(
+            &b[..n],
+            &[
+                1, 29, 0, 0, 0, 8, 7, 6, 5, 4, 3, 2, 1, 0, 17, 10, 0, 0, 1, 10, 0, 0, 2, 0x34,
+                0x12, 53, 0, 3, 2, 0, 0, 0, 0x45, 0,
+            ]
+        );
+        assert_eq!(connection_header_len(&c), CONNECTION_V4_HEADER);
     }
     #[test]
     fn exact_v6_and_bandwidth_sizes() {
         let mut c = Connection::EMPTY;
         c.ipv6 = true;
-        let mut b = [0; MAX_RECORD];
-        assert_eq!(encode_connection(&mut b, 1, &c), Ok(64));
+        let mut b = [0; 128];
+        assert_eq!(encode_connection(&mut b, 1, &c, &[]), Ok(56));
         assert_eq!(b[0], 2);
-        assert_eq!(b[1], 59);
+        assert_eq!(b[1], 51);
         c.direction = Direction::Inbound;
-        assert_eq!(encode_connection(&mut b, 1, &c), Ok(64));
-        assert_eq!(b[21], 1);
-        assert_eq!(&b[13..21], &[0; 8]);
+        assert_eq!(encode_connection(&mut b, 1, &c, &[]), Ok(56));
+        assert_eq!(b[13], 1);
+        assert_eq!(b[51], 3);
+        assert_eq!(&b[52..56], &[0; 4]);
         assert_eq!(encode_bandwidth(&mut b, &c, 123, 456), Ok(62));
         assert_eq!(&b[..10], &[6, 57, 0, 0, 0, 0, 1, 0, 0, 0]);
         assert_eq!(u64::from_le_bytes(b[46..54].try_into().unwrap()), 123);
         assert_eq!(u64::from_le_bytes(b[54..62].try_into().unwrap()), 456);
         assert_eq!(Direction::decode(2), None);
+    }
+    #[test]
+    fn full_payloads_are_not_truncated_at_256_or_65536_bytes() {
+        for ipv6 in [false, true] {
+            let mut c = Connection::EMPTY;
+            c.ipv6 = ipv6;
+            for size in [0, 257, 1500, 65535, 65536, 65575, MAX_PAYLOAD] {
+                let payload: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+                let prefix = connection_header_len(&c);
+                let mut out = vec![0; prefix + size];
+                assert_eq!(encode_connection(&mut out, 19, &c, &payload), Ok(out.len()));
+                assert_eq!(
+                    u32::from_le_bytes(out[1..5].try_into().unwrap()) as usize,
+                    out.len() - 5
+                );
+                assert_eq!(
+                    u32::from_le_bytes(out[prefix - 4..prefix].try_into().unwrap()) as usize,
+                    size
+                );
+                assert_eq!(&out[prefix..], &payload);
+            }
+        }
+    }
+    #[test]
+    fn encoding_the_header_preserves_the_full_packet() {
+        for ipv6 in [false, true] {
+            let mut c = Connection::EMPTY;
+            c.ipv6 = ipv6;
+            let prefix = connection_header_len(&c);
+            let mut out = vec![0xa5; prefix + 65575];
+            assert_eq!(
+                encode_connection_header(&mut out, 27, &c, 65575),
+                Ok(prefix)
+            );
+            assert!(out[prefix..].iter().all(|b| *b == 0xa5));
+        }
+    }
+    #[test]
+    fn invalid_capture_lengths_do_not_produce_partial_records() {
+        let c = Connection::EMPTY;
+        let too_large = vec![0; MAX_PAYLOAD + 1];
+        let mut out = [0xa5; 64];
+        assert_eq!(
+            encode_connection(&mut out, 1, &c, &too_large),
+            Err(Error::Malformed)
+        );
+        assert_eq!(out, [0xa5; 64]);
+        assert_eq!(
+            encode_connection_header(&mut out, 1, &c, MAX_PAYLOAD + 1),
+            Err(Error::Malformed)
+        );
+        assert_eq!(out, [0xa5; 64]);
+        assert_eq!(
+            encode_connection(&mut out[..33], 1, &c, &[0; 2]),
+            Err(Error::BufferTooSmall)
+        );
+        assert_eq!(out, [0xa5; 64]);
+        assert_eq!(VERSION, [0, 3, 0, 0]);
     }
     #[test]
     fn verdicts_are_identical_but_redirects_not_supported() {

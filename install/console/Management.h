@@ -12,8 +12,8 @@ namespace hyperv_guard::setup {
 
 inline constexpr GUID kDefaultSwitchId = {0xc08cb7b8, 0x9b3c, 0x408e, {0x8e, 0x30, 0x5e, 0x16, 0xa3, 0xae, 0xb4, 0x44}};
 inline constexpr int kRebootRequired = ERROR_SUCCESS_REBOOT_REQUIRED;
-// Driver-store package version; the unchanged device wire version is 0.2.1.0.
-inline constexpr wchar_t kPackageVersion[] = L"0.2.1.4";
+// Coherent driver-store package for the PID-free, full-packet 0.3.0.0 wire API.
+inline constexpr wchar_t kPackageVersion[] = L"0.3.0.0";
 
 enum class Action { Install, Enable, Uninstall };
 enum class Change { Complete, RebootRequired };

@@ -7,15 +7,24 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
 
 namespace pmkext::wire {
 
 constexpr size_t kRecordHeaderSize = 5;
-// Matches protocol/src/lib.rs. No length from a peer controls an unbounded allocation.
-constexpr size_t kMaxRecordSize = 512;
+// Matches protocol/src/lib.rs. Connection prefixes include the record header;
+// their payload is the complete logical IP packet, never a shortened capture.
+constexpr size_t kConnectionIpv4PrefixSize = 32;
+constexpr size_t kConnectionIpv6PrefixSize = 56;
+constexpr size_t kMaxPayloadSize = 1024 * 1024;
+constexpr size_t kMaxRecordSize = kConnectionIpv6PrefixSize + kMaxPayloadSize;
+constexpr size_t kMaxLogRecordSize = 512;
 constexpr size_t kMaxCommandBatchSize = 64 * 1024;
 constexpr size_t kVerdictCommandSize = 10;
+constexpr std::array<uint8_t, 4> kRequiredDeviceVersion = {0, 3, 0, 0};
+
+bool IsCompatibleVersion(const uint8_t version[4]) noexcept;
 
 constexpr uint32_t MakeCtlCode(uint32_t function) {
     return (40000u << 16) | (3u << 14) | (function << 2);
@@ -33,7 +42,8 @@ bool EncodeVerdict(uint64_t id, Verdict verdict,
 bool DispatchRecord(const uint8_t* bytes, size_t length, const Handlers& handlers,
                     std::string& error);
 
-// Accept arbitrary read boundaries while keeping at most one 512-byte record.
+// Accept arbitrary read boundaries while keeping at most one bounded record
+// on the heap, including packets spanning many <=65536-byte device reads.
 // Oversized headers permanently invalidate the stream: guessing a new boundary
 // would turn arbitrary payload bytes into fabricated events.
 class RecordStream {
@@ -45,7 +55,8 @@ public:
     size_t PendingBytes() const noexcept { return used_; }
 
 private:
-    std::array<uint8_t, kMaxRecordSize> record_{};
+    // A fixed bound, not a peer-selected allocation or a megabyte stack object.
+    std::unique_ptr<uint8_t[]> record_ = std::make_unique<uint8_t[]>(kMaxRecordSize);
     size_t used_ = 0;
     size_t wanted_ = kRecordHeaderSize;
     bool failed_ = false;

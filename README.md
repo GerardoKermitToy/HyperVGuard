@@ -1,8 +1,8 @@
 # HyperVGuard
 
-Experimental Rust-based **NDIS Lightweight Filter (LWF)** and a C++ monitor with a `kext_monitor`-compatible API. The filter targets only the management-OS host adapter **`vEthernet (Default Switch)`**. It is not a Hyper-V switch extension or a WFP callout.
+Experimental Rust-based **NDIS Lightweight Filter (LWF)** and a C++ monitor with a `kext_monitor`-style API. The filter targets only the management-OS host adapter **`vEthernet (Default Switch)`**. It is not a Hyper-V switch extension or a WFP callout.
 
-Driver package: **0.2.1.4**. Device/wire protocol: **0.2.1.0**.
+Driver package and device/wire protocol: **0.3.0.0**. This is a breaking Connection-event revision: process IDs are removed and payloads contain complete IP packets. Use a matching SYS and monitor; the monitor rejects older device versions.
 
 Only traffic passing through the host vNIC is covered; VM-to-VM traffic is not guaranteed to be visible. The installer and kernel check the exact adapter GUID/NET_LUID, not its display name. If Windows recreates the adapter with a new identity, explicitly uninstall and reinstall.
 
@@ -78,13 +78,15 @@ The public C++ interface is [PortmasterKext.h](monitor/include/PortmasterKext.h)
 
 ### Semantics and compatibility
 
-- **PID is always 0.** There is no TID or public switch/port/NIC/GUID/LUID field, and no host-process or individual-VM ownership is inferred.
+- **ConnectionIpv4/ConnectionIpv6 have no `process_id` field.** There is no TID or public switch/port/NIC/GUID/LUID field, and no host-process or individual-VM ownership is inferred. Unused legacy END compatibility records retain their zero PID.
 - `direction=0` is **guest/Sandbox outbound**, corresponding to host NDIS receive. `direction=1` is **guest/Sandbox inbound**, corresponding to host NDIS send. `local_*` describes the guest endpoint; `remote_*` describes the peer. NAT/forwarding can affect the addresses visible on this path.
-- One connection event and its `id` represent **one pending NBL**, not a socket or a connection lifetime. A homogeneous multi-NB NBL has one verdict and a representative capture from its first NB. Mixed-flow or malformed batches are dropped rather than represented as one flow.
-- `payload_layer=3`. Captures contain up to **256 IP bytes**, without Ethernet/VLAN headers. `payload_size` is the captured byte count, not the original packet length. Endpoint normalization does not rewrite captured packet bytes.
+- One connection event and its `id` represent **one pending NBL**, not a socket or a connection lifetime. A homogeneous multi-NB NBL has one verdict and the complete IP packet from its first NB, not a concatenation of all NBs. Mixed-flow or malformed batches are dropped rather than represented as one flow.
+- `payload_layer=3`. `payload` contains the **complete observed IP packet**, including IP/transport headers, without Ethernet/VLAN headers or Ethernet padding. `payload_size` is its full byte count. No 256-byte capture truncation remains. Endpoint normalization does not rewrite packet bytes. For LSO/RSC, this is the logical packet observed at NDIS, not necessarily one frame on the wire.
 - Non-IP traffic such as ARP does not produce connection events and is passed when its ownership/profile is supported. Cache hits are handled in the kernel without a new verdict event.
 - Redirect verdicts, UpdateV4/V6, PID suspension, and a thread-ID IOCTL are **unsupported**. Some enum names remain in the C++ header only for source compatibility.
 - NDIS has no socket/ALE teardown notification. **Connection-END events are never generated**, including on cache expiry, timeout, or disconnect.
+
+Connection payloads are bounded at **1 MiB (1048576 bytes)**, covering ordinary IPv4/IPv6 packets and supported larger offload packets. Larger logical packets are dropped rather than reported with truncated payloads. Queued records and in-progress capture allocations share a **16 MiB nonpaged budget**; the event queue also has a 16 MiB byte limit, 512 record slots and 256 pending verdict slots. Event-buffer exhaustion follows the configured policy fallback without publishing a shortened event. Failed NDIS buffer copies remain drop paths. `--filter-pid` is no longer supported.
 
 This is experimental kernel code. Offline tests and an enabled binding do not prove correct live filtering.
 
@@ -98,7 +100,7 @@ Both IOCTLs use `CTL_CODE(40000, function, METHOD_BUFFERED, FILE_READ_DATA | FIL
 
 | IOCTL | Function / numeric code | Output and effect |
 |---|---|---|
-| `IOCTL_VERSION` | `0x800` / `0x9C40E000` | Exactly four bytes: `00 02 01 00`. The output buffer must have at least four bytes. |
+| `IOCTL_VERSION` | `0x800` / `0x9C40E000` | Exactly four bytes: `00 03 00 00`. The output buffer must have at least four bytes. |
 | `IOCTL_SHUTDOWN` | `0x801` / `0x9C40E004` | No output. Deactivates the policy session, discards queued events/cache/bandwidth, and resolves pending packets through the configured fallback. Does not unload, unbind, or uninstall the LWF. |
 
 All other IOCTLs are unsupported. After shutdown, close and reopen the handle to activate a new session. Closing the active handle also disconnects the controller and drains pending decisions. Shutdown does not itself close the handle or stop a custom application's read loop.
@@ -118,7 +120,7 @@ Construct `Driver(std::wstring service_name = L"HyperVGuard")`; the argument sel
 | Method | Contract |
 |---|---|
 | `bool Open(std::string& error)` | Opens the already installed device. Fails if this client session is already open. Does not install, bind, or negotiate the version. |
-| `bool GetVersion(uint8_t out[4], std::string& error)` | Reads the four-byte version; integrations should require `0.2.1.0`. |
+| `bool GetVersion(uint8_t out[4], std::string& error)` | Reads the four-byte version; integrations should require `0.3.0.0`. |
 | `void Run(const Handlers& handlers, unsigned poll_interval_ms = 1000)` | Starts a reader thread and blocks until stopped or the reader exits. Dispatches complete records and invokes `on_poll` on the calling thread. It does not automatically request logs/statistics or send verdicts. |
 | `bool SendVerdict(uint64_t id, Verdict verdict, std::string& error)` | Sends one verdict for a pending event ID. Only verdict values 2–7 are accepted. |
 | `bool RequestLogs(std::string& error)` | Sends `GetLogs`; existing log events are already queued for reading. |
@@ -150,7 +152,7 @@ Callback arguments are temporary; copy data needed after the callback returns. S
 
 | Type | Public fields |
 |---|---|
-| `Connection` | `bool ipv6`; `uint64_t id, process_id`; `uint8_t direction, protocol`; `uint8_t local_ip[16], remote_ip[16]`; `uint16_t local_port, remote_port`; `uint8_t payload_layer`; `uint32_t payload_size`; `std::vector<uint8_t> payload`. |
+| `Connection` | `bool ipv6`; `uint64_t id`; `uint8_t direction, protocol`; `uint8_t local_ip[16], remote_ip[16]`; `uint16_t local_port, remote_port`; `uint8_t payload_layer`; `uint32_t payload_size`; `std::vector<uint8_t> payload`. |
 | `ConnectionEnd` | `bool ipv6`; `uint64_t process_id`; `uint8_t direction, protocol`; `uint8_t local_ip[16], remote_ip[16]`; `uint16_t local_port, remote_port`. No verdict ID or payload. |
 | `LogLine` | `Severity severity`; `std::string message`. |
 | `BandwidthEntry` | `bool ipv6`; `uint8_t local_ip[16]`; `uint16_t local_port`; `uint8_t remote_ip[16]`; `uint16_t remote_port`; `uint64_t transmitted_bytes, received_bytes`. |
@@ -189,7 +191,7 @@ Events use explicit byte encoding, never native C++/Rust structure layout:
 [type:u8][body_size:u32 LE][body:body_size bytes]
 ```
 
-The header is five bytes. `body_size` excludes the header; a complete record is at most **512 bytes**. All numeric fields, **including ports**, are little-endian. IP address bytes are in network order. There is no padding or implicit string terminator. In layouts below, `A=4` for IPv4 and `A=16` for IPv6.
+The header is five bytes. `body_size` excludes the header; a complete record is at most **1048632 bytes** (`1 MiB + 56`, the IPv6 prefix). The IPv4 prefix is 32 bytes. Log records retain their separate 512-byte bound. All numeric fields, **including ports**, are little-endian. IP address bytes are in network order. There is no padding or implicit string terminator. In layouts below, `A=4` for IPv4 and `A=16` for IPv6.
 
 | `InfoType` | Byte | Body layout / availability |
 |---|---:|---|
@@ -206,7 +208,6 @@ The header is five bytes. `body_size` excludes the header; a complete record is 
 | Field | Encoding / meaning |
 |---|---|
 | `id` | `u64`, pending NBL verdict ID. |
-| `process_id` | `u64`, always 0. |
 | `direction` | `u8`, guest outbound=0 / inbound=1. |
 | `protocol` | `u8`, IP protocol number. |
 | `local_ip` | `A` raw bytes, guest endpoint. |
@@ -214,10 +215,10 @@ The header is five bytes. `body_size` excludes the header; a complete record is 
 | `local_port` | `u16`. |
 | `remote_port` | `u16`. |
 | `payload_layer` | `u8`, always 3. |
-| `payload_size` | `u32`, number of captured IP bytes, at most 256. |
-| `payload` | Exactly `payload_size` bytes. |
+| `payload_size` | `u32`, complete observed IP packet length, at most 1048576. |
+| `payload` | Exactly `payload_size` bytes, starting with the original IP header; never a shortened capture. |
 
-Body size is `35 + payload_size` for IPv4 or `59 + payload_size` for IPv6; total frame size is respectively `40 + payload_size` or `64 + payload_size`.
+Body size is `27 + payload_size` for IPv4 or `51 + payload_size` for IPv6; total frame size is respectively `32 + payload_size` or `56 + payload_size`. No process-ID bytes or alignment padding are present. These layouts are not wire-compatible with 0.2.1.0; command, verdict, bandwidth and legacy END layouts are unchanged.
 
 **END compatibility body**, understood by the client but not produced by the LWF:
 
@@ -266,9 +267,9 @@ Empty/oversized/truncated writes are rejected with `STATUS_INVALID_PARAMETER`; u
 
 ### Device-independent codec helpers
 
-`pmkext::wire` exposes `IsSupportedVerdict`, `ValidateCommands`, `EncodeVerdict`, and `DispatchRecord`. `EncodeVerdict` fills a fixed ten-byte array; `DispatchRecord` validates exactly one complete frame before invoking its handler.
+`pmkext::wire` exposes `IsCompatibleVersion`, `IsSupportedVerdict`, `ValidateCommands`, `EncodeVerdict`, and `DispatchRecord`. `IsCompatibleVersion` accepts exactly `kRequiredDeviceVersion={0,3,0,0}`; `Open` itself does not perform this check. `EncodeVerdict` fills a fixed ten-byte array; `DispatchRecord` validates exactly one complete frame before invoking its handler.
 
-`RecordStream::Feed(bytes, length, callback, error)` accepts arbitrary read boundaries and invokes the callback for each complete frame. `PendingBytes()` reports buffered incomplete bytes; `Reset()` discards buffered state. An oversized header invalidates the stream until reset; it does not guess a new boundary. Constants are `kRecordHeaderSize=5`, `kMaxRecordSize=512`, `kMaxCommandBatchSize=65536`, and `kVerdictCommandSize=10`.
+`RecordStream::Feed(bytes, length, callback, error)` accepts arbitrary read boundaries and invokes the callback for each complete frame. `PendingBytes()` reports buffered incomplete bytes; `Reset()` discards buffered state. An oversized header invalidates the stream until reset; it does not guess a new boundary. The stream keeps at most one bounded record in heap storage and assembles large records across multiple driver reads. Constants are `kRecordHeaderSize=5`, `kConnectionIpv4PrefixSize=32`, `kConnectionIpv6PrefixSize=56`, `kMaxPayloadSize=1048576`, `kMaxRecordSize=1048632`, `kMaxLogRecordSize=512`, `kMaxCommandBatchSize=65536`, and `kVerdictCommandSize=10`.
 
 ## License
 

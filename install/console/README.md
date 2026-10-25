@@ -1,6 +1,6 @@
 # Native HyperVGuard setup tools
 
-Current driver-store package: **0.2.1.4**; unchanged SYS/device wire version: **0.2.1.0**. This release fixes GetClassGuid/E_POINTER and non-PnP Default Switch setup through merged NetCfg/NETIO identity and target disable-before-arm ordering. Use the coherent new INF/DLL/CAT/setup EXE set. See [the fix and validation](../../docs/NETCFG-IDENTITY-FIX.md).
+Current driver-store package and SYS/device wire version: **0.3.0.0**. This release removes process IDs from Connection events and transmits complete IP packets. Existing GUID/LUID target checks and disable-before-arm setup behavior are unchanged. Use the coherent new INF/DLL/CAT/setup EXE set and matching monitor; older device versions are rejected. Package generation does not replace the installed driver.
 
 `Install.exe` and `Uninstall.exe` replace `scripts/Install.ps1` and `scripts/Uninstall.ps1`. They are native Windows x64 C++ console programs using system APIs directly, not compiled script launchers. No PowerShell module, PowerShell execution policy, `netcfg.exe` child process, SCM service creation, or driver-device access is involved.
 
@@ -63,7 +63,7 @@ When installation requests reboot, do not bypass the disarmed state. Reboot, the
 ## Native lifecycle and scope
 
 - `Target.cpp` queries only local WMI. It verifies the built-in Default Switch identity `c08cb7b8-9b3c-408e-8e30-5e16a3aeb444`, follows **internal management-OS Ethernet port → LAN endpoint → active connection → switch endpoint** associations, and matches the port's `Microsoft:{GUID}` device ID to the exact `MSFT_NetAdapter`. Ethernet type, virtual/hardware flags, nonzero LUID, and native GUID/LUID round-trip conversion are checked. Names are diagnostic only. Missing/ambiguous/stale identity aborts; there is no friendly-name fallback.
-- `Package.cpp` keeps non-write/non-delete-sharing handles open on all four package files. SetupAPI parses the supported 0.2.1.4 NetService/LWF INF, notify CLSID, driver-store destinations and binding policy. WinVerifyTrust validates SYS/DLL/CAT trust and SHA-256 catalog membership of INF/SYS/DLL. Verification uses cached trust information without a timestamp request, certificate import, trust-store mutation or security-policy change.
+- `Package.cpp` keeps non-write/non-delete-sharing handles open on all four package files. SetupAPI parses the supported 0.3.0.0 NetService/LWF INF, notify CLSID, driver-store destinations and binding policy. WinVerifyTrust validates SYS/DLL/CAT trust and SHA-256 catalog membership of INF/SYS/DLL. Verification uses cached trust information without a timestamp request, certificate import, trust-store mutation or security-policy change.
 - `Management.cpp` implements an injectable workflow shared by the real EXEs and offline fake-system tests. Before installation it refuses an existing service/component and a running monitor, requires confirmation, acquires a NetCfg write lock, and rechecks the target and installation state. `AllowBindings=0` is written before target identity and before NetCfg can install the component; `ConfigVersion=2` is written last.
 - `WindowsSetup.cpp` stages the validated INF through `SetupCopyOEMInfW` and uses `INetCfgClassSetup::Install` / `DeInstall` plus `INetCfg::Apply` directly. It inspects only `hyperv_guard` binding paths, requiring each path to terminate at exactly one adapter GUID. An automatically enabled non-PnP exact-target path is explicitly disabled while disarmed, applied/refreshed and verified disabled before arming; resume follows the same ordering. Only paths to the exact target may be enabled; an enabled foreign path causes abort/rollback, not edits to that adapter. Several NetCfg paths to the same exact target are handled together.
 - A failed **new installation** first disarms, discards pending NetCfg changes, and attempts to remove only its own new component. A failed **resume** after mutation disarms but never removes a preexisting component; rejected preflight remains read-only. Configuration is deleted only after complete component/service removal. On failure or reboot it is retained for safe recovery. Staged Driver Store packages are not forcibly purged.
@@ -99,13 +99,13 @@ The normal `scripts/Build.ps1` also builds/copies both EXEs, including with `-Sk
 
 The native setup sources are licensed under the GNU General Public License version 3 only (`GPL-3.0-only`); see [LICENSE](../../LICENSE). They remain independent of the monitor implementation.
 
-## Validation
+## Historical validation
 
 The explicitly authorized 2026-10-25 installation of **0.2.1.4** completed with exit 0, without a reboot request. HyperVGuard is Running; only the exact Default Switch host adapter binding is enabled. All 239 unrelated bindings match the pre-install snapshot and installed package hashes match dist. No monitor/device/traffic test was run; packet interception and real resume remain unverified. See [the live report](../../docs/NETCFG-IDENTITY-FIX.md).
 
 ### Historical offline validation
 
-The following is the **initial console conversion snapshot**. Current package 0.2.1.4 passed **15/15** suites, including adapter GetClassGuid/E_POINTER and non-PnP regressions, **38** fake-system lifecycle cases and **13** rejected INF mutations; current signing and artifact details are in [NETCFG-IDENTITY-FIX](../../docs/NETCFG-IDENTITY-FIX.md).
+The following is the **initial console conversion snapshot**. The preceding package 0.2.1.4 passed **15/15** suites, including adapter GetClassGuid/E_POINTER and non-PnP regressions, **38** fake-system lifecycle cases and **13** rejected INF mutations; that snapshot's signing and artifact details are in [NETCFG-IDENTITY-FIX](../../docs/NETCFG-IDENTITY-FIX.md).
 
 The 2026-10-25 Release build in `build/native-management` passed **14/14 no-driver CTest suites**, including **33 fake-system console management cases**, **12 rejected INF mutations**, and **24 actual help/invalid-CLI invocations** of the two EXEs. Optional read-only validation also accepted the existing signed 0.2.1.0 package and checked SHA-256 catalog membership for INF/SYS/DLL. PE inspection found no child-process launch/manual-SCM lifecycle imports and no dynamic VC++ runtime dependency in the setup EXEs.
 

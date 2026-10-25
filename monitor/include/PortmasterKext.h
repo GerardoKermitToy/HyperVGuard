@@ -79,22 +79,22 @@ std::string FormatIpv4(const uint8_t ip[4]);
 std::string FormatIpv6(const uint8_t ip[16]);
 bool NormalizeIpAddress(const std::wstring& literal, std::string& normalized);
 
-// One event identifies one owned NBL pending one verdict. The driver drops
-// unsupported/mixed batches rather than reporting their first packet as all of
-// them. No host process, thread, switch, port or NIC identity is inferred.
+// One event identifies one owned NBL pending one verdict. For a homogeneous
+// multi-NB NBL, payload is the complete first NB IP packet, not concatenated NB
+// data. Unsupported/mixed batches are dropped. No host process, thread, switch,
+// port or NIC identity is inferred.
 struct Connection {
     bool     ipv6 = false;
     uint64_t id = 0;
-    uint64_t process_id = 0; // Always 0: there is no PID owner at this layer.
     uint8_t  direction = 0;  // Guest outbound=0/inbound=1; local=guest, opposite host NDIS path.
     uint8_t  protocol = 0;
     uint8_t  local_ip[16] = {};
     uint8_t  remote_ip[16] = {};
     uint16_t local_port = 0;
     uint16_t remote_port = 0;
-    uint8_t  payload_layer = 0;
-    uint32_t payload_size = 0; // Captured IP bytes, not the original packet length.
-    std::vector<uint8_t> payload;
+    uint8_t  payload_layer = 3;
+    uint32_t payload_size = 0; // Complete logical IP packet length, at most 1 MiB.
+    std::vector<uint8_t> payload; // All IP bytes, without Ethernet/VLAN headers or truncation.
 
     std::string LocalIpString() const;
     std::string RemoteIpString() const;

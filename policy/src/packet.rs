@@ -1,4 +1,4 @@
-use hyperv_protocol::{CAPTURE, Connection, Direction};
+use hyperv_protocol::{Connection, Direction, MAX_PAYLOAD, connection_header_len};
 
 pub const SNAPSHOT: usize = 320;
 
@@ -54,7 +54,14 @@ pub struct Packet {
     pub flow: Flow,
     pub connection: Connection,
     pub cacheable: bool,
-    pub ip_len: u32,
+    pub ip_len: u32,      // Total bytes for bandwidth; can aggregate same-flow NBs.
+    pub payload_len: u32, // Complete IP packet in the first NB, without Ethernet padding.
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CaptureLayout {
+    pub record_len: usize,
+    pub frame_start: usize,
+    pub frame_len: usize,
 }
 impl Packet {
     pub const EMPTY: Self = Self {
@@ -62,7 +69,23 @@ impl Packet {
         connection: Connection::EMPTY,
         cacheable: false,
         ip_len: 0,
+        payload_len: 0,
     };
+    // Leave room for the wire prefix and copy Ethernet+IP straight into the final
+    // allocation. Encoding the prefix later overwrites only the Ethernet bytes.
+    pub fn capture_layout(&self) -> Option<CaptureLayout> {
+        let payload_len = self.payload_len as usize;
+        if payload_len > MAX_PAYLOAD {
+            return None;
+        }
+        let prefix = connection_header_len(&self.connection);
+        let l2_len = usize::from(self.flow.l2_len);
+        Some(CaptureLayout {
+            record_len: prefix + payload_len,
+            frame_start: prefix.checked_sub(l2_len)?,
+            frame_len: l2_len + payload_len,
+        })
+    }
     pub fn orient(&mut self, path: NdisPath) {
         let direction = path.direction();
         self.connection.direction = direction;
@@ -91,6 +114,7 @@ pub enum ParseError {
     Truncated,
     Malformed,
     TooManyVlans,
+    TooLarge,
 }
 
 fn be16(bytes: &[u8], offset: usize) -> u16 {
@@ -176,6 +200,9 @@ pub fn parse(
         p.flow.destination.copy_from_slice(&ip[24..40]);
         (40, ip[6], false, total)
     };
+    if ip_len > MAX_PAYLOAD {
+        return Err(ParseError::TooLarge);
+    }
     let mut fragment = fragmented;
     let mut fully_parsed = true;
     if p.flow.ipv6 {
@@ -236,9 +263,7 @@ pub fn parse(
     p.connection.remote_ip = p.flow.destination;
     p.connection.local_port = p.flow.source_port;
     p.connection.remote_port = p.flow.destination_port;
-    let capture_len = CAPTURE.min(ip_len).min(data.len() - offset);
-    p.connection.capture[..capture_len].copy_from_slice(&data[offset..offset + capture_len]);
-    p.connection.capture_len = capture_len as u16;
+    p.payload_len = ip_len as u32;
     Ok(Some(p))
 }
 
@@ -264,8 +289,8 @@ mod tests {
         let p = parse(&b, b.len(), b.len(), false).unwrap().unwrap();
         assert!(p.cacheable);
         assert_eq!(p.flow.source_port, 1234);
-        assert_eq!(p.connection.capture_len, 28);
-        assert_eq!(p.connection.capture[0], 0x45);
+        assert_eq!(p.payload_len, 28);
+        assert_eq!(p.ip_len, 28);
     }
     #[test]
     fn host_send_normalizes_guest_endpoints_without_changing_capture() {
@@ -278,7 +303,8 @@ mod tests {
         assert_eq!(p.connection.remote_ip, p.flow.source);
         assert_eq!(p.connection.local_port, 53);
         assert_eq!(p.connection.remote_port, 1234);
-        assert_eq!(p.connection.capture, original.connection.capture);
+        assert_eq!(p.payload_len, original.payload_len);
+        assert_eq!(p.capture_layout(), original.capture_layout());
         assert_eq!(p.flow, original.flow);
         p.orient(NdisPath::Receive);
         assert_eq!(p.connection, original.connection);
@@ -328,7 +354,7 @@ mod tests {
                 outbound.connection.remote_port
             );
             assert_ne!(inbound.flow.source, outbound.flow.source);
-            assert_ne!(inbound.connection.capture, outbound.connection.capture);
+            assert_eq!(inbound.payload_len, outbound.payload_len);
         }
     }
     #[test]

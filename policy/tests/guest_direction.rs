@@ -1,8 +1,8 @@
 use hyperv_policy::{
-    engine::{Engine, Finish, Key, Submission},
+    engine::{Engine, Finish, Key, Submission, allocate_record},
     packet::{self, NdisPath, Packet},
 };
-use hyperv_protocol::{Direction, Verdict};
+use hyperv_protocol::{Direction, Verdict, connection_header_len};
 
 fn sandbox_request(protocol: u8) -> Vec<u8> {
     let size = if protocol == 1 { 60u16 } else { 52 };
@@ -55,7 +55,14 @@ fn engine() -> Box<Engine> {
     engine
 }
 
-fn submit(engine: &mut Engine, packet: Packet, path: NdisPath, token: usize) -> u64 {
+fn capture(packet: &Packet, frame: &[u8]) -> Vec<u8> {
+    let layout = packet.capture_layout().unwrap();
+    let mut data = allocate_record(layout.record_len).unwrap();
+    data[layout.frame_start..].copy_from_slice(&frame[..layout.frame_len]);
+    data
+}
+
+fn submit(engine: &mut Engine, packet: Packet, path: NdisPath, token: usize, frame: &[u8]) -> u64 {
     let key = Key {
         adapter: 1,
         epoch: engine.epoch(1).unwrap(),
@@ -63,7 +70,8 @@ fn submit(engine: &mut Engine, packet: Packet, path: NdisPath, token: usize) -> 
         vlan: 0,
         flow: packet.flow,
     };
-    let Submission::Pending(id) = engine.submit(key, packet, token, 0, 100) else {
+    let data = capture(&packet, frame);
+    let Submission::Pending(id) = engine.submit(key, packet, token, 0, 100, Some(data)) else {
         panic!("expected one pending NBL")
     };
     id
@@ -115,11 +123,9 @@ fn sandbox_ping_and_tcp_requests_are_outbound_replies_inbound() {
             assert_eq!(connection.local_port, if protocol == 1 { 0 } else { 49714 });
             assert_eq!(connection.remote_port, if protocol == 1 { 0 } else { 1234 });
             assert_eq!(connection.protocol, protocol);
-            assert_eq!(usize::from(connection.capture_len), original.len() - 14);
-            assert_eq!(
-                &connection.capture[..usize::from(connection.capture_len)],
-                &original[14..]
-            );
+            assert_eq!(packet.payload_len as usize, original.len() - 14);
+            let data = capture(&packet, &original);
+            assert_eq!(&data[connection_header_len(&connection)..], &original[14..]);
             assert_eq!(packet.cacheable, protocol == 6);
         }
     }
@@ -136,23 +142,22 @@ fn guest_wire_direction_and_endpoints_survive_allow_and_drop() {
                 (NdisPath::Send, reply(&request), 1),
             ] {
                 let packet = parse(&bytes, path);
-                let id = submit(&mut engine, packet, path, 7);
+                let id = submit(&mut engine, packet, path, 7, &bytes);
                 let event = record(&mut engine, 1);
                 assert_eq!(u64::from_le_bytes(event[5..13].try_into().unwrap()), id);
-                assert_eq!(&event[13..21], &[0; 8]);
-                assert_eq!(event[21], direction);
-                assert_eq!(event[22], protocol);
-                assert_eq!(&event[23..27], &[172, 28, 192, 8]);
-                assert_eq!(&event[27..31], &packet.connection.remote_ip[..4]);
+                assert_eq!(event[13], direction);
+                assert_eq!(event[14], protocol);
+                assert_eq!(&event[15..19], &[172, 28, 192, 8]);
+                assert_eq!(&event[19..23], &packet.connection.remote_ip[..4]);
                 assert_eq!(
-                    u16::from_le_bytes(event[31..33].try_into().unwrap()),
+                    u16::from_le_bytes(event[23..25].try_into().unwrap()),
                     packet.connection.local_port
                 );
                 assert_eq!(
-                    u16::from_le_bytes(event[33..35].try_into().unwrap()),
+                    u16::from_le_bytes(event[25..27].try_into().unwrap()),
                     packet.connection.remote_port
                 );
-                assert_eq!(&event[40..], &bytes[14..]);
+                assert_eq!(&event[32..], &bytes[14..]);
                 let action = engine.verdict(id, verdict, 101).unwrap();
                 assert_eq!(action.token, 7);
                 assert_eq!(
@@ -178,7 +183,7 @@ fn guest_bandwidth_uses_receive_for_tx_send_for_rx() {
     response[46] = 0x50;
     for (path, bytes) in [(NdisPath::Receive, request), (NdisPath::Send, response)] {
         let packet = parse(&bytes, path);
-        let id = submit(&mut engine, packet, path, 1);
+        let id = submit(&mut engine, packet, path, 1, &bytes);
         assert_eq!(
             engine.verdict(id, Verdict::Accept, 101).unwrap().finish,
             Finish::Allow

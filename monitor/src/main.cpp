@@ -1,6 +1,7 @@
 // HyperVGuard console monitor, adapted from kext_client on 2026-10-25 (see README.md/LICENSE).
 // Interactive runs wait for driver startup; --duration runs never wait.
 #include "PortmasterKext.h"
+#include "DriverProtocol.h"
 #include "DriverStartup.h"
 #include "DelayedVerdicts.h"
 #include "MonitorOptions.h"
@@ -181,12 +182,14 @@ int MonitorMain(int argc, wchar_t** argv) {
         return 1;
     }
     std::printf("Driver version: %u.%u.%u.%u\n", version[0], version[1], version[2], version[3]);
-    if (version[0] != 0 || version[1] != 2 || version[2] != 1 || version[3] != 0) {
-        std::fprintf(stderr, "ERROR: incompatible HyperVGuard driver version (expected 0.2.1.0)\n");
+    if (!pmkext::wire::IsCompatibleVersion(version)) {
+        std::fprintf(stderr, "ERROR: incompatible HyperVGuard driver version (expected 0.3.0.0); "
+                             "installed SYS uses a different wire layout\n");
         return 1;
     }
-    std::printf("CONN: one NBL decision, pid=0, direction=0 outbound/1 inbound from the guest side.\n"
-                "Local=guest endpoint, remote=peer; host receive=outbound, host send=inbound; no process/thread identity. Payload is layer-3 IP.\n"
+    std::printf("CONN: one NBL decision, direction=0 outbound/1 inbound from the guest side.\n"
+                "Local=guest endpoint, remote=peer; host receive=outbound, host send=inbound; no process/thread identity.\n"
+                "Payload is the complete layer-3 logical IP packet, up to 1 MiB without truncation.\n"
                 "Permanent cache TTL: 60 s; pending timeout: 2 s by default, fail-open by default.\n"
                 "Bandwidth: tx/rx=admitted guest outbound/inbound IP bytes, no PID; clean-ended only sweeps TTLs.\n"
                 "No synthetic END events; UpdateV4/UpdateV6 and redirects are unsupported.\n");
@@ -287,7 +290,7 @@ int MonitorMain(int argc, wchar_t** argv) {
         // Output filtering must never withhold or change a verdict.
         if (!show) return;
         pmkext::RecordOutput record(g_out, g_print_mutex);
-        record.Write("%s[CONN %s] id=%llu pid=0 %s proto=%u(%s) layer=%u(%s)\n"
+        record.Write("%s[CONN %s] id=%llu %s proto=%u(%s) layer=%u(%s)\n"
                      "          local(guest)=%s:%u  remote(peer)=%s:%u  payload=%u bytes\n",
                      TimePrefix(opt.timestamps).c_str(), c.ipv6 ? "v6" : "v4",
                      static_cast<unsigned long long>(c.id), pmkext::DirectionToString(c.direction),
@@ -321,7 +324,7 @@ int MonitorMain(int argc, wchar_t** argv) {
     // This code never synthesizes END or bandwidth from NBL/verdict counters.
     handlers.on_connection_end = [&](const pmkext::ConnectionEnd& end) {
         ++ends;
-        if (!opt.show_ends || (opt.has_filter_pid && opt.filter_pid != end.process_id) ||
+        if (!opt.show_ends ||
             (opt.has_filter_protocol && opt.filter_protocol != end.protocol)) return;
         if (opt.filter.present &&
             !pmkext::monitor::MatchesEndpoint(opt.filter, end.LocalIpString(), end.local_port) &&
@@ -334,7 +337,7 @@ int MonitorMain(int argc, wchar_t** argv) {
     };
     handlers.on_bandwidth = [&](const pmkext::BandwidthStats& stats) {
         ++bandwidth_records;
-        if (!opt.show_bandwidth || opt.has_filter_pid ||
+        if (!opt.show_bandwidth ||
             (opt.has_filter_protocol && opt.filter_protocol != stats.protocol)) return;
         auto keep = [&](const pmkext::BandwidthEntry& entry) {
             return !opt.filter.present ||

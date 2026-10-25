@@ -28,7 +28,9 @@ expect_invalid(missing_duration "positive decimal" --duration)
 expect_invalid(bad_poll "positive decimal" --duration 1 --poll 0)
 expect_invalid(bad_poll_negative "positive decimal" --duration 1 --poll -1)
 expect_invalid(bad_protocol "0 to 255" --duration 1 --filter-protocol 256)
-expect_invalid(bad_pid "supports only 0" --duration 1 --filter-pid 1234)
+expect_invalid(pid_filter_zero_rejected "unknown option" --duration 1 --filter-pid 0)
+expect_invalid(pid_filter_nonzero_rejected "unknown option" --duration 1 --filter-pid 1234)
+expect_invalid(pid_filter_missing_rejected "unknown option" --duration 1 --filter-pid)
 expect_invalid(bad_match "without --verdict" --duration 1 --match 192.0.2.1)
 expect_invalid(bad_port "1 to 65535" --duration 1 --verdict block --match 192.0.2.1:65536)
 expect_invalid(bad_ipv6_port "1 to 65535" --duration 1 --filter-ip "[::1]:53x")
@@ -65,6 +67,10 @@ if(NOT result STREQUAL "0" OR NOT output MATCHES "direction=0 outbound, 1 inboun
    NOT output MATCHES "Without --duration, wait for driver startup" OR
    NOT output MATCHES "Ctrl\\+C exits" OR
    NOT output MATCHES "never wait for driver startup" OR
+   NOT output MATCHES "complete logical IP packet" OR
+   NOT output MATCHES "up to 1 MiB, no truncation" OR
+   NOT output MATCHES "Connection events carry no process/thread identity" OR
+   output MATCHES "--filter-pid|PID=0|possibly shortened" OR
    output MATCHES "HyperVGuardPipe|Bridge:|winrpc|named-pipe" OR
    output MATCHES "Opening explicitly installed|Driver version")
     message(FATAL_ERROR "Help did not stay on the no-device path: ${result}: ${output}${errors}")

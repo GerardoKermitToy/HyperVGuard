@@ -22,11 +22,11 @@ bool TestValidOptions() {
     pmkext::monitor::Options opt;
     std::string error;
     CHECK(Parse({L"--duration", L"1", L"--out", L"never-opened-by-parser.log", L"--poll", L"4294967295",
-        L"--timestamps", L"--payload", L"--memory-stats", L"--filter-pid", L"0", L"--filter-protocol", L"17",
+        L"--timestamps", L"--payload", L"--memory-stats", L"--filter-protocol", L"17",
         L"--filter-ip", L"[2001:DB8::1]:53", L"--verdict", L"drop", L"--match", L"192.0.2.1:53",
         L"--verdict-delay-ms", L"4294967295"}, opt, error));
     CHECK(opt.duration_s == 1 && opt.poll_ms == 4294967295u && opt.verdict_delay_ms == 4294967295u);
-    CHECK(opt.timestamps && opt.show_payload && opt.memory_stats && opt.has_filter_pid && opt.filter_pid == 0);
+    CHECK(opt.timestamps && opt.show_payload && opt.memory_stats);
     CHECK(opt.has_filter_protocol && opt.filter_protocol == 17);
     CHECK(opt.filter.ip == "2001:0db8:0000:0000:0000:0000:0000:0001" && opt.filter.port == 53);
     CHECK(opt.match.ip == "192.0.2.1" && opt.match.port == 53 && opt.alt_verdict == pmkext::Verdict::Drop);
@@ -64,10 +64,6 @@ bool TestInvalidNumbersAndEndpoints() {
         pmkext::monitor::Options opt;
         CHECK(!Parse({L"--duration", L"1", L"--filter-protocol", bad}, opt, error));
     }
-    for (const wchar_t* bad : {L"1", L"4", L"-1", L"not-a-pid", L"18446744073709551616"}) {
-        pmkext::monitor::Options opt;
-        CHECK(!Parse({L"--duration", L"1", L"--filter-pid", bad}, opt, error));
-    }
     for (const wchar_t* bad : {L"-1", L"1x", L"4294967296", L""}) {
         pmkext::monitor::Options opt;
         CHECK(!Parse({L"--duration", L"1", L"--verdict-delay-ms", bad}, opt, error));
@@ -80,7 +76,7 @@ bool TestInvalidNumbersAndEndpoints() {
         opt = {};
         CHECK(!Parse({L"--duration", L"1", L"--verdict", L"accept", L"--match", bad}, opt, error));
     }
-    for (const wchar_t* option : {L"--duration", L"--poll", L"--out", L"--filter-ip", L"--filter-pid",
+    for (const wchar_t* option : {L"--duration", L"--poll", L"--out", L"--filter-ip",
                                  L"--filter-protocol", L"--verdict", L"--verdict-delay-ms", L"--match"}) {
         pmkext::monitor::Options opt;
         CHECK(!Parse({L"--duration", L"1", option}, opt, error));
@@ -97,9 +93,14 @@ bool TestRejectedCapabilities() {
         CHECK(error.find("redirect") != std::string::npos);
     }
     for (const wchar_t* unsupported : {L"--sys", L"driver.sys", L"--suspend-pid-on-verdict-delay",
-                                      L"--no-inbound-udp-pid-fallback", L"--update-v4", L"--update-v6", L"--unknown"}) {
+                                      L"--no-inbound-udp-pid-fallback", L"--filter-pid", L"--update-v4", L"--update-v6", L"--unknown"}) {
         pmkext::monitor::Options opt;
         CHECK(!Parse({L"--duration", L"1", unsupported}, opt, error));
+    }
+    for (const wchar_t* pid : {L"0", L"1", L"4", L"-1", L"not-a-pid", L"18446744073709551616"}) {
+        pmkext::monitor::Options opt;
+        CHECK(!Parse({L"--duration", L"1", L"--filter-pid", pid}, opt, error));
+        CHECK(error.find("unknown option") != std::string::npos);
     }
     pmkext::monitor::Options bare_match;
     CHECK(!Parse({L"--duration", L"1", L"--match", L"192.0.2.1"}, bare_match, error));
@@ -110,7 +111,7 @@ bool TestFilterAndVerdictSeparation() {
     pmkext::monitor::Options opt;
     std::string error;
     CHECK(Parse({L"--duration", L"1", L"--verdict", L"block", L"--match", L"10.0.0.2:53",
-                 L"--filter-ip", L"10.0.0.1:53", L"--filter-pid", L"0", L"--filter-protocol", L"17"}, opt, error));
+                 L"--filter-ip", L"10.0.0.1:53", L"--filter-protocol", L"17"}, opt, error));
     pmkext::Connection c;
     const uint8_t local[] = {10, 0, 0, 1};
     const uint8_t remote[] = {10, 0, 0, 2};
@@ -125,9 +126,9 @@ bool TestFilterAndVerdictSeparation() {
     c.protocol = 6;
     CHECK(!pmkext::monitor::ShowConnection(opt, c));
     CHECK(pmkext::monitor::AlternateMatches(opt, c)); // Filter cannot alter verdict selection.
-    c.protocol = 17; c.process_id = 1;
-    CHECK(!pmkext::monitor::ShowConnection(opt, c));
-    c.process_id = 0; c.remote_port = 80;
+    c.protocol = 17;
+    CHECK(pmkext::monitor::ShowConnection(opt, c));
+    c.remote_port = 80;
     CHECK(!pmkext::monitor::AlternateMatches(opt, c));
     opt.match = {};
     CHECK(pmkext::monitor::AlternateMatches(opt, c));
@@ -140,7 +141,7 @@ int main() {
     const struct { const char* name; bool (*run)(); } tests[] = {
         {"valid monitor arguments without device access", TestValidOptions},
         {"strict numeric/endpoint validation", TestInvalidNumbersAndEndpoints},
-        {"redirects/SCM/suspension/updates rejected", TestRejectedCapabilities},
+        {"redirects/SCM/suspension/PID filters/updates rejected", TestRejectedCapabilities},
         {"source/destination filters do not alter verdicts", TestFilterAndVerdictSeparation},
     };
     for (const auto& test : tests) {
