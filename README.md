@@ -145,7 +145,7 @@ A typical integration opens the device, checks its version, installs handlers, a
 
 [HyperVGuard.hpp](monitor/include/HyperVGuard.hpp) provides the separate **`hypervguard::Client`** namespace/API. Include just that file in a Windows x64 **C++20** application; no `pmkext` sources, codec, or client library are needed. It uses Kernel32 and Advapi32 (MSVC links Advapi32 through the header's pragma; other toolchains must link it explicitly). A compiled example is [callback_client.cpp](monitor/examples/callback_client.cpp), built as `build/monitor/callback_client.exe`. The example opens a real device if explicitly run; offline tests never run it.
 
-`Run` uses one caller-owned thread: it blocks on overlapped read completion, Stop, or an optional runtime deadline. There is no second reader/poll thread, idle read polling, automatic statistics timer, or automatic verdict. The receive buffer is allocated once per Run; reads go directly into it. Connection payload/IP and log-message views borrow that storage, with no separate per-event payload allocation or copy. Only an incomplete tail may move between reads. Callback function pointers plus a `void*` context avoid type-erasure/capture allocations; copy views only if they must outlive the callback. This minimizes idle wakeups and hot-path work, not a measured guarantee of zero CPU usage.
+`Run` uses one caller-owned thread: it blocks on overlapped read completion, Stop, or an optional runtime deadline. There is no second reader/poll thread, idle read polling, automatic statistics timer, or automatic verdict. The receive buffer is allocated once per Run; reads go directly into it. Connection headers, payloads, bandwidth arrays and log-message views borrow that storage: no per-event structure reconstruction, allocation or payload copy. Bandwidth dispatch calls once per nonempty record, not once per tuple. A head/tail cursor retains partial frames in place; compaction happens only when the writable tail is short, not after every read. Callback function pointers plus a `void*` context avoid type-erasure/capture allocations. Copy the actual data (not just its pointer) if it must outlive the callback. This minimizes idle wakeups and hot-path work, not a measured guarantee of zero CPU usage.
 
 | Method | Contract (`DWORD`: 0 is success, otherwise a Win32 error) |
 |---|---|
@@ -158,11 +158,28 @@ A typical integration opens the device, checks its version, installs handlers, a
 | `Send(Command)` | Single-byte ClearCache=4, GetLogs=5, GetBandwidthStats=6, PrintMemoryStats=7 or CleanEndedConnections=8. No automatic scheduling. |
 | `Shutdown()` | Calls Stop and issues the policy shutdown IOCTL. Does not close, unload or unbind. |
 
-`Callbacks` contains optional function pointers `on_connection(void*, const Connection&)`, `on_log(void*, uint8_t severity, std::string_view)`, `on_bandwidth(void*, const Bandwidth&)` and their shared `context`. The callback table/context must remain alive throughout Run. Callbacks may send commands/verdicts or call Stop; do not close/destroy the client from a callback. Open/Close are not concurrent operations; only Stop is supported during startup, and commands may run concurrently once Open has succeeded. Slow callbacks still delay verdicts and shutdown.
+`Callbacks` contains optional function pointers and their shared `context`:
 
-`Connection` contains `id:u64`, `ipv6:bool`, `direction:u8`, `protocol:u8`, borrowed `local_ip`/`remote_ip` spans (4 or 16 network-order bytes), `local_port`/`remote_port:u16`, and a borrowed complete-IP `payload` span. No PID or thread ID is present. `Bandwidth` contains `ipv6`, `protocol`, the same endpoint views/ports, and `transmitted_bytes`/`received_bytes:u64`; its callback is invoked once per tuple entry. Guest direction and all policy/fallback semantics are the same as the wire reference. `Verdict` contains Accept=2, PermanentAccept=3, Block=4, PermanentBlock=5, Drop=6 and PermanentDrop=7.
+| Callback | Arguments after `void* context` |
+|---|---|
+| `on_connection_v4` | `const ConnectionV4* header, const uint8_t* payload, uint32_t payload_size` |
+| `on_connection_v6` | `const ConnectionV6* header, const uint8_t* payload, uint32_t payload_size` |
+| `on_log` | `uint8_t severity, std::string_view message` |
+| `on_bandwidth_v4` | `uint8_t protocol, const BandwidthV4* entries, uint32_t count` |
+| `on_bandwidth_v6` | `uint8_t protocol, const BandwidthV6* entries, uint32_t count` |
 
-For offline/custom transports, `Client::DispatchRecord(Bytes, callbacks)` validates one complete record without copying payloads. The optional `Client::Stream` helper exposes a writable `Buffer()` (at most 65536 bytes), `Commit(written, callbacks)`, `PendingBytes()` and `Reset()`; an invalid stream stays failed until Reset. Record size is bounded by `MaxRecordSize=1048632`, read size by `ReadSize=65536`. Legacy connection-END types are not exposed by this client: the driver never generates them.
+Every header/array/payload pointer refers directly to the validated input buffer and expires when the callback returns. The callback table/context must remain alive throughout Run. Callbacks may send commands/verdicts or call Stop; do not close/destroy the client from a callback. Open/Close are not concurrent operations; only Stop is supported during startup, and commands may run concurrently once Open has succeeded. Slow callbacks still delay verdicts and shutdown.
+
+| Packed type (`Client::`) | Size / fields in wire order |
+|---|---|
+| `ConnectionV4` / `ConnectionV6` | 23 / 47 bytes: `id:u64`, `direction:u8`, `protocol:u8`, `local_ip[4/16]`, `remote_ip[4/16]`, `local_port:u16`, `remote_port:u16`, `payload_layer:u8=3`. The following four-byte payload length is validated and passed separately with the complete-IP payload pointer. |
+| `BandwidthV4` / `BandwidthV6` | 28 / 52 bytes per entry: `local_ip[4/16]`, `local_port:u16`, `remote_ip[4/16]`, `remote_port:u16`, `transmitted_bytes:u64`, `received_bytes:u64`. One callback receives the entire contiguous array; an empty array produces no callback. |
+
+These fixed, trivially-copyable wire views use scoped `#pragma pack(push, 1)` / `pop`, with compile-time size, alignment and offset checks. All numbers are little-endian (native on supported Windows x64); addresses remain network-order bytes. Read packed scalar fields by value; do not pass a field's address/reference to an API expecting naturally aligned integers. IPv4/IPv6 is selected by the callback type, not an added `ipv6` field; no PID/thread ID is present. Guest direction and all policy/fallback semantics are unchanged. `Verdict` contains Accept=2, PermanentAccept=3, Block=4, PermanentBlock=5, Drop=6 and PermanentDrop=7.
+
+**C++ source migration:** the former unified `on_connection(const Connection&)` and per-tuple `on_bandwidth(const Bandwidth&)` callbacks are replaced by the IPv4/IPv6 pointer callbacks above. Update consumers as in [callback_client.cpp](monitor/examples/callback_client.cpp); `pmkext::Driver` and the driver wire API/version **0.3.1.0** are unchanged.
+
+For offline/custom transports, `Client::DispatchRecord(Bytes, callbacks)` validates one complete record before exposing any packed views. The optional `Client::Stream` helper exposes a writable `Buffer()` (at most 65536 bytes), `Commit(written, callbacks)`, `PendingBytes()` and `Reset()`; an invalid stream stays failed until Reset. Fill the latest Buffer and Commit it before asking for another; Buffer may compact storage, so do not retain its pointer across calls. Record size is bounded by `MaxRecordSize=1048632`, payload by `MaxPayloadSize=1048576`, read size by `ReadSize=65536`. Legacy connection-END types are not exposed by this client: the driver never generates them.
 
 ### Callbacks and data types
 

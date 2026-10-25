@@ -8,7 +8,9 @@
 #endif
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cassert>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <memory>
@@ -25,32 +27,65 @@ namespace hypervguard {
 // Join all callers before Close/destruction; callbacks may Stop but not Close.
 class Client final {
 public:
+    static_assert(std::endian::native == std::endian::little, "The device wire API is little-endian");
     using Bytes = std::span<const uint8_t>;
-    static constexpr size_t MaxRecordSize = 1'048'632;
+    static constexpr size_t MaxPayloadSize = 1'048'576;
+    static constexpr size_t MaxRecordSize = MaxPayloadSize + 56;
     static constexpr DWORD ReadSize = 65'536;
     static constexpr std::array<uint8_t, 4> RequiredVersion{0, 3, 1, 0};
     enum class Verdict : uint8_t { Accept = 2, PermanentAccept, Block, PermanentBlock, Drop, PermanentDrop };
     enum class Command : uint8_t { ClearCache = 4, GetLogs, GetBandwidthStats, PrintMemoryStats, CleanEndedConnections };
-    struct Connection {
+
+    // Borrowed wire views, not normalized copies. Packing applies only to these
+    // fixed layouts; never take an aligned scalar pointer/reference to a field.
+#pragma pack(push, 1)
+    template <size_t AddressSize> struct ConnectionFixed {
         uint64_t id;
-        bool ipv6;
         uint8_t direction, protocol; // 0=guest outbound, 1=guest inbound; never host PID.
-        Bytes local_ip, remote_ip;
+        uint8_t local_ip[AddressSize], remote_ip[AddressSize];
         uint16_t local_port, remote_port;
-        Bytes payload; // Complete L3 packet, not Ethernet; may be a logical offload packet.
+        uint8_t payload_layer; // Always 3. The following u32 is the payload size.
     };
-    struct Bandwidth {
-        bool ipv6;
-        uint8_t protocol;
-        Bytes local_ip, remote_ip;
-        uint16_t local_port, remote_port;
+    template <size_t AddressSize> struct BandwidthValue {
+        uint8_t local_ip[AddressSize];
+        uint16_t local_port;
+        uint8_t remote_ip[AddressSize];
+        uint16_t remote_port;
         uint64_t transmitted_bytes, received_bytes;
     };
+#pragma pack(pop)
+    using ConnectionV4 = ConnectionFixed<4>;
+    using ConnectionV6 = ConnectionFixed<16>;
+    using BandwidthV4 = BandwidthValue<4>;
+    using BandwidthV6 = BandwidthValue<16>;
+    static_assert(sizeof(ConnectionV4) == 23 && sizeof(ConnectionV6) == 47);
+    static_assert(alignof(ConnectionV4) == 1 && alignof(ConnectionV6) == 1);
+    static_assert(offsetof(ConnectionV4, id) == 0 && offsetof(ConnectionV6, id) == 0);
+    static_assert(offsetof(ConnectionV4, direction) == 8 && offsetof(ConnectionV6, direction) == 8);
+    static_assert(offsetof(ConnectionV4, protocol) == 9 && offsetof(ConnectionV6, protocol) == 9);
+    static_assert(offsetof(ConnectionV4, local_ip) == 10 && offsetof(ConnectionV6, local_ip) == 10);
+    static_assert(offsetof(ConnectionV4, remote_ip) == 14 && offsetof(ConnectionV6, remote_ip) == 26);
+    static_assert(offsetof(ConnectionV4, local_port) == 18 && offsetof(ConnectionV6, local_port) == 42);
+    static_assert(offsetof(ConnectionV4, remote_port) == 20 && offsetof(ConnectionV6, remote_port) == 44);
+    static_assert(offsetof(ConnectionV4, payload_layer) == 22 && offsetof(ConnectionV6, payload_layer) == 46);
+    static_assert(sizeof(BandwidthV4) == 28 && sizeof(BandwidthV6) == 52);
+    static_assert(alignof(BandwidthV4) == 1 && alignof(BandwidthV6) == 1);
+    static_assert(offsetof(BandwidthV4, local_ip) == 0 && offsetof(BandwidthV6, local_ip) == 0);
+    static_assert(offsetof(BandwidthV4, local_port) == 4 && offsetof(BandwidthV6, local_port) == 16);
+    static_assert(offsetof(BandwidthV4, remote_ip) == 6 && offsetof(BandwidthV6, remote_ip) == 18);
+    static_assert(offsetof(BandwidthV4, remote_port) == 10 && offsetof(BandwidthV6, remote_port) == 34);
+    static_assert(offsetof(BandwidthV4, transmitted_bytes) == 12 && offsetof(BandwidthV6, transmitted_bytes) == 36);
+    static_assert(offsetof(BandwidthV4, received_bytes) == 20 && offsetof(BandwidthV6, received_bytes) == 44);
+
+    template <class T> using ConnectionCallback = void (*)(void*, const T*, const uint8_t* payload, uint32_t size);
+    template <class T> using BandwidthCallback = void (*)(void*, uint8_t protocol, const T*, uint32_t count);
     struct Callbacks {
         void* context = nullptr;
-        void (*on_connection)(void*, const Connection&) = nullptr;
+        ConnectionCallback<ConnectionV4> on_connection_v4 = nullptr;
+        ConnectionCallback<ConnectionV6> on_connection_v6 = nullptr;
         void (*on_log)(void*, uint8_t severity, std::string_view message) = nullptr;
-        void (*on_bandwidth)(void*, const Bandwidth&) = nullptr; // Once per tuple, not per batch.
+        BandwidthCallback<BandwidthV4> on_bandwidth_v4 = nullptr; // One call per record, not per tuple.
+        BandwidthCallback<BandwidthV6> on_bandwidth_v6 = nullptr;
     };
 
     Client() = default;
@@ -109,7 +144,7 @@ public:
         uint8_t bytes[4]{};
         DWORD size = 0, error = Control(0x802, bytes, 4, size);
         if (!error && size != 4) error = ERROR_BAD_LENGTH;
-        if (!error) out = static_cast<uint32_t>(ReadLe(bytes, 4));
+        if (!error) out = ReadLe<uint32_t>(bytes);
         return error;
     }
     DWORD Shutdown() {
@@ -121,7 +156,7 @@ public:
         const auto v = static_cast<uint8_t>(verdict);
         if (v < 2 || v > 7) return ERROR_INVALID_PARAMETER;
         uint8_t bytes[10]{1};
-        for (unsigned i = 0; i < 8; ++i) bytes[i + 1] = static_cast<uint8_t>(id >> (i * 8));
+        std::memcpy(bytes + 1, &id, sizeof(id));
         bytes[9] = v;
         return Write(bytes, sizeof(bytes));
     }
@@ -163,78 +198,86 @@ public:
         return ERROR_SUCCESS;
     }
 
-    // Device-independent, zero-copy decode. Exactly one complete bounded record.
+    // Device-independent, borrowed packed views. Exactly one complete bounded record.
     static DWORD DispatchRecord(Bytes record, const Callbacks& cb) {
-        if (record.size() < 5 || record.size() > MaxRecordSize || ReadLe(record.data() + 1, 4) != record.size() - 5)
+        if (record.size() < 5 || record.size() > MaxRecordSize || ReadLe<uint32_t>(record.data() + 1) != record.size() - 5)
             return ERROR_INVALID_DATA;
-        const auto body = record.subspan(5);
-        const uint8_t* p = body.data();
-        if (record[0] == 0) {
-            if (body.empty() || record.size() > 512 || p[0] < 1 || p[0] > 7) return ERROR_INVALID_DATA;
-            if (cb.on_log) cb.on_log(cb.context, p[0], {reinterpret_cast<const char*>(p + 1), body.size() - 1});
-        } else if (record[0] == 1 || record[0] == 2) {
-            const bool v6 = record[0] == 2;
-            const size_t addr = v6 ? 16 : 4, prefix = v6 ? 51 : 27;
-            if (body.size() < prefix || p[8] > 1 || p[prefix - 5] != 3 ||
-                ReadLe(p + prefix - 4, 4) != body.size() - prefix || body.size() - prefix > 1'048'576)
-                return ERROR_INVALID_DATA;
-            const Connection connection{ReadLe(p, 8), v6, p[8], p[9], body.subspan(10, addr),
-                body.subspan(10 + addr, addr), static_cast<uint16_t>(ReadLe(p + 10 + addr * 2, 2)),
-                static_cast<uint16_t>(ReadLe(p + 12 + addr * 2, 2)), body.subspan(prefix)};
-            if (cb.on_connection) cb.on_connection(cb.context, connection);
-        } else if (record[0] == 5 || record[0] == 6) {
-            const bool v6 = record[0] == 6;
-            const size_t addr = v6 ? 16 : 4, entry = addr * 2 + 20;
-            if (body.size() < 5 || (body.size() - 5) % entry || ReadLe(p + 1, 4) != (body.size() - 5) / entry)
-                return ERROR_INVALID_DATA;
-            if (cb.on_bandwidth) for (size_t offset = 5; offset < body.size(); offset += entry) {
-                const uint8_t* b = p + offset;
-                const Bandwidth bandwidth{v6, p[0], body.subspan(offset, addr), body.subspan(offset + addr + 2, addr),
-                    static_cast<uint16_t>(ReadLe(b + addr, 2)), static_cast<uint16_t>(ReadLe(b + addr * 2 + 2, 2)),
-                    ReadLe(b + addr * 2 + 4, 8), ReadLe(b + addr * 2 + 12, 8)};
-                cb.on_bandwidth(cb.context, bandwidth);
-            }
-        } else return ERROR_NOT_SUPPORTED; // No synthetic/legacy connection-END events.
-        return ERROR_SUCCESS;
+        return DispatchBody(record[0], record.subspan(5), cb);
     }
 
-    // Read directly into this reusable heap buffer. Only an incomplete tail moves;
-    // complete packets and callback views are never copied into separate objects.
+    // Read directly into reusable storage; retain [head_, tail_) in place until
+    // the writable tail is short. No compaction on every partial-record read.
     class Stream {
     public:
         std::span<uint8_t> Buffer() noexcept {
             if (!data_ || failed_) return {};
-            const size_t available = MaxRecordSize - used_;
-            return {data_.get() + used_, available < ReadSize ? available : ReadSize};
+            if (MaxRecordSize - tail_ < ReadSize && head_) {
+                const size_t pending = PendingBytes();
+                std::memmove(data_.get(), data_.get() + head_, pending);
+                head_ = 0;
+                tail_ = pending;
+            }
+            const size_t available = MaxRecordSize - tail_;
+            return {data_.get() + tail_, available < ReadSize ? available : ReadSize};
         }
         DWORD Commit(size_t count, const Callbacks& cb, const std::atomic<bool>* stop = nullptr) {
             if (!data_) return ERROR_NOT_ENOUGH_MEMORY;
-            if (failed_ || count > Buffer().size()) { failed_ = true; return ERROR_INVALID_DATA; }
-            used_ += count;
-            size_t consumed = 0;
-            while (used_ - consumed >= 5 && (!stop || !stop->load())) {
-                const uint8_t* p = data_.get() + consumed;
-                const uint64_t body = ReadLe(p + 1, 4);
+            if (failed_ || count > ReadSize || count > MaxRecordSize - tail_) {
+                failed_ = true; return ERROR_INVALID_DATA;
+            }
+            tail_ += count;
+            while (PendingBytes() >= 5 && (!stop || !stop->load())) {
+                const uint8_t* p = data_.get() + head_;
+                const uint32_t body = ReadLe<uint32_t>(p + 1);
                 if (body > MaxRecordSize - 5) { failed_ = true; return ERROR_INVALID_DATA; }
                 const size_t length = 5 + static_cast<size_t>(body);
-                if (used_ - consumed < length) break;
-                const DWORD error = DispatchRecord({p, length}, cb);
+                if (PendingBytes() < length) break;
+                const DWORD error = DispatchBody(p[0], {p + 5, body}, cb);
                 if (error) { failed_ = true; return error; }
-                consumed += length;
+                head_ += length;
             }
-            used_ -= consumed;
-            if (used_ && consumed) std::memmove(data_.get(), data_.get() + consumed, used_);
+            if (head_ == tail_) head_ = tail_ = 0;
             return ERROR_SUCCESS;
         }
-        void Reset() noexcept { used_ = 0; failed_ = false; }
-        size_t PendingBytes() const noexcept { return used_; }
+        void Reset() noexcept { head_ = tail_ = 0; failed_ = false; }
+        size_t PendingBytes() const noexcept { return tail_ - head_; }
     private:
         std::unique_ptr<uint8_t[]> data_{new (std::nothrow) uint8_t[MaxRecordSize]};
-        size_t used_ = 0;
+        size_t head_ = 0, tail_ = 0;
         bool failed_ = false;
     };
 
 private:
+    template <class T> static DWORD DispatchConnection(Bytes body, void* context, ConnectionCallback<T> callback) {
+        constexpr size_t prefix = sizeof(T) + sizeof(uint32_t);
+        if (body.size() < prefix) return ERROR_INVALID_DATA;
+        const auto* connection = reinterpret_cast<const T*>(body.data());
+        const uint32_t size = ReadLe<uint32_t>(body.data() + sizeof(T));
+        if (connection->direction > 1 || connection->payload_layer != 3 || size > MaxPayloadSize ||
+            size != body.size() - prefix) return ERROR_INVALID_DATA;
+        if (callback) callback(context, connection, body.data() + prefix, size);
+        return ERROR_SUCCESS;
+    }
+    template <class T> static DWORD DispatchBandwidth(Bytes body, void* context, BandwidthCallback<T> callback) {
+        if (body.size() < 5) return ERROR_INVALID_DATA;
+        const uint32_t count = ReadLe<uint32_t>(body.data() + 1);
+        if ((body.size() - 5) % sizeof(T) || count != (body.size() - 5) / sizeof(T)) return ERROR_INVALID_DATA;
+        if (callback && count) callback(context, body[0], reinterpret_cast<const T*>(body.data() + 5), count);
+        return ERROR_SUCCESS;
+    }
+    static DWORD DispatchBody(uint8_t type, Bytes body, const Callbacks& cb) {
+        switch (type) {
+        case 0:
+            if (body.empty() || body.size() > 507 || body[0] < 1 || body[0] > 7) return ERROR_INVALID_DATA;
+            if (cb.on_log) cb.on_log(cb.context, body[0], {reinterpret_cast<const char*>(body.data() + 1), body.size() - 1});
+            return ERROR_SUCCESS;
+        case 1: return DispatchConnection(body, cb.context, cb.on_connection_v4);
+        case 2: return DispatchConnection(body, cb.context, cb.on_connection_v6);
+        case 5: return DispatchBandwidth(body, cb.context, cb.on_bandwidth_v4);
+        case 6: return DispatchBandwidth(body, cb.context, cb.on_bandwidth_v6);
+        default: return ERROR_NOT_SUPPORTED; // No synthetic/legacy connection-END events.
+        }
+    }
     DWORD OpenDevice() {
         auto try_open = [&]() {
             device_ = CreateFileW(L"\\\\.\\HyperVGuard", GENERIC_READ | GENERIC_WRITE, 0, nullptr,
@@ -263,10 +306,10 @@ private:
             if (wait != WAIT_OBJECT_0 + 1) return wait == WAIT_FAILED ? GetLastError() : ERROR_GEN_FAILURE;
         }
     }
-    static uint64_t ReadLe(const uint8_t* bytes, unsigned length) noexcept {
-        uint64_t result = 0;
-        for (unsigned i = 0; i < length; ++i) result |= static_cast<uint64_t>(bytes[i]) << (i * 8);
-        return result;
+    template <class T> static T ReadLe(const uint8_t* bytes) noexcept {
+        T value;
+        std::memcpy(&value, bytes, sizeof(value)); // Unaligned scalar load, not a record copy.
+        return value;
     }
     static DWORD Finish(HANDLE device, OVERLAPPED& ov, BOOL started, DWORD& bytes,
                         HANDLE stop = nullptr, ULONGLONG deadline = 0) {

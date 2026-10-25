@@ -13,13 +13,15 @@ int main() {
     struct State { hypervguard::Client& driver; DWORD error = 0; uint64_t packets = 0; } state{driver};
     hypervguard::Client::Callbacks callbacks;
     callbacks.context = &state;
-    callbacks.on_connection = [](void* context, const hypervguard::Client::Connection& packet) {
+    const auto accept = []<class T>(void* context, const T* packet, const uint8_t*, uint32_t) {
         auto& s = *static_cast<State*>(context);
         ++s.packets;
-        // Borrowed packet.payload is valid only inside this callback. No per-packet printing.
-        s.error = s.driver.SendVerdict(packet.id, hypervguard::Client::Verdict::PermanentAccept);
+        // Header and payload point into the read buffer; valid only during this callback.
+        s.error = s.driver.SendVerdict(packet->id, hypervguard::Client::Verdict::PermanentAccept);
         if (s.error) s.driver.Stop();
     };
+    callbacks.on_connection_v4 = accept;
+    callbacks.on_connection_v6 = accept;
     error = driver.Run(callbacks, 10'000); // Bounded example: 10 seconds, no driver lifecycle.
     driver.Close();
     if (!error) error = state.error;
