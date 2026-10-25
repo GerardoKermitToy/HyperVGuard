@@ -1,0 +1,15 @@
+[package]
+name = "hyperv-driver"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+
+[lib]
+name = "hyperv_driver"
+crate-type = ["staticlib"]
+test = false
+doctest = false
+
+[dependencies]
+hyperv-protocol = { path = "../protocol" }
+hyperv-policy = { path = "../policy" }
