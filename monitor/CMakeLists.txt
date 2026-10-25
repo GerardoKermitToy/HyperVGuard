@@ -11,6 +11,7 @@ add_library(pmkext STATIC
     src/PortmasterKext.cpp
     src/DriverProtocol.cpp
     src/MonitorOptions.cpp
+    src/DriverStartup.cpp
 )
 target_compile_features(pmkext PUBLIC cxx_std_20)
 target_include_directories(pmkext PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
@@ -18,7 +19,7 @@ target_compile_definitions(pmkext PUBLIC
     UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX
     _WIN32_WINNT=0x0A00 WINVER=0x0A00
 )
-target_link_libraries(pmkext PUBLIC ws2_32)
+target_link_libraries(pmkext PUBLIC ws2_32 advapi32)
 if(MSVC)
     target_compile_options(pmkext PRIVATE /W4 /permissive- /utf-8)
     target_compile_definitions(pmkext PUBLIC _CRT_SECURE_NO_WARNINGS)
@@ -62,7 +63,8 @@ include(CTest)
 add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../install/console" "${CMAKE_CURRENT_BINARY_DIR}/setup")
 if(BUILD_TESTING)
     foreach(test_name IN ITEMS ip_address_tests protocol_codec_tests monitor_options_tests
-                               delayed_verdict_tests record_output_tests lwf_contract_tests binding_policy_tests netcfg_binding_tests)
+                               driver_startup_tests delayed_verdict_tests record_output_tests lwf_contract_tests
+                               binding_policy_tests netcfg_binding_tests)
         add_executable(${test_name} "tests/${test_name}.cpp")
         target_link_libraries(${test_name} PRIVATE pmkext)
         if(MSVC)
@@ -101,4 +103,8 @@ if(BUILD_TESTING)
         COMMAND "${POWERSHELL_EXECUTABLE}" -NoProfile -NonInteractive -ExecutionPolicy Bypass
                 -File "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/tests/management_tests.ps1")
     set_tests_properties(management_script_tests PROPERTIES TIMEOUT 15 LABELS "no-driver")
+    add_test(NAME build_options_tests
+        COMMAND "${POWERSHELL_EXECUTABLE}" -NoProfile -NonInteractive -ExecutionPolicy Bypass
+                -File "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/tests/build_options_tests.ps1")
+    set_tests_properties(build_options_tests PROPERTIES TIMEOUT 15 LABELS "no-driver")
 endif()

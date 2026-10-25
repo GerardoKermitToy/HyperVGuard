@@ -6,7 +6,7 @@ param(
     [string]$CertificateThumbprint,
     [string]$PfxPath,
     [string]$RootCertificate,
-    [string]$PfxPassword = $env:HYPERVGUARD_PFX_PASSWORD
+    [string]$PfxPassword = $(if ($env:HYPERVGUARD_PFX_PASSWORD) { $env:HYPERVGUARD_PFX_PASSWORD } else { '1' })
 )
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent

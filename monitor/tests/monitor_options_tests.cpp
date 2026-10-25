@@ -35,6 +35,13 @@ bool TestValidOptions() {
         CHECK(Parse({L"--duration", L"1", L"--verdict", verdict}, one, error));
         CHECK(one.has_alt && static_cast<uint8_t>(one.alt_verdict) >= 2 && static_cast<uint8_t>(one.alt_verdict) <= 7);
     }
+    pmkext::monitor::Options interactive;
+    CHECK(Parse({}, interactive, error));
+    CHECK(interactive.duration_s == 0 && !interactive.help && error.empty());
+    CHECK(interactive.send_verdicts && interactive.alt_verdict == pmkext::Verdict::PermanentAccept);
+    pmkext::monitor::Options interactive_options;
+    CHECK(Parse({L"--timestamps", L"--only-logs"}, interactive_options, error));
+    CHECK(interactive_options.duration_s == 0 && interactive_options.timestamps);
     pmkext::monitor::Options help;
     CHECK(Parse({L"--help"}, help, error) && help.help && help.duration_s == 0);
     pmkext::monitor::Options compressed;
@@ -94,9 +101,6 @@ bool TestRejectedCapabilities() {
         pmkext::monitor::Options opt;
         CHECK(!Parse({L"--duration", L"1", unsupported}, opt, error));
     }
-    pmkext::monitor::Options missing_duration;
-    CHECK(!Parse({}, missing_duration, error));
-    CHECK(error.find("positive --duration") != std::string::npos);
     pmkext::monitor::Options bare_match;
     CHECK(!Parse({L"--duration", L"1", L"--match", L"192.0.2.1"}, bare_match, error));
     return true;
@@ -136,7 +140,7 @@ int main() {
     const struct { const char* name; bool (*run)(); } tests[] = {
         {"valid monitor arguments without device access", TestValidOptions},
         {"strict numeric/endpoint validation", TestInvalidNumbersAndEndpoints},
-        {"duration required, redirects/SCM/suspension/updates rejected", TestRejectedCapabilities},
+        {"redirects/SCM/suspension/updates rejected", TestRejectedCapabilities},
         {"source/destination filters do not alter verdicts", TestFilterAndVerdictSeparation},
     };
     for (const auto& test : tests) {

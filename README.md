@@ -18,7 +18,7 @@ powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts/
 
 This builds the package and runs offline tests without installing, loading, or binding the driver. Output goes to `dist/`: SYS/PDB/INF/CAT, `HyperVGuardNotify.dll`, `hyperv_monitor.exe`, `Install.exe`, and `Uninstall.exe`. Keep package files together; do not mix versions.
 
-The default build is unsigned. For signing, pass `-PfxPath` and `-RootCertificate` to the build script and provide the PFX password through the process environment variable `HYPERVGUARD_PFX_PASSWORD`. The script does not import certificates or change security policy. Installation requires trusted package signatures.
+The default build is unsigned. For signing, pass `-PfxPath` and `-RootCertificate` to the build script. The local test-PFX password defaults to `1`; a nonempty process environment variable `HYPERVGUARD_PFX_PASSWORD` overrides that default, and an explicit `-PfxPassword` overrides both (including an explicitly empty password). The script does not import certificates or change security policy. Installation requires trusted package signatures.
 
 ## Install
 
@@ -50,7 +50,15 @@ Block only a test remote endpoint:
 ./dist/hyperv_monitor.exe --duration 10 --match 192.0.2.10:9000 --verdict permanent-block --out block.log
 ```
 
-**Always use a positive `--duration`.** `--match` selects the remote endpoint in both directions; unmatched events receive PermanentAccept. `--filter-ip` only filters output, not verdicts. A blocking verdict without `--match` applies to every event and can disconnect the host-vNIC path.
+For an interactive session, omit `--duration` and exit with **Ctrl+C**:
+
+```bash
+./dist/hyperv_monitor.exe
+```
+
+Without `--duration`, an open failure makes the monitor create/open `Global\HyperVGuard.DriverReady` and wait for driver startup. Ctrl+C also cancels this wait. With a positive `--duration N`, it never waits for startup: an open failure exits immediately; a successful session stops after N seconds. Use `--duration` for automated/live tests; zero, negative and malformed values remain invalid.
+
+`--match` selects the remote endpoint in both directions; unmatched events receive PermanentAccept. `--filter-ip` only filters output, not verdicts. A blocking verdict without `--match` applies to every event and can disconnect the host-vNIC path.
 
 The monitor never installs, unbinds, or uninstalls the filter. Exiting closes the policy session; the LWF remains installed and bound. Use `--help` for all options without opening the device.
 
@@ -96,6 +104,12 @@ Both IOCTLs use `CTL_CODE(40000, function, METHOD_BUFFERED, FILE_READ_DATA | FIL
 All other IOCTLs are unsupported. After shutdown, close and reopen the handle to activate a new session. Closing the active handle also disconnects the controller and drains pending decisions. Shutdown does not itself close the handle or stop a custom application's read loop.
 
 Reads return an event byte stream, at most **65536 bytes per driver read**. A successful zero-byte read means **empty queue, not EOF**. Reads can split a record or contain multiple records; retain incomplete bytes between reads. The supplied client waits interruptibly for 10 ms on empty reads.
+
+### Driver-start notification
+
+`Global\HyperVGuard.DriverReady` (kernel name `\BaseNamedObjects\HyperVGuard.DriverReady`) is a named manual-reset event, separate from the device byte stream and IOCTLs. New objects allow access only to Administrator/SYSTEM. At startup, after initializing the control device and timer, the driver creates/opens the event, signals it, and keeps its handle until unload; unload clears the event and closes the handle. This requires the updated SYS, not just the monitor. Event creation is best-effort if the global object directory is not yet available during early system boot; device initialization does not depend on notification success.
+
+Only the console monitor's **unlimited mode** uses startup waiting. It first tries `Driver::Open`. On failure it creates/opens the event, clears it **before** retrying the device, and waits only if that retry also fails. A signal causes another reset/retry; a stale signal cannot cause a busy loop. Wait timeouts check Ctrl+C at 100 ms intervals without polling the device. A signal is only a retry hint, not proof of successful NDIS attachment, device authorization, compatible version or packet interception. The monitor never installs or loads the LWF while waiting; another application releasing an exclusive device handle does not itself generate a startup signal. No automatic reconnect is added after an established session ends.
 
 ### C++ client methods
 

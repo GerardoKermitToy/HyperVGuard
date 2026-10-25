@@ -1,6 +1,7 @@
 // HyperVGuard console monitor, adapted from kext_client on 2026-10-25 (see README.md/LICENSE).
-// A positive --duration is mandatory. Help/invalid CLI never opens a device.
+// Interactive runs wait for driver startup; --duration runs never wait.
 #include "PortmasterKext.h"
+#include "DriverStartup.h"
 #include "DelayedVerdicts.h"
 #include "MonitorOptions.h"
 #include "RecordOutput.h"
@@ -96,8 +97,16 @@ BOOL WINAPI ConsoleHandler(DWORD signal) {
 
 class ConsoleRegistration {
 public:
-    ConsoleRegistration() { SetConsoleCtrlHandler(ConsoleHandler, TRUE); }
-    ~ConsoleRegistration() { SetConsoleCtrlHandler(ConsoleHandler, FALSE); }
+    ~ConsoleRegistration() {
+        if (registered_) SetConsoleCtrlHandler(ConsoleHandler, FALSE);
+    }
+    bool Register(std::string& error) {
+        registered_ = SetConsoleCtrlHandler(ConsoleHandler, TRUE) != FALSE;
+        if (!registered_) error = "cannot register console handler: error " + std::to_string(GetLastError());
+        return registered_;
+    }
+private:
+    bool registered_ = false;
 };
 
 class OutputFile {
@@ -138,17 +147,33 @@ int MonitorMain(int argc, wchar_t** argv) {
         std::fprintf(stderr, "ERROR: %s. No device or service state was changed.\n", error.c_str());
         return 1;
     }
+    ConsoleRegistration console_handler;
+    if (!console_handler.Register(error)) {
+        std::fprintf(stderr, "ERROR: %s\n", error.c_str());
+        return 1;
+    }
     OutputFile output;
     if (!output.Open(opt.out_path)) return 1;
 
     std::printf("Device name : HyperVGuard\n"
                 "Opening explicitly installed host-adapter NDIS LWF (no SCM lifecycle).\n");
     pmkext::Driver driver;
-    if (!driver.Open(error)) {
+    const auto startup = pmkext::monitor::OpenDriverWhenReady(
+        [&](std::string& reason) { return driver.Open(reason); }, opt.duration_s == 0,
+        g_shutdown_requested, [&](const std::string& reason) {
+            std::printf("Device open failed: %s\n"
+                        "Waiting for driver startup (Global\\HyperVGuard.DriverReady); Ctrl+C to exit.\n",
+                        reason.c_str());
+            std::fflush(stdout);
+        }, error);
+    if (startup == pmkext::monitor::StartupResult::Failed) {
         std::fprintf(stderr, "ERROR: open device failed: %s\n", error.c_str());
         return 1;
     }
-    ConsoleRegistration console_handler;
+    if (startup == pmkext::monitor::StartupResult::Cancelled || g_shutdown_requested.load()) {
+        std::printf("Console stop requested during startup; exiting.\n");
+        return 0;
+    }
 
     uint8_t version[4]{};
     if (!driver.GetVersion(version, error)) {
@@ -187,8 +212,12 @@ int MonitorMain(int argc, wchar_t** argv) {
             std::printf("WARNING: delay reaches/exceeds the default pending timeout; verdicts may arrive too late.\n");
         }
     }
-    std::printf("Running for %u second(s), then stopping the session (LWF remains installed).\n\n",
-                opt.duration_s);
+    if (opt.duration_s != 0) {
+        std::printf("Running for %u second(s), then stopping the session (LWF remains installed).\n\n",
+                    opt.duration_s);
+    } else {
+        std::printf("Running until Ctrl+C; stopping the session leaves the LWF installed.\n\n");
+    }
     std::fflush(stdout);
 
     unsigned long long connections = 0;
@@ -336,8 +365,9 @@ int MonitorMain(int argc, wchar_t** argv) {
     ULONGLONG next_cleanup = started + 30'000;
     auto poll = [&]() {
         const ULONGLONG now = GetTickCount64();
-        if (g_shutdown_requested.load() || now >= deadline) {
-            Emit(now >= deadline ? "\nDuration elapsed, stopping...\n" : "\nConsole stop requested, stopping...\n");
+        const bool duration_elapsed = opt.duration_s != 0 && now >= deadline;
+        if (g_shutdown_requested.load() || duration_elapsed) {
+            Emit(duration_elapsed ? "\nDuration elapsed, stopping...\n" : "\nConsole stop requested, stopping...\n");
             g_shutdown_requested.store(true);
             driver.Stop();
             return;

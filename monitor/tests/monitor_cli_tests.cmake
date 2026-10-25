@@ -20,7 +20,6 @@ function(expect_invalid name expected)
     endif()
 endfunction()
 
-expect_invalid(no_arguments "positive --duration")
 expect_invalid(zero_duration "positive decimal" --duration 0)
 expect_invalid(negative_duration "positive decimal" --duration -1)
 expect_invalid(overflow_duration "positive decimal" --duration 4294967296)
@@ -63,6 +62,9 @@ if(NOT result STREQUAL "0" OR NOT output MATCHES "direction=0 outbound, 1 inboun
    NOT output MATCHES "relative to the guest side" OR NOT output MATCHES "local=guest endpoint" OR
    NOT output MATCHES "Host receive=outbound, send=inbound" OR
    NOT output MATCHES "Redirects are NOT supported" OR
+   NOT output MATCHES "Without --duration, wait for driver startup" OR
+   NOT output MATCHES "Ctrl\\+C exits" OR
+   NOT output MATCHES "never wait for driver startup" OR
    output MATCHES "HyperVGuardPipe|Bridge:|winrpc|named-pipe" OR
    output MATCHES "Opening explicitly installed|Driver version")
     message(FATAL_ERROR "Help did not stay on the no-device path: ${result}: ${output}${errors}")

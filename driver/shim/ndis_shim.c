@@ -1,8 +1,9 @@
 // WDK ABI shim. Rust owns parsing, bounded policy queues, wire API and verdicts.
-#include <ntddk.h>
+#include <ntifs.h>
 #include <ndis.h>
 #include <netioapi.h>
 #include "lwf_contract.h"
+#include "driver_ready.h"
 
 #define TAG 'gVHH'
 #define MAX_TOKENS 2048
@@ -48,6 +49,8 @@ extern NTSTATUS HvWrite(const UCHAR*, ULONG);
 
 static NDIS_HANDLE DriverHandle, DeviceHandle;
 static PDEVICE_OBJECT ControlDevice;
+static HANDLE ReadyEventHandle;
+static PKEVENT ReadyEvent;
 static KSPIN_LOCK PolicyLock;
 static FAST_MUTEX IoMutex;
 static PFILE_OBJECT Client;
@@ -57,7 +60,7 @@ static KDPC TimerDpc;
 static volatile LONG64 NextAdapter;
 static NDIS_STRING Friendly = RTL_CONSTANT_STRING(L"HyperV Guard Rust Host Adapter LWF");
 static NDIS_STRING Unique = RTL_CONSTANT_STRING(L"{6E76EAD1-7BCB-49C4-9547-D3E6B3488F71}");
-static NDIS_STRING Service = RTL_CONSTANT_STRING(L"HyperVGuard");
+static NDIS_STRING ServiceName = RTL_CONSTANT_STRING(L"HyperVGuard");
 
 DRIVER_UNLOAD HvUnload;
 DRIVER_DISPATCH HvDispatch;
@@ -621,6 +624,45 @@ static void ReadConfiguration(PUNICODE_STRING registry) {
     }
     ZwClose(service);
 }
+static void SignalDriverReady(void) {
+    UNICODE_STRING name = RTL_CONSTANT_STRING(HV_READY_EVENT_KERNEL_NAME);
+    OBJECT_ATTRIBUTES attributes;
+    SECURITY_DESCRIPTOR descriptor;
+    struct {
+        ACL Header;
+        UCHAR Aces[2 * (sizeof(ACCESS_ALLOWED_ACE) + SECURITY_MAX_SID_SIZE)];
+    } acl;
+    NTSTATUS status;
+    status = RtlCreateSecurityDescriptor(&descriptor, SECURITY_DESCRIPTOR_REVISION);
+    if (!NT_SUCCESS(status)) goto Failed;
+    status = RtlCreateAcl(&acl.Header, sizeof(acl), ACL_REVISION);
+    if (!NT_SUCCESS(status)) goto Failed;
+    status = RtlAddAccessAllowedAce(&acl.Header, ACL_REVISION, EVENT_ALL_ACCESS, SeExports->SeLocalSystemSid);
+    if (!NT_SUCCESS(status)) goto Failed;
+    status = RtlAddAccessAllowedAce(&acl.Header, ACL_REVISION, EVENT_ALL_ACCESS, SeExports->SeAliasAdminsSid);
+    if (!NT_SUCCESS(status)) goto Failed;
+    status = RtlSetDaclSecurityDescriptor(&descriptor, TRUE, &acl.Header, FALSE);
+    if (!NT_SUCCESS(status)) goto Failed;
+    descriptor.Control |= SE_DACL_PROTECTED;
+    InitializeObjectAttributes(&attributes, &name,
+        OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE | OBJ_OPENIF, NULL, &descriptor);
+    status = ZwCreateEvent(&ReadyEventHandle, EVENT_MODIFY_STATE | SYNCHRONIZE,
+        &attributes, NotificationEvent, FALSE);
+    if (!NT_SUCCESS(status)) goto Failed;
+    status = ObReferenceObjectByHandle(ReadyEventHandle, EVENT_MODIFY_STATE,
+        *ExEventObjectType, KernelMode, (PVOID*)&ReadyEvent, NULL);
+    if (!NT_SUCCESS(status)) {
+        ZwClose(ReadyEventHandle); ReadyEventHandle = NULL;
+        goto Failed;
+    }
+    KeSetEvent(ReadyEvent, IO_NO_INCREMENT, FALSE);
+    return;
+Failed:
+    // At system boot BaseNamedObjects may not exist yet, so no monitor can be
+    // waiting there. Notification failure must not disable an otherwise ready LWF.
+    DbgPrintEx(DPFLTR_IHVNETWORK_ID, DPFLTR_WARNING_LEVEL,
+        "HyperVGuard: driver-ready event unavailable: 0x%08lX\n", (ULONG)status);
+}
 NTSTATUS hv_initialize(PDRIVER_OBJECT driver, PUNICODE_STRING registry) {
     NDIS_FILTER_DRIVER_CHARACTERISTICS c = {0};
     NDIS_DEVICE_OBJECT_ATTRIBUTES attributes = {0};
@@ -637,7 +679,7 @@ NTSTATUS hv_initialize(PDRIVER_OBJECT driver, PUNICODE_STRING registry) {
     c.Header.Size = NDIS_SIZEOF_FILTER_DRIVER_CHARACTERISTICS_REVISION_2;
     c.MajorNdisVersion = 6; c.MinorNdisVersion = 40;
     c.MajorDriverVersion = 0; c.MinorDriverVersion = 2;
-    c.FriendlyName = Friendly; c.UniqueName = Unique; c.ServiceName = Service;
+    c.FriendlyName = Friendly; c.UniqueName = Unique; c.ServiceName = ServiceName;
     c.AttachHandler = HvFilterAttach; c.DetachHandler = HvFilterDetach;
     c.RestartHandler = HvFilterRestart; c.PauseHandler = HvFilterPause;
     c.SendNetBufferListsHandler = HvSend; c.SendNetBufferListsCompleteHandler = HvSendComplete;
@@ -663,13 +705,17 @@ NTSTATUS hv_initialize(PDRIVER_OBJECT driver, PUNICODE_STRING registry) {
     ControlDevice->Flags &= ~DO_DEVICE_INITIALIZING;
     KeInitializeTimer(&Timer); KeInitializeDpc(&TimerDpc, TickDpc, NULL);
     due.QuadPart = -500000; KeSetTimerEx(&Timer, due, 50, &TimerDpc);
+    SignalDriverReady(); // Publish only after the control device and timer are ready.
     return STATUS_SUCCESS;
 }
 _Use_decl_annotations_
 void HvUnload(PDRIVER_OBJECT driver) {
     UNREFERENCED_PARAMETER(driver);
+    if (ReadyEvent != NULL) KeClearEvent(ReadyEvent);
     ExAcquireFastMutex(&IoMutex); Stopping = TRUE; HvDisconnect(); Client = NULL; ExReleaseFastMutex(&IoMutex);
     KeCancelTimer(&Timer); KeFlushQueuedDpcs();
     NdisFDeregisterFilterDriver(DriverHandle);
     NdisDeregisterDeviceEx(DeviceHandle);
+    if (ReadyEvent != NULL) {ObDereferenceObject(ReadyEvent); ReadyEvent = NULL;}
+    if (ReadyEventHandle != NULL) {ZwClose(ReadyEventHandle); ReadyEventHandle = NULL;}
 }

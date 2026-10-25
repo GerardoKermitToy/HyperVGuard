@@ -17,7 +17,7 @@ struct Endpoint {
 
 struct Options {
     std::wstring out_path;
-    unsigned duration_s = 0;
+    unsigned duration_s = 0; // Omitted: wait for startup and run until Ctrl+C.
     unsigned poll_ms = 1000;
     unsigned verdict_delay_ms = 0;
     bool show_connections = true;

@@ -189,10 +189,6 @@ bool ParseOptions(int argc, const wchar_t* const* argv, Options& opt, std::strin
         error = "--match given without --verdict";
         return false;
     }
-    if (!opt.help && opt.duration_s == 0) {
-        error = "a positive --duration is required for every monitor run; --help does not access the device";
-        return false;
-    }
     error.clear();
     return true;
 }
@@ -216,13 +212,16 @@ bool AlternateMatches(const Options& opt, const Connection& c) {
 
 void PrintUsage(FILE* out) {
     std::fprintf(out,
-        "Usage: hyperv_monitor.exe --duration SECONDS [options]\n"
+        "Usage: hyperv_monitor.exe [--duration SECONDS] [options]\n"
         "       hyperv_monitor.exe --help\n\n"
         "Opens the existing \\\\.\\HyperVGuard device; never installs/starts/stops an SCM service.\n"
         "Install explicitly with dist/Install.exe for the host adapter\n"
-        "vEthernet (Default Switch). Device access requires elevated admin/SYSTEM.\n\n"
+        "vEthernet (Default Switch). Device access requires elevated admin/SYSTEM.\n"
+        "Without --duration, wait for driver startup if open fails; Ctrl+C exits\n"
+        "both the startup wait and monitoring. The monitor never loads the LWF.\n\n"
         "Collection:\n"
-        "  --duration N     REQUIRED positive seconds; stop and close the session.\n"
+        "  --duration N     optional positive seconds; never wait for driver startup.\n"
+        "                   Open failure exits immediately; otherwise stop after N s.\n"
         "                   This does not uninstall or unbind the LWF.\n"
         "  --out FILE       write records to FILE, flushed per record.\n"
         "  --poll N         request logs/bandwidth every N ms (default 1000).\n"
@@ -263,6 +262,7 @@ void PrintUsage(FILE* out) {
         "  Block/drop for all events can cut host-vNIC traffic and remote access.\n"
         "  --sys, positional .sys paths and PID-suspension options are rejected.\n\n"
         "Examples:\n"
+        "  hyperv_monitor.exe\n"
         "  hyperv_monitor.exe --duration 10 --only-logs\n"
         "  hyperv_monitor.exe --duration 30 --out run.log --timestamps --payload\n"
         "  hyperv_monitor.exe --duration 30 --filter-pid 0 --filter-protocol 17\n"

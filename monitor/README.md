@@ -16,15 +16,19 @@ For Visual Studio 2022 use `-G "Visual Studio 17 2022"`. Alternatively configure
 
 With the VS generator the executable is `build\Release\hyperv_monitor.exe`. It deliberately uses an **as-invoker** manifest so `--help` and invalid-CLI tests need neither elevation nor a device. Actual device access still requires elevated Administrator/SYSTEM because of the driver's device ACL.
 
-CTest registers **only no-driver tests**: exact IPv4/IPv6/event/command codecs and device-only lifecycle checks, fragmented streams and length limits, strict CLI/filter validation, delayed-verdict scheduling, output serialization, `--help`, and deliberately invalid CLI invocations. Additional offline tests cover LWF target/copy/ownership helpers, binding-policy decisions, mock management preflight and user-mode COM factory/lifetime. The notify DLL is loaded only as a normal DLL for that test; it is never registered. No test installs/loads/binds a driver, opens its device, or runs a monitoring session. The record-output test writes only in its CTest build working directory. Do not substitute a valid monitoring run when validating a build without explicit authorization.
+CTest registers **only no-driver tests**: exact IPv4/IPv6/event/command codecs and device-only lifecycle checks, fragmented streams and length limits, strict CLI/filter validation, startup-event races/cancellation with fake device opens and private local test events, delayed-verdict scheduling, output serialization, `--help`, and deliberately invalid CLI invocations. Additional offline tests cover LWF target/copy/ownership helpers, binding-policy decisions, mock management preflight and user-mode COM factory/lifetime. The notify DLL is loaded only as a normal DLL for that test; it is never registered. No test installs/loads/binds a driver, opens its device, or runs a monitoring session. The record-output test writes only in its CTest build working directory. Do not substitute a valid monitoring run when validating a build without explicit authorization.
 
-## Explicit installation, bounded sessions
+## Explicit installation and session startup
 
 An NDIS LWF is a NetCfg network component, not a legacy demand-start service. Install explicitly using the native `dist/Install.exe`, which restricts the new component to the exact Default Switch host vNIC through a notify object and a separate kernel GUID/LUID gate. Use `Install.exe --enable` to resume after a requested reboot, `Uninstall.exe` for removal, and the optional `Set-Binding.ps1` for explicit rebind/unbind. Setup EXEs do not launch PowerShell/netcfg.exe. The monitor performs neither installation nor binding.
 
 `Driver::Open()` opens the existing `\\.\HyperVGuard` device only; it does not start an IPC server. `Driver::Install(...)` keeps its old signature but returns a descriptive **not supported** error without touching SCM or registry state. `Stop()` sends the existing shutdown IOCTL to end the device session and release pending packets; `Cleanup()` closes handles. Neither disables, uninstalls or unloads the LWF.
 
-Every monitoring run requires a **positive `--duration`**. No arguments, zero/negative/junk durations, `.sys` positional arguments, `--sys`, process-suspension options, redirect verdict names and unsupported options fail before taking a singleton, opening an output file or accessing a device. `--help` also stays entirely on this no-device path.
+`--duration` is optional. With no duration (including no arguments), the monitor runs until **Ctrl+C**. If the initial device open fails, it creates/opens the Administrator/SYSTEM-only manual-reset event `Global\HyperVGuard.DriverReady` and waits for the driver to signal startup. Ctrl+C cancels that wait as well. The driver signals only after its control device and timer are initialized, retains the event handle while loaded, and clears/closes it on unload. The updated SYS is required for notification; this does not install or load it. Notification is best-effort during early boot before the global object directory exists.
+
+The monitor resets the event before rechecking the device to avoid lost startup races and stale-signal spinning. A signal only requests another device-open attempt; it does not bypass exclusive access, elevation or version checks. An access failure can therefore keep waiting for the next startup; closing another controller is not a startup signal. No reconnect after an established session is implemented.
+
+With a **positive `--duration N`**, device-open failure exits immediately without creating, resetting or waiting on the event, and a successful session stops after N seconds. Automated/live tests must still use positive durations. Explicit zero/negative/junk durations, `.sys` positional arguments, `--sys`, process-suspension options, redirect verdict names and unsupported options fail before taking a singleton, opening an output file or accessing a device. `--help` also stays entirely on this no-device path.
 
 ```powershell
 # Help only: no device access.
@@ -32,6 +36,7 @@ Every monitoring run requires a **positive `--duration`**. No arguments, zero/ne
 
 # Runtime examples only; require an explicitly installed/bound LWF,
 # elevation, and separate permission to run against live host-vNIC traffic.
+.\build\Release\hyperv_monitor.exe  # Interactive: wait for startup, then Ctrl+C exits.
 .\build\Release\hyperv_monitor.exe --duration 10 --only-logs
 .\build\Release\hyperv_monitor.exe --duration 30 --out run.log --timestamps --payload
 .\build\Release\hyperv_monitor.exe --duration 30 --filter-pid 0 --filter-protocol 17
@@ -40,7 +45,7 @@ Every monitoring run requires a **positive `--duration`**. No arguments, zero/ne
 
 Supported options include `--out`, `--filter-ip IP[:PORT]` (`[IPv6]:PORT` for IPv6), `--filter-protocol`, `--filter-pid 0`, `--match`, `--verdict`, `--no-verdicts`, `--payload`, `--poll`, `--timestamps`, `--memory-stats` and `--verdict-delay-ms`. `--only-logs`, `--no-conn` and `--no-bandwidth` are retained. Numeric values and ports are validated without truncation or wrapping. Display filters combine with AND, never change verdicts, and IP/port pairs must match the same endpoint. `--match` selects the normalized `remote` endpoint in both directions.
 
-A duration check runs at most 100 ms apart regardless of a longer `--poll`; requesting an enormous poll interval does not extend the requested monitoring period. In-progress I/O completion can still add bounded completion time. Ctrl+C requests early session shutdown. The independent singleton is `Global\HyperVGuardMonitor.Singleton`, so the WFP monitor's singleton is not reused.
+Duration/console-stop checks run at most 100 ms apart regardless of a longer `--poll`; requesting an enormous poll interval does not extend the requested monitoring period. The startup event wait also checks console-stop requests every 100 ms, without periodically reopening the device. In-progress I/O completion can still add bounded completion time. Ctrl+C requests session shutdown or cancels startup waiting. The independent singleton is `Global\HyperVGuardMonitor.Singleton`, so the WFP monitor's singleton is not reused.
 
 ## Exact wire compatibility and NDIS semantics
 
@@ -62,7 +67,7 @@ The default automatic verdict is `PermanentAccept`; `--verdict` without `--match
 
 The monitor uses only the existing driver device. All complete raw device records are decoded and delivered to the local `Handlers`; local automatic/delayed verdicts write directly to that device. There is no named-pipe server, handshake, attached-client state, external command forwarding, trusted-client executable check, or exclusive external record ownership.
 
-The standalone `winrpc/` source directory is not a dependency of this monitor. Removing it from a deployment or source bundle does not affect monitor targets. The driver wire format and required version remain **0.2.1.0**; this monitor-only change does not require rebuilding/reinstalling the SYS.
+The standalone `winrpc/` source directory is not a dependency of this monitor. Removing it from a deployment or source bundle does not affect monitor targets. The driver wire format and required version remain **0.2.1.0**. Removal of the old transport needed no SYS change; the separate driver-start event described above does require the updated SYS.
 
 ## Source provenance and license
 
@@ -76,6 +81,10 @@ These are independent copies/adaptations of the local `C:\portmaster_v3` source 
 
 The original repository's **GNU GPL version 3** license is preserved verbatim as `LICENSE`; this adaptation retains that license. Source provenance does not imply that the original WFP driver's lifecycle or host process semantics apply to a host-adapter NDIS LWF.
 
+## Startup-event validation
+
+The startup-event/default-password Release build passed **17/17 no-driver CTest suites**, including **11** startup scenarios with fake device openers and private local events: duration/no-wait, already available, signal-before-event-open/wait, asynchronous signaling, stale/repeated signals, cancellation and named-object type collision. The startup suite also passed 50 consecutive offline repetitions; a separate build-options suite verifies eight default/environment/argument password-precedence cases. These tests do not open the installed device or exercise the real kernel notification/Ctrl+C path. Driver wire version remains **0.2.1.0**; the SYS must be rebuilt for startup signaling.
+
 ## Device-only validation
 
 Historical device-only snapshot (before native setup tool integration changed monitor help strings): on 2026-10-25, a fresh Release build in `build/monitor-device-only` passed **11/11 no-driver CTest suites**, including local device-session construction/cleanup and help/invalid-CLI checks that reject unsupported transport options. The compilation database and Ninja graph contain no winrpc/duplex-pipe sources, includes or link dependency. PE imports contain no named-pipe server APIs.
@@ -84,8 +93,8 @@ That snapshot executable was copied to `dist/hyperv_monitor.exe`: **94720 bytes*
 
 SYS, INF, CAT and the signed notify DLL in `dist/` were verified unchanged. No driver was installed, loaded or bound, no device was opened, and no live monitoring session was run. The user retains live traffic testing.
 
-## Native setup integration
+## Historical native setup integration
 
-The current monitor help and unsupported-installation diagnostics point to `dist/Install.exe` rather than the removed PowerShell installer. A new Release build passed **14/14 no-driver CTest suites**, including the native setup workflow, INF and help/invalid-CLI tests. Current `dist/hyperv_monitor.exe`: **94720 bytes**, SHA-256 **6CB99E7BED9BD2825DAC12D17BFE18F80EDD5932DEE13E03BBC420DBFD2B56C9**. The driver protocol remains **0.2.1.0**; SYS/INF/CAT/notify DLL were unchanged. See [native setup validation](../install/console/README.md#offline-validation).
+The initial native setup integration changed monitor help and unsupported-installation diagnostics to point to `dist/Install.exe` rather than the removed PowerShell installer. That Release build passed **14/14 no-driver CTest suites**, including the native setup workflow, INF and help/invalid-CLI tests. That snapshot's `dist/hyperv_monitor.exe`: **94720 bytes**, SHA-256 **6CB99E7BED9BD2825DAC12D17BFE18F80EDD5932DEE13E03BBC420DBFD2B56C9**. The driver protocol remained **0.2.1.0**; SYS/INF/CAT/notify DLL were unchanged in that snapshot. See [native setup validation](../install/console/README.md#offline-validation).
 
 The later driver-store package **0.2.1.4** corrects setup/notify GUID inspection and non-PnP target lifecycle and passed **15/15** no-driver suites. Its authorized real installation completed with exit 0 and only the Default Switch binding enabled; this monitor and wire version 0.2.1.0 remain unchanged. No live monitor/traffic test was run. Current package and retry instructions: [NetCfg identity fix](../docs/NETCFG-IDENTITY-FIX.md).
