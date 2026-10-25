@@ -19,7 +19,7 @@ int wmain(int argc, wchar_t** argv) {
         const std::vector<std::pair<std::string, std::string>> mutations = {
             {"Class=NetService", "Class=Net"},
             {"CatalogFile=HyperVGuard.cat", "CatalogFile=Unrelated.cat"},
-            {"0.3.0.0", "0.2.1.4"},
+            {"0.3.1.0", "0.3.0.0"},
             {"6E76EAD1-7BCB-49C4-9547-D3E6B3488F71", "00000001-0002-0003-0405-060708090A0B"},
             {"Install, hyperv_guard", "Install, another_component"},
             {"FilterClass,,\"custom\"", "FilterClass,,\"ms_switch_filter\""},

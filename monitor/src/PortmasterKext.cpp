@@ -275,6 +275,13 @@ bool Driver::GetVersion(uint8_t out[4], std::string& error) {
     return true;
 }
 
+bool Driver::GetFilteredDeviceCount(uint32_t& out, std::string& error) {
+    uint8_t bytes[4]{};
+    uint32_t returned = 0;
+    if (!DeviceControl(wire::kIoctlFilteredDeviceCount, bytes, sizeof(bytes), error, &returned)) return false;
+    return wire::DecodeFilteredDeviceCount(bytes, returned, out, error);
+}
+
 bool Driver::RequestShutdown(std::string& error) {
     return DeviceControl(wire::kIoctlShutdown, nullptr, 0, error);
 }
@@ -373,7 +380,7 @@ void Driver::ReaderLoop(const Handlers& handlers) {
             if (status == ERROR_OPERATION_ABORTED || status == ERROR_INVALID_HANDLE ||
                 status == ERROR_HANDLE_EOF) break;
             if (status != ERROR_IO_PENDING) {
-                if (handlers.on_warning) handlers.on_warning("ReadFile failed: " + LastErrorText(status));
+                if (WaitForSingleObject(stop, 0) != WAIT_OBJECT_0 && handlers.on_warning) handlers.on_warning("ReadFile failed: " + LastErrorText(status));
                 break;
             }
             const HANDLE waits[] = {stop, overlap.get()->hEvent};
@@ -395,16 +402,14 @@ void Driver::ReaderLoop(const Handlers& handlers) {
         if (GetOverlappedResult(device, overlap.get(), &read, TRUE) == FALSE) {
             const DWORD status = GetLastError();
             if (status != ERROR_OPERATION_ABORTED && status != ERROR_INVALID_HANDLE &&
-                status != ERROR_HANDLE_EOF && handlers.on_warning) {
+                status != ERROR_HANDLE_EOF && WaitForSingleObject(stop, 0) != WAIT_OBJECT_0 && handlers.on_warning) {
                 handlers.on_warning("GetOverlappedResult failed: " + LastErrorText(status));
             }
             break;
         }
         if (read == 0) {
-            // SUCCESS + 0 is an empty NONBLOCKING device queue, NOT EOF. An
-            // interruptible wait avoids 100% CPU and still responds to Stop().
-            if (WaitForSingleObject(stop, 10) == WAIT_OBJECT_0) break;
-            continue;
+            if (handlers.on_warning) handlers.on_warning("unexpected empty read; install the blocking-read SYS");
+            break;
         }
         if (read > chunk.size()) {
             if (handlers.on_warning) handlers.on_warning("driver returned an invalid read length");

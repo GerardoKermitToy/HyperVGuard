@@ -22,7 +22,7 @@ constexpr size_t kMaxRecordSize = kConnectionIpv6PrefixSize + kMaxPayloadSize;
 constexpr size_t kMaxLogRecordSize = 512;
 constexpr size_t kMaxCommandBatchSize = 64 * 1024;
 constexpr size_t kVerdictCommandSize = 10;
-constexpr std::array<uint8_t, 4> kRequiredDeviceVersion = {0, 3, 0, 0};
+constexpr std::array<uint8_t, 4> kRequiredDeviceVersion = {0, 3, 1, 0};
 
 bool IsCompatibleVersion(const uint8_t version[4]) noexcept;
 
@@ -31,6 +31,10 @@ constexpr uint32_t MakeCtlCode(uint32_t function) {
 }
 constexpr uint32_t kIoctlVersion = MakeCtlCode(0x800);
 constexpr uint32_t kIoctlShutdown = MakeCtlCode(0x801);
+constexpr uint32_t kIoctlFilteredDeviceCount = MakeCtlCode(0x802);
+
+bool DecodeFilteredDeviceCount(const uint8_t* bytes, size_t length,
+                               uint32_t& out, std::string& error);
 
 bool IsSupportedVerdict(uint8_t verdict) noexcept;
 bool ValidateCommands(const uint8_t* bytes, size_t length, std::string& error);

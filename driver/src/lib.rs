@@ -30,6 +30,7 @@ unsafe extern "C" {
     fn hv_initialize(driver: Handle, registry: Handle) -> i32;
     fn hv_lock() -> usize;
     fn hv_unlock(irql: usize);
+    fn hv_read_state(ready: u32, online: u32);
     fn hv_now() -> u64;
     fn hv_allocate(size: usize) -> *mut u8;
     fn hv_free(data: *mut u8, size: usize);
@@ -74,7 +75,11 @@ fn with_state<R>(f: impl FnOnce(&mut Engine) -> R) -> R {
     // SAFETY: no recursion into this lock; no NDIS forwarding/completion while held.
     unsafe {
         let irql = hv_lock();
-        let result = f(&mut *STATE.0.get());
+        let engine = &mut *STATE.0.get();
+        let result = f(engine);
+        // Publish the level while still locked: a new read cannot miss enqueue,
+        // partial-read, timeout, or disconnect changes. This only schedules work.
+        hv_read_state(engine.has_events() as u32, engine.is_online() as u32);
         hv_unlock(irql);
         result
     }

@@ -193,19 +193,43 @@ bool TestConnectionAbi() {
     CHECK(std::string(pmkext::DirectionToString(2)) == "unknown");
     CHECK(pmkext::wire::kIoctlVersion == 0x9c40e000u);
     CHECK(pmkext::wire::kIoctlShutdown == 0x9c40e004u);
+    CHECK(pmkext::wire::kIoctlFilteredDeviceCount == 0x9c40e008u);
     return true;
 }
 
 bool TestRequiredVersion() {
-    const std::array<uint8_t, 4> expected = {0, 3, 0, 0};
+    const std::array<uint8_t, 4> expected = {0, 3, 1, 0};
     CHECK(pmkext::wire::kRequiredDeviceVersion == expected);
     CHECK(pmkext::wire::IsCompatibleVersion(expected.data()));
     CHECK(!pmkext::wire::IsCompatibleVersion(nullptr));
     for (const auto version : std::array<std::array<uint8_t, 4>, 7>{{
             {0, 2, 1, 0}, {0, 2, 0, 0}, {0, 0, 0, 0}, {0, 3, 0, 1},
-            {0, 3, 1, 0}, {0, 4, 0, 0}, {1, 3, 0, 0}}}) {
+            {0, 3, 0, 0}, {0, 4, 0, 0}, {1, 3, 0, 0}}}) {
         CHECK(!pmkext::wire::IsCompatibleVersion(version.data()));
     }
+    return true;
+}
+
+bool TestFilteredDeviceCount() {
+    std::string error;
+    uint32_t count = 0;
+    for (const uint32_t expected : {0u, 1u, 0x12345678u, 0xffffffffu}) {
+        const uint8_t bytes[] = {
+            static_cast<uint8_t>(expected), static_cast<uint8_t>(expected >> 8),
+            static_cast<uint8_t>(expected >> 16), static_cast<uint8_t>(expected >> 24)
+        };
+        error = "stale error";
+        CHECK(pmkext::wire::DecodeFilteredDeviceCount(bytes, sizeof(bytes), count, error));
+        CHECK(count == expected && error.empty());
+    }
+    const uint8_t bytes[] = {1, 2, 3, 4, 5};
+    count = 99;
+    for (const size_t length : {size_t{0}, size_t{1}, size_t{2}, size_t{3}, size_t{5}, size_t{65536}}) {
+        CHECK(!pmkext::wire::DecodeFilteredDeviceCount(bytes, length, count, error));
+        CHECK(count == 99 && error.find("exactly four bytes") != std::string::npos);
+    }
+    CHECK(!pmkext::wire::DecodeFilteredDeviceCount(nullptr, 4, count, error));
+    CHECK(count == 99);
     return true;
 }
 
@@ -567,6 +591,9 @@ bool TestDeviceOnlySession() {
     pmkext::Driver driver;
     std::string error;
     uint8_t version[4]{};
+    uint32_t count = 99;
+    CHECK(!driver.GetFilteredDeviceCount(count, error) && error == "device not open");
+    CHECK(count == 99);
     CHECK(!driver.GetVersion(version, error) && error == "device not open");
     CHECK(!driver.SendVerdict(1, pmkext::Verdict::Accept, error) && error == "device not open");
     CHECK(!driver.RequestLogs(error) && error == "device not open");
@@ -584,6 +611,8 @@ bool TestDeviceOnlySession() {
     driver.Stop();
     driver.Cleanup();
     driver.Cleanup();
+    CHECK(!driver.GetFilteredDeviceCount(count, error) && error == "device not open");
+    CHECK(count == 99);
     CHECK(!driver.GetVersion(version, error) && error == "device not open");
     return true;
 }
@@ -593,7 +622,8 @@ bool TestDeviceOnlySession() {
 int main() {
     const struct { const char* name; bool (*run)(); } tests[] = {
         {"IPv4/IPv6 exact PID-less wire fixtures and complete IP packets", TestConnectionAbi},
-        {"only wire version 0.3.0.0 is compatible", TestRequiredVersion},
+        {"only blocking-read wire version 0.3.1.0 is compatible", TestRequiredVersion},
+        {"filtered-device count exact little-endian reply and malformed lengths", TestFilteredDeviceCount},
         {"full packets above 256/65536 bytes and at the 1 MiB maximum", TestLargeConnections},
         {"malformed records, metadata and oversized payloads rejected before callbacks", TestInvalidRecords},
         {"legacy ConnectionEnd IPv4/IPv6 layout and zero PID unchanged", TestConnectionEndAbi},

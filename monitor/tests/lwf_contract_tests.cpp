@@ -14,6 +14,31 @@ int main() {
     CHECK(HvTargetMatches(123, 123));
     CHECK(HvTargetMatches(ULLONG_MAX, ULLONG_MAX));
 
+    unsigned char first = 0, second = 0;
+    int active = 0;
+    // Attach starts paused. Repeated transitions must not double-count a device.
+    active += HvSetFilterRunning(&first, 0);
+    CHECK(active == 0 && first == 0);
+    active += HvSetFilterRunning(&first, 1);
+    CHECK(active == 1 && first == 1);
+    active += HvSetFilterRunning(&first, 1);
+    CHECK(active == 1);
+    active += HvSetFilterRunning(&second, 1);
+    CHECK(active == 2 && second == 1);
+    // Pause excludes the module immediately, before any pending NBLs finish.
+    active += HvSetFilterRunning(&first, 0);
+    CHECK(active == 1 && first == 0 && second == 1);
+    active += HvSetFilterRunning(&first, 0);
+    CHECK(active == 1);
+    active += HvSetFilterRunning(&second, 0);
+    CHECK(active == 0);
+    for (unsigned i = 0; i < 1000; ++i) {
+        active += HvSetFilterRunning(&first, 1);
+        CHECK(active == 1);
+        active += HvSetFilterRunning(&first, 0);
+        CHECK(active == 0);
+    }
+
     CHECK(HvCopyFits(0, 0, 1));
     CHECK(HvCopyFits(HV_MAX_NB - 1, 0, HV_MAX_COPY_BYTES));
     CHECK(!HvCopyFits(HV_MAX_NB, 0, 1));
@@ -36,6 +61,6 @@ int main() {
     }
     CHECK(HvFinishRoute(HV_DIRECTION_RECEIVE, 0, 0) == HvRouteReturnReceive);
     CHECK(HvFinishRoute(HV_DIRECTION_RECEIVE, 1, 0) == HvRouteFreeReceive);
-    std::puts("PASS LWF target gate, copy bounds and send/receive ownership routes");
+    std::puts("PASS LWF target gate, running-device transitions, copy bounds and ownership routes");
     return 0;
 }

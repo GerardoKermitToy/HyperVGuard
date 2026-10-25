@@ -216,7 +216,7 @@ void PrintUsage(FILE* out) {
         "                   Open failure exits immediately; otherwise stop after N s.\n"
         "                   This does not uninstall or unbind the LWF.\n"
         "  --out FILE       write records to FILE, flushed per record.\n"
-        "  --poll N         request logs/bandwidth every N ms (default 1000).\n"
+        "  --poll N         query device count/logs/bandwidth every N ms (default 1000).\n"
         "  --timestamps     prefix records with local HH:MM:SS.mmm.\n"
         "  --payload        dump the complete IP packet as one hex string.\n"
         "  --memory-stats   request compatible memory-stat LogLine records each poll.\n\n"

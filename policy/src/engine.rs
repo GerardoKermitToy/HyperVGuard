@@ -245,6 +245,12 @@ impl Engine {
     pub fn stats(&self) -> Stats {
         self.stats
     }
+    pub fn has_events(&self) -> bool {
+        self.count != 0
+    }
+    pub fn is_online(&self) -> bool {
+        self.online
+    }
     pub fn pending_count(&self) -> usize {
         self.pending.iter().filter(|p| p.id != 0).count()
     }
@@ -1102,6 +1108,25 @@ mod tests {
         );
         assert_eq!(e.queued_bytes, 0);
         assert_eq!(e.pending_count(), 0);
+    }
+    #[test]
+    fn read_readiness_tracks_partial_reads_and_disconnect() {
+        let mut engine = Box::new(Engine::new());
+        assert!(!engine.is_online() && !engine.has_events());
+        engine.connect();
+        assert!(engine.is_online() && engine.has_events());
+        assert_eq!(engine.read(&mut []), 0);
+        assert!(engine.has_events());
+        assert_eq!(engine.read(&mut [0; 1]), 1);
+        assert!(engine.has_events());
+        while engine.read(&mut [0; 512]) != 0 {}
+        assert!(!engine.has_events() && engine.is_online());
+        engine.log(3, "queued");
+        assert!(engine.has_events());
+        engine.disconnect();
+        assert!(!engine.has_events() && !engine.is_online());
+        engine.log(3, "offline");
+        assert!(!engine.has_events());
     }
     #[test]
     fn pending_metadata_does_not_contain_packet_sized_arrays() {

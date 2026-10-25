@@ -2,7 +2,7 @@
 
 Experimental Rust-based **NDIS Lightweight Filter (LWF)** and a C++ monitor with a `kext_monitor`-style API. The filter targets only the management-OS host adapter **`vEthernet (Default Switch)`**. It is not a Hyper-V switch extension or a WFP callout.
 
-Driver package and device/wire protocol: **0.3.0.0**. This is a breaking Connection-event revision: process IDs are removed and payloads contain complete IP packets. Use a matching SYS and monitor; the monitor rejects older device versions.
+Driver package and device API: **0.3.1.0**. Nonzero reads now wait for event data and support cancellation. The PID-free, complete-IP-packet Connection layouts from 0.3.0.0 are unchanged. Use a matching SYS and monitor; the monitor rejects older device versions.
 
 Only traffic passing through the host vNIC is covered; VM-to-VM traffic is not guaranteed to be visible. The installer and kernel check the exact adapter GUID/NET_LUID, not its display name. If Windows recreates the adapter with a new identity, explicitly uninstall and reinstall.
 
@@ -58,6 +58,8 @@ For an interactive session, omit `--duration` and exit with **Ctrl+C**:
 
 Without `--duration`, an open failure makes the monitor create/open `Global\HyperVGuard.DriverReady` and wait for driver startup. Ctrl+C also cancels this wait. With a positive `--duration N`, it never waits for startup: an open failure exits immediately; a successful session stops after N seconds. Use `--duration` for automated/live tests; zero, negative and malformed values remain invalid.
 
+The monitor prints `Filtered network devices: N (running NDIS modules)` after the version check and whenever the count changes, checking at the `--poll` interval (default 1000 ms). This is the driver's live attachment/running-state count, not the number of configured or enabled bindings. A loaded driver can report zero. Status lines honor `--out` and `--timestamps`. If the installed SYS lacks the new IOCTL or a query fails, the monitor warns that the count is unavailable rather than reporting zero; monitoring continues and later polls retry.
+
 `--match` selects the remote endpoint in both directions; unmatched events receive PermanentAccept. `--filter-ip` only filters output, not verdicts. A blocking verdict without `--match` applies to every event and can disconnect the host-vNIC path.
 
 The monitor never installs, unbinds, or uninstalls the filter. Exiting closes the policy session; the LWF remains installed and bound. Use `--help` for all options without opening the device.
@@ -92,20 +94,23 @@ This is experimental kernel code. Offline tests and an enabled binding do not pr
 
 ### Device session and IOCTLs
 
-Open **`\\.\HyperVGuard`** as Administrator/SYSTEM with `GENERIC_READ | GENERIC_WRITE`, `OPEN_EXISTING`, and exclusive sharing. The C++ client uses `FILE_FLAG_OVERLAPPED`; the driver completes buffered reads without waiting for future events. Only **one controller** may hold the device. There is no named-pipe/winrpc transport.
+Open **`\\.\HyperVGuard`** as Administrator/SYSTEM with `GENERIC_READ | GENERIC_WRITE`, `OPEN_EXISTING`, and exclusive sharing. The C++ client uses `FILE_FLAG_OVERLAPPED`; nonzero buffered reads wait for event bytes and are cancellable. Only **one controller** may hold the device. There is no named-pipe/winrpc transport.
 
 Opening the device activates a policy session and resets its event queue, permanent cache, and bandwidth buckets. The client must verify the device version before relying on the protocol. `Driver::Open` only opens the session; the monitor separately checks the version.
 
-Both IOCTLs use `CTL_CODE(40000, function, METHOD_BUFFERED, FILE_READ_DATA | FILE_WRITE_DATA)` and take no input buffer:
+All supported IOCTLs use `CTL_CODE(40000, function, METHOD_BUFFERED, FILE_READ_DATA | FILE_WRITE_DATA)` and take no input buffer:
 
 | IOCTL | Function / numeric code | Output and effect |
 |---|---|---|
-| `IOCTL_VERSION` | `0x800` / `0x9C40E000` | Exactly four bytes: `00 03 00 00`. The output buffer must have at least four bytes. |
+| `IOCTL_VERSION` | `0x800` / `0x9C40E000` | Exactly four bytes: `00 03 01 00`. The output buffer must have at least four bytes. |
 | `IOCTL_SHUTDOWN` | `0x801` / `0x9C40E004` | No output. Deactivates the policy session, discards queued events/cache/bandwidth, and resolves pending packets through the configured fallback. Does not unload, unbind, or uninstall the LWF. |
+| `IOCTL_FILTERED_DEVICE_COUNT` | `0x802` / `0x9C40E008` | Exactly four bytes: an unsigned 32-bit little-endian count of running NDIS filter modules. The output buffer must have at least four bytes; input must be empty. No policy or binding side effects. |
+
+The count includes only modules admitted by the kernel target gate that successfully restarted and have not begun pausing. Merely configured, rejected, attached-but-paused, failed-restart and detached modules do not count. Pause removes a module immediately, even while outstanding NBLs are draining; a later successful restart adds it again. The snapshot is independent of the controller's policy-session state, so shutdown does not reset it. It describes active interception on adapters, not packet delivery, link connectivity or proof that traffic was observed. Current target isolation normally allows zero or one running device. Polling can miss brief transitions.
 
 All other IOCTLs are unsupported. After shutdown, close and reopen the handle to activate a new session. Closing the active handle also disconnects the controller and drains pending decisions. Shutdown does not itself close the handle or stop a custom application's read loop.
 
-Reads return an event byte stream, at most **65536 bytes per driver read**. A successful zero-byte read means **empty queue, not EOF**. Reads can split a record or contain multiple records; retain incomplete bytes between reads. The supplied client waits interruptibly for 10 ms on empty reads.
+Reads return an event byte stream, at most **65536 bytes per driver read**. A nonzero read remains pending until bytes exist; it never succeeds empty merely because the queue is empty. Zero-length requests still complete with zero bytes. The cancel-safe queue allows at most 16 waiting reads; excess requests fail with `STATUS_DEVICE_BUSY`. Shutdown, cleanup and unload cancel waiting reads; new reads after session shutdown fail until close/reopen. `CancelIoEx` cancels a waiting read, but cancellation can race a successful completion. Always reap an outstanding OVERLAPPED operation before freeing its buffer/event. Reads can split a record or contain multiple records; retain incomplete bytes between reads. No read-polling delay is needed. A work item copies queued bytes and completes requests outside the policy/NDIS locks; stale-only queues leave the read pending instead of returning zero.
 
 ### Driver-start notification
 
@@ -120,7 +125,8 @@ Construct `Driver(std::wstring service_name = L"HyperVGuard")`; the argument sel
 | Method | Contract |
 |---|---|
 | `bool Open(std::string& error)` | Opens the already installed device. Fails if this client session is already open. Does not install, bind, or negotiate the version. |
-| `bool GetVersion(uint8_t out[4], std::string& error)` | Reads the four-byte version; integrations should require `0.3.0.0`. |
+| `bool GetVersion(uint8_t out[4], std::string& error)` | Reads the four-byte version; integrations should require `0.3.1.0`. |
+| `bool GetFilteredDeviceCount(uint32_t& out, std::string& error)` | Synchronously reads the running-module snapshot through `IOCTL_FILTERED_DEVICE_COUNT`. Requires exactly four response bytes. On failure returns false and leaves `out` unchanged; an unsupported request means unavailable, not zero. |
 | `void Run(const Handlers& handlers, unsigned poll_interval_ms = 1000)` | Starts a reader thread and blocks until stopped or the reader exits. Dispatches complete records and invokes `on_poll` on the calling thread. It does not automatically request logs/statistics or send verdicts. |
 | `bool SendVerdict(uint64_t id, Verdict verdict, std::string& error)` | Sends one verdict for a pending event ID. Only verdict values 2–7 are accepted. |
 | `bool RequestLogs(std::string& error)` | Sends `GetLogs`; existing log events are already queued for reading. |
@@ -134,6 +140,29 @@ Construct `Driver(std::wstring service_name = L"HyperVGuard")`; the argument sel
 | `bool Install(const std::wstring& sys_path, std::string& error, bool inbound_udp_pid_fallback = true)` | Compatibility stub: always returns an unsupported-operation error. Use the native installer instead. Neither argument enables a driver-loading or PID-fallback path. |
 
 A typical integration opens the device, checks its version, installs handlers, answers `on_connection` events, and uses `on_poll` for periodic requests and a positive runtime deadline. Call `Stop`, wait for `Run` to finish, then call `Cleanup`. Keep callbacks short enough to answer before the pending timeout.
+
+### Lightweight header-only client
+
+[HyperVGuard.hpp](monitor/include/HyperVGuard.hpp) provides the separate **`hypervguard::Client`** namespace/API. Include just that file in a Windows x64 **C++20** application; no `pmkext` sources, codec, or client library are needed. It uses Kernel32 and Advapi32 (MSVC links Advapi32 through the header's pragma; other toolchains must link it explicitly). A compiled example is [callback_client.cpp](monitor/examples/callback_client.cpp), built as `build/monitor/callback_client.exe`. The example opens a real device if explicitly run; offline tests never run it.
+
+`Run` uses one caller-owned thread: it blocks on overlapped read completion, Stop, or an optional runtime deadline. There is no second reader/poll thread, idle read polling, automatic statistics timer, or automatic verdict. The receive buffer is allocated once per Run; reads go directly into it. Connection payload/IP and log-message views borrow that storage, with no separate per-event payload allocation or copy. Only an incomplete tail may move between reads. Callback function pointers plus a `void*` context avoid type-erasure/capture allocations; copy views only if they must outlive the callback. This minimizes idle wakeups and hot-path work, not a measured guarantee of zero CPU usage.
+
+| Method | Contract (`DWORD`: 0 is success, otherwise a Win32 error) |
+|---|---|
+| `Open()` | Tries the existing exclusive Administrator/SYSTEM device. After an open failure, creates/opens the protected `Global\HyperVGuard.DriverReady` event, resets it before retrying, then waits **indefinitely**, without device polling or a startup timeout. A signal only requests a retry. `Stop()` cancels this wait with `ERROR_OPERATION_ABORTED`. Never installs/loads the driver. Requires version `{0,3,1,0}` after opening; version/I/O errors are returned rather than treated as startup signals. |
+| `Run(const Callbacks&, DWORD duration_ms = INFINITE)` | Blocking callback dispatch on the calling thread. A positive duration limits monitoring only, **not Open's unlimited startup wait**; zero is invalid. Stop/runtime expiry returns success after cancelling/reaping the outstanding read. Unexpected zero-byte reads are an error, not a retry loop. Callback exceptions propagate after pending I/O is reaped. |
+| `Stop()` | Thread-safe local stop, usable during Open/Run; wakes the wait. Does not itself shut down policy, close handles or unload the LWF. |
+| `Close()` | Returns `ERROR_BUSY` during Run. Otherwise closes handles; device cleanup disconnects policy and releases pending packets through fallback. Join Run and all other callers before Close/destruction. |
+| `GetVersion(std::array<uint8_t,4>&)` / `GetFilteredDeviceCount(uint32_t&)` | Synchronous IOCTL queries; exact four-byte replies. Outputs are unchanged on failure. |
+| `SendVerdict(uint64_t id, Verdict)` | Sends the fixed ten-byte verdict; values 2..7 only. No verdict-application acknowledgement. |
+| `Send(Command)` | Single-byte ClearCache=4, GetLogs=5, GetBandwidthStats=6, PrintMemoryStats=7 or CleanEndedConnections=8. No automatic scheduling. |
+| `Shutdown()` | Calls Stop and issues the policy shutdown IOCTL. Does not close, unload or unbind. |
+
+`Callbacks` contains optional function pointers `on_connection(void*, const Connection&)`, `on_log(void*, uint8_t severity, std::string_view)`, `on_bandwidth(void*, const Bandwidth&)` and their shared `context`. The callback table/context must remain alive throughout Run. Callbacks may send commands/verdicts or call Stop; do not close/destroy the client from a callback. Open/Close are not concurrent operations; only Stop is supported during startup, and commands may run concurrently once Open has succeeded. Slow callbacks still delay verdicts and shutdown.
+
+`Connection` contains `id:u64`, `ipv6:bool`, `direction:u8`, `protocol:u8`, borrowed `local_ip`/`remote_ip` spans (4 or 16 network-order bytes), `local_port`/`remote_port:u16`, and a borrowed complete-IP `payload` span. No PID or thread ID is present. `Bandwidth` contains `ipv6`, `protocol`, the same endpoint views/ports, and `transmitted_bytes`/`received_bytes:u64`; its callback is invoked once per tuple entry. Guest direction and all policy/fallback semantics are the same as the wire reference. `Verdict` contains Accept=2, PermanentAccept=3, Block=4, PermanentBlock=5, Drop=6 and PermanentDrop=7.
+
+For offline/custom transports, `Client::DispatchRecord(Bytes, callbacks)` validates one complete record without copying payloads. The optional `Client::Stream` helper exposes a writable `Buffer()` (at most 65536 bytes), `Commit(written, callbacks)`, `PendingBytes()` and `Reset()`; an invalid stream stays failed until Reset. Record size is bounded by `MaxRecordSize=1048632`, read size by `ReadSize=65536`. Legacy connection-END types are not exposed by this client: the driver never generates them.
 
 ### Callbacks and data types
 
@@ -263,11 +292,11 @@ Commands are **unframed**, unlike events. One write can concatenate complete com
 
 Single-byte commands contain only their command byte. Request results are read asynchronously from the same event stream; there is no correlation ID or separate acknowledgement. Queue pressure can prevent diagnostic/statistics records from being queued.
 
-Empty/oversized/truncated writes are rejected with `STATUS_INVALID_PARAMETER`; unsupported command/verdict values and unknown IOCTLs use `STATUS_NOT_SUPPORTED`. A second controller is rejected with `STATUS_SHARING_VIOLATION`. Version queries with an undersized output buffer use `STATUS_BUFFER_TOO_SMALL`. The C++ client validates commands locally before writing and reports Windows I/O failures through `error`.
+Empty/oversized/truncated writes are rejected with `STATUS_INVALID_PARAMETER`; unsupported command/verdict values and unknown IOCTLs use `STATUS_NOT_SUPPORTED`. A second controller is rejected with `STATUS_SHARING_VIOLATION`. Version and filtered-device-count queries with an undersized output buffer use `STATUS_BUFFER_TOO_SMALL`. The filtered-device-count query rejects nonempty input with `STATUS_INVALID_PARAMETER`. The C++ client validates commands locally before writing and reports Windows I/O failures through `error`.
 
 ### Device-independent codec helpers
 
-`pmkext::wire` exposes `IsCompatibleVersion`, `IsSupportedVerdict`, `ValidateCommands`, `EncodeVerdict`, and `DispatchRecord`. `IsCompatibleVersion` accepts exactly `kRequiredDeviceVersion={0,3,0,0}`; `Open` itself does not perform this check. `EncodeVerdict` fills a fixed ten-byte array; `DispatchRecord` validates exactly one complete frame before invoking its handler.
+`pmkext::wire` exposes `IsCompatibleVersion`, `DecodeFilteredDeviceCount`, `IsSupportedVerdict`, `ValidateCommands`, `EncodeVerdict`, and `DispatchRecord`. `IsCompatibleVersion` accepts exactly `kRequiredDeviceVersion={0,3,1,0}`; `Open` itself does not perform this check. `DecodeFilteredDeviceCount` requires a non-null, exactly four-byte little-endian reply and leaves its output unchanged on failure. `EncodeVerdict` fills a fixed ten-byte array; `DispatchRecord` validates exactly one complete frame before invoking its handler.
 
 `RecordStream::Feed(bytes, length, callback, error)` accepts arbitrary read boundaries and invokes the callback for each complete frame. `PendingBytes()` reports buffered incomplete bytes; `Reset()` discards buffered state. An oversized header invalidates the stream until reset; it does not guess a new boundary. The stream keeps at most one bounded record in heap storage and assembles large records across multiple driver reads. Constants are `kRecordHeaderSize=5`, `kConnectionIpv4PrefixSize=32`, `kConnectionIpv6PrefixSize=56`, `kMaxPayloadSize=1048576`, `kMaxRecordSize=1048632`, `kMaxLogRecordSize=512`, `kMaxCommandBatchSize=65536`, and `kVerdictCommandSize=10`.
 

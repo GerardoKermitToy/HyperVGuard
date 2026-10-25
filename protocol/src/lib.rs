@@ -1,7 +1,7 @@
 #![no_std]
 
 // Explicit byte protocol, deliberately independent of Rust/C structure layout.
-pub const VERSION: [u8; 4] = [0, 3, 0, 0];
+pub const VERSION: [u8; 4] = [0, 3, 1, 0];
 pub const MAX_PAYLOAD: usize = 1024 * 1024;
 pub const CONNECTION_V4_HEADER: usize = 32;
 pub const CONNECTION_V6_HEADER: usize = 56;
@@ -9,6 +9,8 @@ pub const MAX_RECORD: usize = CONNECTION_V6_HEADER + MAX_PAYLOAD;
 pub const MAX_LOG_RECORD: usize = 512;
 pub const IOCTL_VERSION: u32 = ctl_code(0x800);
 pub const IOCTL_SHUTDOWN: u32 = ctl_code(0x801);
+// Four-byte little-endian count of running NDIS filter modules; no input.
+pub const IOCTL_FILTERED_DEVICE_COUNT: u32 = ctl_code(0x802);
 const fn ctl_code(function: u32) -> u32 {
     (40000 << 16) | (3 << 14) | (function << 2)
 }
@@ -266,6 +268,12 @@ mod tests {
     use std::{vec, vec::Vec};
 
     #[test]
+    fn ioctl_codes_are_stable() {
+        assert_eq!(IOCTL_VERSION, 0x9c40_e000);
+        assert_eq!(IOCTL_SHUTDOWN, 0x9c40_e004);
+        assert_eq!(IOCTL_FILTERED_DEVICE_COUNT, 0x9c40_e008);
+    }
+    #[test]
     fn exact_v4_abi_without_process_id() {
         let mut c = Connection::EMPTY;
         c.protocol = 17;
@@ -360,7 +368,7 @@ mod tests {
             Err(Error::BufferTooSmall)
         );
         assert_eq!(out, [0xa5; 64]);
-        assert_eq!(VERSION, [0, 3, 0, 0]);
+        assert_eq!(VERSION, [0, 3, 1, 0]);
     }
     #[test]
     fn verdicts_are_identical_but_redirects_not_supported() {

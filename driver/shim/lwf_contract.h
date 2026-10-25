@@ -20,6 +20,12 @@ typedef enum _HV_FINISH_ROUTE {
 static int HvTargetMatches(unsigned long long target, unsigned long long actual) {
     return target != 0 && target == actual;
 }
+// Caller holds the adapter lock and adds the returned delta to the global count.
+static int HvSetFilterRunning(unsigned char* state, int running) {
+    int previous = *state != 0;
+    *state = (unsigned char)(running != 0);
+    return (*state != 0) - previous;
+}
 static int HvCopyFits(unsigned int count, unsigned int total, unsigned int length) {
     return count < HV_MAX_NB && length != 0 && total <= HV_MAX_COPY_BYTES &&
         length <= HV_MAX_COPY_BYTES - total;

@@ -10,6 +10,7 @@
 #define MAX_EVENT_POOL_BYTES (16u * 1024u * 1024u)
 #define VERSION_IOCTL CTL_CODE(40000, 0x800, METHOD_BUFFERED, FILE_READ_DATA | FILE_WRITE_DATA)
 #define SHUTDOWN_IOCTL CTL_CODE(40000, 0x801, METHOD_BUFFERED, FILE_READ_DATA | FILE_WRITE_DATA)
+#define FILTERED_DEVICE_COUNT_IOCTL CTL_CODE(40000, 0x802, METHOD_BUFFERED, FILE_READ_DATA | FILE_WRITE_DATA)
 
 typedef struct _HV_ADAPTER HV_ADAPTER;
 typedef struct _HV_TOKEN {
@@ -55,11 +56,12 @@ static PKEVENT ReadyEvent;
 static KSPIN_LOCK PolicyLock;
 static FAST_MUTEX IoMutex;
 static PFILE_OBJECT Client;
-static BOOLEAN Stopping;
+static volatile LONG Stopping;
 static KTIMER Timer;
 static KDPC TimerDpc;
 static volatile LONG64 NextAdapter;
 static volatile LONG64 EventPoolBytes;
+static volatile LONG FilteredDeviceCount;
 static NDIS_STRING Friendly = RTL_CONSTANT_STRING(L"HyperV Guard Rust Host Adapter LWF");
 static NDIS_STRING Unique = RTL_CONSTANT_STRING(L"{6E76EAD1-7BCB-49C4-9547-D3E6B3488F71}");
 static NDIS_STRING ServiceName = RTL_CONSTANT_STRING(L"HyperVGuard");
@@ -81,6 +83,121 @@ FILTER_CANCEL_OID_REQUEST HvCancelOid;
 FILTER_NET_PNP_EVENT HvPnp;
 FILTER_STATUS HvStatus;
 static BOOLEAN TargetAdapter(PNDIS_FILTER_ATTACH_PARAMETERS p);
+
+// A bounded cancel-safe queue. NDIS only schedules the reader; buffered copies
+// and IRP completions run outside the policy/NDIS locks on a system work item.
+#define MAX_PENDING_READS 16
+static IO_CSQ ReadCsq;
+static LIST_ENTRY ReadIrps;
+static KSPIN_LOCK ReadLock;
+static PFILE_OBJECT ReadClient;
+static EX_RUNDOWN_REF ReadRundown;
+static PIO_WORKITEM ReadWorkItem;
+static volatile LONG ReadPending, ReadReady, ReadOnline, ReadScheduled;
+static IO_CSQ_INSERT_IRP_EX ReadInsert;
+static IO_CSQ_REMOVE_IRP ReadRemove;
+static IO_CSQ_PEEK_NEXT_IRP ReadPeek;
+static IO_CSQ_ACQUIRE_LOCK HvReadQueueAcquire;
+static IO_CSQ_RELEASE_LOCK HvReadQueueRelease;
+static IO_CSQ_COMPLETE_CANCELED_IRP ReadCancelled;
+static IO_WORKITEM_ROUTINE ReadWorker;
+
+static void CompleteRead(PIRP irp, NTSTATUS status, ULONG bytes) {
+    irp->IoStatus.Status = status;
+    irp->IoStatus.Information = bytes;
+    IoCompleteRequest(irp, IO_NO_INCREMENT);
+    ExReleaseRundownProtection(&ReadRundown);
+}
+_Use_decl_annotations_
+static NTSTATUS ReadInsert(PIO_CSQ csq, PIRP irp, PVOID context) {
+    UNREFERENCED_PARAMETER(csq); UNREFERENCED_PARAMETER(context);
+    if (Stopping || ReadClient != IoGetCurrentIrpStackLocation(irp)->FileObject || !ReadOnline)
+        return STATUS_DEVICE_NOT_CONNECTED;
+    if (ReadPending >= MAX_PENDING_READS) return STATUS_DEVICE_BUSY;
+    InsertTailList(&ReadIrps, &irp->Tail.Overlay.ListEntry);
+    InterlockedIncrement(&ReadPending);
+    return STATUS_SUCCESS;
+}
+_Use_decl_annotations_
+static void ReadRemove(PIO_CSQ csq, PIRP irp) {
+    UNREFERENCED_PARAMETER(csq);
+    RemoveEntryList(&irp->Tail.Overlay.ListEntry);
+    InterlockedDecrement(&ReadPending);
+}
+_Use_decl_annotations_
+static PIRP ReadPeek(PIO_CSQ csq, PIRP irp, PVOID context) {
+    PLIST_ENTRY entry = irp ? irp->Tail.Overlay.ListEntry.Flink : ReadIrps.Flink;
+    UNREFERENCED_PARAMETER(csq);
+    while (entry != &ReadIrps) {
+        PIRP next = CONTAINING_RECORD(entry, IRP, Tail.Overlay.ListEntry);
+        if (context == NULL || IoGetCurrentIrpStackLocation(next)->FileObject == context) return next;
+        entry = entry->Flink;
+    }
+    return NULL;
+}
+_Use_decl_annotations_
+static void HvReadQueueAcquire(PIO_CSQ csq, PKIRQL irql) {
+    UNREFERENCED_PARAMETER(csq); KeAcquireSpinLock(&ReadLock, irql);
+}
+_Use_decl_annotations_
+static void HvReadQueueRelease(PIO_CSQ csq, KIRQL irql) {
+    UNREFERENCED_PARAMETER(csq); KeReleaseSpinLock(&ReadLock, irql);
+}
+_Use_decl_annotations_
+static void ReadCancelled(PIO_CSQ csq, PIRP irp) {
+    UNREFERENCED_PARAMETER(csq); CompleteRead(irp, STATUS_CANCELLED, 0);
+}
+static void SetReadClient(PFILE_OBJECT file) {
+    KIRQL irql;
+    KeAcquireSpinLock(&ReadLock, &irql); ReadClient = file; KeReleaseSpinLock(&ReadLock, irql);
+}
+static void CancelReads(PFILE_OBJECT file) {
+    PIRP irp;
+    while ((irp = IoCsqRemoveNextIrp(&ReadCsq, file)) != NULL)
+        CompleteRead(irp, STATUS_CANCELLED, 0);
+}
+static void ScheduleRead(void) {
+    if (Stopping || ReadWorkItem == NULL || ReadPending == 0 || (!ReadReady && ReadOnline)) return;
+    if (!ExAcquireRundownProtection(&ReadRundown)) return;
+    if (InterlockedCompareExchange(&ReadScheduled, 1, 0) == 0)
+        IoQueueWorkItem(ReadWorkItem, ReadWorker, DelayedWorkQueue, NULL);
+    else ExReleaseRundownProtection(&ReadRundown);
+}
+// Called only with PolicyLock held. No copying, completion, or NDIS calls here.
+void hv_read_state(ULONG ready, ULONG online) {
+    if (ReadReady != (LONG)ready) InterlockedExchange(&ReadReady, (LONG)ready);
+    if (ReadOnline != (LONG)online) InterlockedExchange(&ReadOnline, (LONG)online);
+    ScheduleRead();
+}
+_Use_decl_annotations_
+static void ReadWorker(PDEVICE_OBJECT device, PVOID context) {
+    UNREFERENCED_PARAMETER(device); UNREFERENCED_PARAMETER(context);
+    for (;;) {
+        PIRP irp;
+        NTSTATUS status = STATUS_SUCCESS;
+        ULONG bytes = 0;
+        if (Stopping || (!ReadReady && ReadOnline)) break;
+        irp = IoCsqRemoveNextIrp(&ReadCsq, NULL);
+        if (irp == NULL) break;
+        ExAcquireFastMutex(&IoMutex);
+        if (Stopping || !ReadOnline || Client != IoGetCurrentIrpStackLocation(irp)->FileObject)
+            status = STATUS_CANCELLED;
+        else bytes = HvRead(irp->AssociatedIrp.SystemBuffer,
+            min(IoGetCurrentIrpStackLocation(irp)->Parameters.Read.Length, 65536));
+        ExReleaseFastMutex(&IoMutex);
+        if (!NT_SUCCESS(status) || bytes != 0) CompleteRead(irp, status, bytes);
+        else {
+            // A timeout may have removed every unread event. Keep waiting instead
+            // of completing with zero. InsertEx also closes the cleanup race.
+            status = IoCsqInsertIrpEx(&ReadCsq, irp, NULL, NULL);
+            if (!NT_SUCCESS(status)) CompleteRead(irp, status, 0);
+            break;
+        }
+    }
+    InterlockedExchange(&ReadScheduled, 0);
+    ScheduleRead(); // Recheck after releasing ownership: no enqueue/wakeup gap.
+    ExReleaseRundownProtection(&ReadRundown);
+}
 
 ULONG_PTR hv_lock(void) {
     KIRQL irql; KeAcquireSpinLock(&PolicyLock, &irql); return irql;
@@ -129,6 +246,14 @@ static void ReleaseActive(HV_ADAPTER* a, LONG count) {
     NdisReleaseSpinLock(&a->Lock);
     // Last access to a: PauseComplete may synchronously cause detach/free.
     if (complete) NdisFPauseComplete(filter);
+}
+static void SetFilterRunning(HV_ADAPTER* a, BOOLEAN running) {
+    LONG count;
+    NdisAcquireSpinLock(&a->Lock);
+    count = InterlockedAdd(&FilteredDeviceCount, HvSetFilterRunning(&a->Running, running));
+    NT_ASSERT(count >= 0);
+    UNREFERENCED_PARAMETER(count);
+    NdisReleaseSpinLock(&a->Lock);
 }
 static BOOLEAN BeginIo(HV_ADAPTER* a) {
     BOOLEAN running;
@@ -518,7 +643,7 @@ NDIS_STATUS HvFilterRestart(NDIS_HANDLE context, PNDIS_FILTER_RESTART_PARAMETERS
     HV_ADAPTER* a = context;
     UNREFERENCED_PARAMETER(parameters);
     if (!HvRestart(a->Id)) return NDIS_STATUS_FAILURE;
-    NdisAcquireSpinLock(&a->Lock); a->Running = TRUE; NdisReleaseSpinLock(&a->Lock);
+    SetFilterRunning(a, TRUE);
     return NDIS_STATUS_SUCCESS;
 }
 _Use_decl_annotations_
@@ -526,7 +651,7 @@ NDIS_STATUS HvFilterPause(NDIS_HANDLE context, PNDIS_FILTER_PAUSE_PARAMETERS par
     HV_ADAPTER* a = context;
     NDIS_STATUS status;
     UNREFERENCED_PARAMETER(parameters);
-    NdisAcquireSpinLock(&a->Lock); a->Running = FALSE; NdisReleaseSpinLock(&a->Lock);
+    SetFilterRunning(a, FALSE);
     Invalidate(a);
     NdisAcquireSpinLock(&a->Lock);
     status = a->Active == 0 ? NDIS_STATUS_SUCCESS : NDIS_STATUS_PENDING;
@@ -548,17 +673,19 @@ NTSTATUS HvDispatch(PDEVICE_OBJECT device, PIRP irp) {
     PIO_STACK_LOCATION stack = IoGetCurrentIrpStackLocation(irp);
     NTSTATUS status = STATUS_SUCCESS;
     ULONG_PTR transferred = 0;
+    BOOLEAN queueRead = FALSE, cancelReads = FALSE;
     UNREFERENCED_PARAMETER(device);
-    // Nonblocking buffered reads. NDIS callbacks use separate locks.
+    // Buffered reads wait in a cancel-safe queue; other I/O stays synchronous.
     ExAcquireFastMutex(&IoMutex);
     switch (stack->MajorFunction) {
     case IRP_MJ_CREATE:
         if (Stopping) status = STATUS_DELETE_PENDING;
         else if (Client != NULL) status = STATUS_SHARING_VIOLATION;
-        else {Client = stack->FileObject; HvConnect();}
+        else {Client = stack->FileObject; SetReadClient(Client); HvConnect();}
         break;
     case IRP_MJ_CLEANUP:
-        if (Client == stack->FileObject) {HvDisconnect(); Client = NULL;}
+        if (Client == stack->FileObject) {SetReadClient(NULL); HvDisconnect(); Client = NULL;}
+        cancelReads = TRUE;
         break;
     case IRP_MJ_CLOSE: break;
     default:
@@ -566,22 +693,47 @@ NTSTATUS HvDispatch(PDEVICE_OBJECT device, PIRP irp) {
         if (stack->MajorFunction == IRP_MJ_READ) {
             ULONG n = min(stack->Parameters.Read.Length, 65536);
             if (n && irp->AssociatedIrp.SystemBuffer == NULL) status = STATUS_INVALID_PARAMETER;
-            else transferred = HvRead(irp->AssociatedIrp.SystemBuffer, n);
+            else if (n != 0) {
+                if (!ExAcquireRundownProtection(&ReadRundown)) status = STATUS_DEVICE_NOT_CONNECTED;
+                else queueRead = TRUE;
+            }
         } else if (stack->MajorFunction == IRP_MJ_WRITE) {
             status = HvWrite(irp->AssociatedIrp.SystemBuffer, stack->Parameters.Write.Length);
             if (NT_SUCCESS(status)) transferred = stack->Parameters.Write.Length;
+            if (!ReadOnline) cancelReads = TRUE;
         } else if (stack->MajorFunction == IRP_MJ_DEVICE_CONTROL) {
             ULONG code = stack->Parameters.DeviceIoControl.IoControlCode;
             if (code == VERSION_IOCTL) {
-                static const UCHAR version[4] = {0,3,0,0};
+                static const UCHAR version[4] = {0,3,1,0};
                 if (stack->Parameters.DeviceIoControl.OutputBufferLength < sizeof(version)) status = STATUS_BUFFER_TOO_SMALL;
                 else {RtlCopyMemory(irp->AssociatedIrp.SystemBuffer, version, sizeof(version)); transferred = sizeof(version);}
-            } else if (code == SHUTDOWN_IOCTL) HvDisconnect();
-            else status = STATUS_NOT_SUPPORTED;
+            } else if (code == SHUTDOWN_IOCTL) {HvDisconnect(); cancelReads = TRUE;}
+            else if (code == FILTERED_DEVICE_COUNT_IOCTL) {
+                if (stack->Parameters.DeviceIoControl.InputBufferLength != 0) status = STATUS_INVALID_PARAMETER;
+                else if (stack->Parameters.DeviceIoControl.OutputBufferLength < sizeof(ULONG)) status = STATUS_BUFFER_TOO_SMALL;
+                else if (irp->AssociatedIrp.SystemBuffer == NULL) status = STATUS_INVALID_PARAMETER;
+                else {
+                    ULONG count = (ULONG)InterlockedCompareExchange(&FilteredDeviceCount, 0, 0);
+                    UCHAR* out = irp->AssociatedIrp.SystemBuffer;
+                    out[0] = (UCHAR)count; out[1] = (UCHAR)(count >> 8);
+                    out[2] = (UCHAR)(count >> 16); out[3] = (UCHAR)(count >> 24);
+                    transferred = sizeof(ULONG);
+                }
+            } else status = STATUS_NOT_SUPPORTED;
         } else status = STATUS_INVALID_DEVICE_REQUEST;
         break;
     }
     ExReleaseFastMutex(&IoMutex);
+    if (cancelReads) CancelReads(stack->FileObject);
+    if (queueRead) {
+        // No locks across CSQ insertion: an already-cancelled IRP can complete
+        // inline. Never touch it after successful insertion.
+        IoMarkIrpPending(irp);
+        status = IoCsqInsertIrpEx(&ReadCsq, irp, NULL, NULL);
+        if (!NT_SUCCESS(status)) CompleteRead(irp, status, 0);
+        else ScheduleRead();
+        return STATUS_PENDING;
+    }
     irp->IoStatus.Status = status; irp->IoStatus.Information = transferred;
     IoCompleteRequest(irp, IO_NO_INCREMENT); return status;
 }
@@ -698,6 +850,11 @@ NTSTATUS hv_initialize(PDRIVER_OBJECT driver, PUNICODE_STRING registry) {
     NDIS_STATUS status;
     LARGE_INTEGER due;
     KeInitializeSpinLock(&PolicyLock); ExInitializeFastMutex(&IoMutex);
+    KeInitializeSpinLock(&ReadLock); InitializeListHead(&ReadIrps);
+    ExInitializeRundownProtection(&ReadRundown);
+    status = IoCsqInitializeEx(&ReadCsq, ReadInsert, ReadRemove, ReadPeek,
+        HvReadQueueAcquire, HvReadQueueRelease, ReadCancelled);
+    if (!NT_SUCCESS(status)) return status;
     ReadConfiguration(registry);
     c.Header.Type = NDIS_OBJECT_TYPE_FILTER_DRIVER_CHARACTERISTICS;
     c.Header.Revision = NDIS_FILTER_CHARACTERISTICS_REVISION_2;
@@ -726,6 +883,12 @@ NTSTATUS hv_initialize(PDRIVER_OBJECT driver, PUNICODE_STRING registry) {
     attributes.MajorFunctions = dispatch; attributes.DefaultSDDLString = &sddl;
     status = NdisRegisterDeviceEx(DriverHandle, &attributes, &ControlDevice, &DeviceHandle);
     if (status != NDIS_STATUS_SUCCESS) {NdisFDeregisterFilterDriver(DriverHandle); DriverHandle = NULL; return status;}
+    ReadWorkItem = IoAllocateWorkItem(ControlDevice);
+    if (ReadWorkItem == NULL) {
+        NdisDeregisterDeviceEx(DeviceHandle); NdisFDeregisterFilterDriver(DriverHandle);
+        DriverHandle = NULL; return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    ScheduleRead();
     ControlDevice->Flags |= DO_BUFFERED_IO;
     ControlDevice->Flags &= ~DO_DEVICE_INITIALIZING;
     KeInitializeTimer(&Timer); KeInitializeDpc(&TimerDpc, TickDpc, NULL);
@@ -737,7 +900,11 @@ _Use_decl_annotations_
 void HvUnload(PDRIVER_OBJECT driver) {
     UNREFERENCED_PARAMETER(driver);
     if (ReadyEvent != NULL) KeClearEvent(ReadyEvent);
-    ExAcquireFastMutex(&IoMutex); Stopping = TRUE; HvDisconnect(); Client = NULL; ExReleaseFastMutex(&IoMutex);
+    ExAcquireFastMutex(&IoMutex); InterlockedExchange(&Stopping, TRUE);
+    SetReadClient(NULL); HvDisconnect(); Client = NULL; ExReleaseFastMutex(&IoMutex);
+    CancelReads(NULL);
+    ExWaitForRundownProtectionRelease(&ReadRundown);
+    IoFreeWorkItem(ReadWorkItem); ReadWorkItem = NULL;
     KeCancelTimer(&Timer); KeFlushQueuedDpcs();
     NdisFDeregisterFilterDriver(DriverHandle);
     NdisDeregisterDeviceEx(DeviceHandle);

@@ -59,9 +59,26 @@ if(MSVC)
     target_link_options(hyperv_guard_notify PRIVATE /DYNAMICBASE /NXCOMPAT /GUARD:CF)
 endif()
 
+# Independent header-only consumers: no pmkext library or codec dependency.
+function(add_header_client_target target source)
+    add_executable(${target} ${source})
+    target_compile_features(${target} PRIVATE cxx_std_20)
+    target_include_directories(${target} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    target_compile_definitions(${target} PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN
+        _WIN32_WINNT=0x0A00)
+    target_link_libraries(${target} PRIVATE advapi32)
+    if(MSVC)
+        target_compile_options(${target} PRIVATE /W4 /WX /permissive- /utf-8)
+    endif()
+endfunction()
+add_header_client_target(callback_client examples/callback_client.cpp)
+
 include(CTest)
 add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../install/console" "${CMAKE_CURRENT_BINARY_DIR}/setup")
 if(BUILD_TESTING)
+    add_header_client_target(header_client_tests tests/header_client_tests.cpp)
+    add_test(NAME header_client_tests COMMAND header_client_tests)
+    set_tests_properties(header_client_tests PROPERTIES TIMEOUT 30 LABELS "no-driver")
     foreach(test_name IN ITEMS ip_address_tests protocol_codec_tests monitor_options_tests
                                driver_startup_tests delayed_verdict_tests record_output_tests lwf_contract_tests
                                binding_policy_tests netcfg_binding_tests)

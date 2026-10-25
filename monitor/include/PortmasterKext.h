@@ -172,8 +172,8 @@ public:
     // external verdict client is started; records go to the local handlers.
     bool Open(std::string& error);
 
-    // Driver reads are NONBLOCKING. Empty successful reads wait interruptibly
-    // for 10 ms, not EOF. Only complete bounded wire records are dispatched.
+    // Nonzero reads wait for data and support cancellation; no idle polling.
+    // Only complete bounded wire records are dispatched.
     // Stop() is thread-safe during Run(). Join Run() before Cleanup/destruction.
     void Run(const Handlers& handlers, unsigned poll_interval_ms = 1000);
 
@@ -182,6 +182,9 @@ public:
     void Stop();
 
     bool GetVersion(uint8_t out[4], std::string& error);
+    // Snapshot of running NDIS modules, not configured/enabled bindings or traffic.
+    // Paused modules are excluded; the count does not depend on policy-session state.
+    bool GetFilteredDeviceCount(uint32_t& out, std::string& error);
     bool RequestShutdown(std::string& error);
 
     // Original unframed commands, with unchanged IDs and fixed field sizes.

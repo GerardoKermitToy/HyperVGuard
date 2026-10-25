@@ -29,6 +29,17 @@ bool IsCompatibleVersion(const uint8_t version[4]) noexcept {
            std::equal(kRequiredDeviceVersion.begin(), kRequiredDeviceVersion.end(), version);
 }
 
+bool DecodeFilteredDeviceCount(const uint8_t* bytes, size_t length,
+                               uint32_t& out, std::string& error) {
+    if (bytes == nullptr || length != sizeof(uint32_t)) {
+        error = "IOCTL_FILTERED_DEVICE_COUNT did not return exactly four bytes";
+        return false;
+    }
+    out = ReadU32(bytes);
+    error.clear();
+    return true;
+}
+
 bool IsSupportedVerdict(uint8_t verdict) noexcept {
     return verdict >= static_cast<uint8_t>(Verdict::Accept) &&
            verdict <= static_cast<uint8_t>(Verdict::PermanentDrop);

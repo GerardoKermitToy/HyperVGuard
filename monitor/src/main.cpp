@@ -176,6 +176,27 @@ int MonitorMain(int argc, wchar_t** argv) {
         return 0;
     }
 
+    uint32_t filtered_devices = 0;
+    bool have_filtered_devices = false;
+    bool filtered_devices_unavailable = false;
+    auto report_filtered_devices = [&]() {
+        uint32_t count = 0;
+        std::string query_error;
+        if (!driver.GetFilteredDeviceCount(count, query_error)) {
+            if (!filtered_devices_unavailable)
+                Emit("%s[WARN] Filtered network device count unavailable: %s\n",
+                     TimePrefix(opt.timestamps).c_str(), query_error.c_str());
+            filtered_devices_unavailable = true;
+            return;
+        }
+        if (!have_filtered_devices || filtered_devices_unavailable || count != filtered_devices)
+            Emit("%sFiltered network devices: %u (running NDIS modules)\n",
+                 TimePrefix(opt.timestamps).c_str(), count);
+        filtered_devices = count;
+        have_filtered_devices = true;
+        filtered_devices_unavailable = false;
+    };
+
     uint8_t version[4]{};
     if (!driver.GetVersion(version, error)) {
         std::fprintf(stderr, "ERROR: could not read version: %s\n", error.c_str());
@@ -183,10 +204,11 @@ int MonitorMain(int argc, wchar_t** argv) {
     }
     std::printf("Driver version: %u.%u.%u.%u\n", version[0], version[1], version[2], version[3]);
     if (!pmkext::wire::IsCompatibleVersion(version)) {
-        std::fprintf(stderr, "ERROR: incompatible HyperVGuard driver version (expected 0.3.0.0); "
+        std::fprintf(stderr, "ERROR: incompatible HyperVGuard driver version (expected 0.3.1.0); "
                              "installed SYS uses a different wire layout\n");
         return 1;
     }
+    report_filtered_devices();
     std::printf("CONN: one NBL decision, direction=0 outbound/1 inbound from the guest side.\n"
                 "Local=guest endpoint, remote=peer; host receive=outbound, host send=inbound; no process/thread identity.\n"
                 "Payload is the complete layer-3 logical IP packet, up to 1 MiB without truncation.\n"
@@ -377,6 +399,7 @@ int MonitorMain(int argc, wchar_t** argv) {
         }
         if (now < next_poll) return;
         next_poll = now + opt.poll_ms;
+        report_filtered_devices();
         std::string command_error;
         if (now >= next_cleanup) {
             if (!driver.RequestCleanEndedConnections(command_error))
