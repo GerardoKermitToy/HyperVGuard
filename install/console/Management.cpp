@@ -24,6 +24,38 @@ int NeedsReboot(System& system) {
     return kRebootRequired;
 }
 
+int RemovalNeedsReboot(System& system) {
+    system.Print(L"Removal requires a reboot. Configuration remains disarmed. After reboot, run Uninstall.exe again to remove all remaining HyperVXNdisFilter Driver Store packages.\n");
+    return kRebootRequired;
+}
+
+Change RemovePackages(System& system) {
+    bool reboot = false;
+    std::wstring failures;
+    for (const auto& package : system.ReadDriverPackages()) {
+        try {
+            if (system.RemoveDriverPackage(package) == Change::RebootRequired) {
+                if (!reboot) {
+                    system.Print(L"Package removal requires a reboot, even if later cleanup fails. After reboot, rerun Uninstall.exe.\n");
+                }
+                reboot = true;
+            }
+        } catch (const Error& error) {
+            // Отказ одного пакета не должен оставлять остальные старые версии
+            // без попытки удаления. Успех при частичной очистке не возвращаем.
+            failures += package + L": " + error.message + L"\n";
+            system.Print(L"WARNING: " + package + L": " + error.message + L"\n");
+        }
+    }
+    const auto remaining = system.ReadDriverPackages();
+    if (!failures.empty()) throw Error{L"Driver Store cleanup is incomplete; configuration remains disarmed.\n" + failures};
+    if (reboot) return Change::RebootRequired;
+    if (!remaining.empty()) {
+        throw Error{L"HyperVXNdisFilter packages remain in Driver Store after removal. Configuration is retained; run Uninstall.exe again."};
+    }
+    return Change::Complete;
+}
+
 int Enable(System& system, const Adapter& target) {
     ValidateBindings(system.ReadBindings(), target, false);
     RevalidateTarget(system, target);
@@ -110,9 +142,9 @@ std::wstring Usage(Action executable) {
         ? L"Usage: Uninstall.exe [--yes] [--what-if]\n       Uninstall.exe --help\n\n"
         : L"Usage: Install.exe [--package DIRECTORY] [--yes] [--what-if]\n       Install.exe --enable [--yes] [--what-if]\n       Install.exe --help\n\n";
     result += uninstall
-        ? L"Disarms and removes only the hyperv_xndis_filter NetCfg component.\nNo Default Switch, VM, HNS, NAT or unrelated binding is changed.\n"
+        ? L"Disarms and removes only the hyperv_xndis_filter NetCfg component, then\nremoves ALL identified HyperVXNdisFilter package versions from Driver Store.\nPackages in use require reboot and another Uninstall.exe run; no forced file\ndeletion is performed. No Default Switch, VM, HNS, NAT or unrelated driver is changed.\n"
         : L"Installs the optional NDIS LWF only on the Default Switch host vNIC.\nThe package directory defaults to the directory containing this EXE.\n--enable resumes an installed, disarmed component after a requested reboot;\nit never retargets stale GUID/NET_LUID configuration.\n";
-    result += L"\nRun from an elevated Administrator/SYSTEM console; stop hyperv_monitor first.\nConfirmation is required unless --yes is supplied. --what-if performs read-only\npreflight without a write lock, registry writes, installation or binding changes.\n--help and invalid arguments do not access WMI, NetCfg, registry or the driver.\n\nExit codes: 0 success/dry run, 1 failure, 2 invalid arguments,\n1223 cancelled, 3010 reboot required (configuration retained disarmed).\nThe programs never open the driver device or create an SCM service manually.\n";
+    result += L"\nRun from an elevated Administrator/SYSTEM console; stop hyperv_monitor first.\nConfirmation is required unless --yes is supplied. --what-if performs read-only\npreflight without a write lock, registry writes, package deletion or binding changes.\n--help and invalid arguments do not access WMI, NetCfg, registry or the driver.\n\nExit codes: 0 success/dry run, 1 failure, 2 invalid arguments,\n1223 cancelled, 3010 reboot required (configuration retained disarmed).\nThe programs never open the driver device or create an SCM service manually.\n";
     return result;
 }
 
@@ -201,12 +233,17 @@ int Execute(const Options& options, System& system) {
         system.Print(L"Target only: " + target.name + L", NET_LUID=" + std::to_wstring(target.luid) + L"\n");
         system.Print(L"WARNING: this is the host-vNIC path, not all VM-to-VM traffic. Blocking verdicts can disconnect it.\n");
     }
+    if (options.action == Action::Uninstall) {
+        const auto packages = system.ReadDriverPackages();
+        system.Print(L"HyperVXNdisFilter Driver Store packages (all versions): " + std::to_wstring(packages.size()) + L"\n");
+        for (const auto& package : packages) system.Print(L"  " + package + L"\n");
+    }
     if (options.what_if) {
         system.Print(L"What-if: preflight completed. No system state was changed.\n");
         return 0;
     }
     const std::wstring operation = options.action == Action::Uninstall
-        ? L"Disarm and uninstall ONLY HyperVXNdisFilter"
+        ? L"Disarm and uninstall ONLY HyperVXNdisFilter, including ALL its Driver Store package versions"
         : options.action == Action::Enable ? L"Enable ONLY the configured Default Switch host binding"
                                           : L"Install HyperVXNdisFilter and enable ONLY the Default Switch host binding";
     if (!options.yes && !system.Confirm(operation)) {
@@ -217,12 +254,13 @@ int Execute(const Options& options, System& system) {
     system.RequireMonitorStopped();
     if (options.action == Action::Uninstall) {
         system.DisarmIfPresent();
-        if (system.RemoveComponent() == Change::RebootRequired) return NeedsReboot(system);
+        if (system.RemoveComponent() == Change::RebootRequired) return RemovalNeedsReboot(system);
         if (system.HasComponent() || system.HasService()) {
             throw Error{L"HyperVXNdisFilter removal is incomplete. Configuration remains disarmed; reboot if requested and run Uninstall.exe again."};
         }
+        if (RemovePackages(system) == Change::RebootRequired) return RemovalNeedsReboot(system);
         system.DeleteConfiguration();
-        system.Print(L"HyperVXNdisFilter removed. No other component, switch, VM, HNS or NAT setting was changed.\n");
+        system.Print(L"HyperVXNdisFilter and all its Driver Store package versions removed. No other component, switch, VM, HNS or NAT setting was changed.\n");
         return 0;
     }
     RevalidateTarget(system, target);

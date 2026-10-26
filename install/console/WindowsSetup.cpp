@@ -45,6 +45,15 @@ public:
         Initialize();
     }
 
+    void Quiesce() {
+        if (!initialized_) return;
+        Check(config->Cancel(), L"Discard pending NetCfg changes before package removal");
+        Check(config->Uninitialize(), L"Release NetCfg notify objects before package removal");
+        initialized_ = false;
+        // Освобождаем неиспользуемую notify DLL, но сохраняем NetCfg write lock.
+        CoFreeUnusedLibrariesEx(0, 0);
+    }
+
     ComPtr<INetCfgComponent> Component() {
         ComPtr<INetCfgComponent> component;
         const HRESULT result = config->FindComponent(kComponentId, &component);
@@ -364,6 +373,14 @@ public:
         component.Reset();
         setup.Reset();
         return Applied(*network_, result);
+    }
+
+    std::vector<std::wstring> ReadDriverPackages() override { return ReadWindowsDriverPackages(); }
+
+    Change RemoveDriverPackage(const std::wstring& published_inf) override {
+        if (!network_) throw Error{L"NetCfg write lock is required for package removal."};
+        network_->Quiesce();
+        return RemoveWindowsDriverPackage(published_inf);
     }
 
     std::vector<Binding> ReadBindings() override {

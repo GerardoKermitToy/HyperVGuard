@@ -73,6 +73,10 @@ struct CoString {
 
 Adapter ResolveWindowsTarget();
 void ValidateInfFile(const std::filesystem::path& inf);
+void ValidateRemovalInfFile(const std::filesystem::path& inf);
+bool IsPublishedInfName(const std::wstring& name);
+std::vector<std::wstring> ReadWindowsDriverPackages();
+Change RemoveWindowsDriverPackage(const std::wstring& published_inf);
 std::vector<Handle> LockAndVerifyPackage(const std::filesystem::path& package);
 
 } // namespace hyperv_xndis_filter::setup

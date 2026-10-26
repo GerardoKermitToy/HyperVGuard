@@ -80,7 +80,9 @@ Stop the monitor, then run from an elevated console:
 ./dist/Uninstall.exe
 ```
 
-Only HyperVXNdisFilter is removed. If removal returns **3010**, reboot before reinstalling. No manual SCM service creation or deletion is needed.
+Uninstall first disarms and removes the `hyperv_xndis_filter` NetCfg component, then removes **all identified HyperVXNdisFilter driver-package versions** from Driver Store, including old `HyperVXNdisFilter.sys` copies under `FileRepository`. Windows driver-installation APIs perform the deletion; the program never takes ownership of Driver Store folders or deletes them manually. Package ownership is checked from the original INF name, NetService class, every component model, filter instance GUID, and service/SYS identity, without requiring the current package version. Unrelated driver packages are not selected.
+
+`--what-if` lists matching published OEM INFs without changing system state. Cleanup also works when the component is already absent and only old staged packages remain. Exit **0** requires a fresh inventory with no matching packages; partial failure is reported, not ignored. If component/package removal returns **3010**, reboot and run `Uninstall.exe` again before reinstalling. Busy packages are never forcibly deleted; no manual SCM service creation/deletion is needed.
 
 ## API
 

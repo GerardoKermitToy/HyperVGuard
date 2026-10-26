@@ -39,6 +39,10 @@ public:
     Adapter target = Target();
     Adapter configured = target;
     std::vector<Binding> bindings;
+    std::vector<std::wstring> packages, removed_packages;
+    std::wstring package_failure;
+    bool package_remove_effect = true, package_after_confirmation = false;
+    Change package_remove_result = Change::Complete;
     std::vector<std::string> calls;
     std::vector<std::wstring> messages;
     std::string fail;
@@ -74,6 +78,7 @@ public:
         Step("confirm");
         if (change_target_after_confirm) target.guid = foreign_guid;
         if (appear_after_confirm) service = component = true;
+        if (package_after_confirmation) packages.push_back(L"oem999.inf");
         return consent;
     }
     void Print(const std::wstring& text) override { messages.push_back(text); }
@@ -110,6 +115,15 @@ public:
         }
         return remove_result;
     }
+    std::vector<std::wstring> ReadDriverPackages() override { Step("packages"); return packages; }
+    Change RemoveDriverPackage(const std::wstring& published_inf) override {
+        Require(!component && !service && !allowed && !recovery, "package removal must follow complete component removal and disarm");
+        removed_packages.push_back(published_inf);
+        Step("purge");
+        if (package_failure == published_inf) throw Error{L"injected package removal failure"};
+        if (package_remove_effect) std::erase(packages, published_inf);
+        return package_remove_result;
+    }
     std::vector<Binding> ReadBindings() override { Step("bindings"); return bindings; }
     Change DisableTarget(const Adapter& adapter) override {
         Require(config && !allowed && SameTarget(configured, adapter), "disable must follow exact config validation and disarm");
@@ -136,7 +150,7 @@ public:
         return static_cast<size_t>(found - calls.begin());
     }
     void RequireNoMutation() const {
-        for (const auto name : {"lock", "write-disarmed", "disarm", "arm", "ready", "install", "disable", "enable", "remove", "delete-config"}) {
+        for (const auto name : {"lock", "write-disarmed", "disarm", "arm", "ready", "install", "disable", "enable", "remove", "purge", "delete-config"}) {
             Require(!Called(name), "unexpected mutation in read-only path");
         }
     }
@@ -407,6 +421,102 @@ int main() {
             Require(system.At("disarm") < system.At("remove") && system.At("remove") < system.At("delete-config"));
             Require(!system.component && !system.service && !system.config);
             Require(!system.Called("resolve") && !system.Called("os") && !system.Called("enable") && !system.Called("package"));
+        }},
+        {"uninstall removes all package versions before deleting configuration", [] {
+            FakeSystem system; system.Installed(); system.allowed = system.recovery = true;
+            system.packages = {L"oem7.inf", L"oem42.inf", L"oem108.inf"};
+            const auto expected = system.packages;
+            Require(Execute(Uninstall(), system) == 0);
+            Require(system.packages.empty() && system.removed_packages == expected && !system.config);
+            Require(system.At("remove") < system.At("purge") && system.At("purge") < system.At("delete-config"));
+        }},
+        {"staged old packages are removed even when component is already absent", [] {
+            FakeSystem system; system.packages = {L"oem1.inf", L"oem12.inf"};
+            Require(Execute(Uninstall(), system) == 0);
+            Require(system.packages.empty() && system.removed_packages.size() == 2);
+            Require(!system.Called("resolve") && !system.Called("os") && !system.Called("package"));
+        }},
+        {"package preflight and declined confirmation are read-only", [] {
+            FakeSystem system; system.packages = {L"oem3.inf"}; system.consent = false;
+            Require(Execute(Uninstall(), system) == ERROR_CANCELLED);
+            system.RequireNoMutation();
+            Require(system.packages.size() == 1 && system.removed_packages.empty());
+            Require(std::any_of(system.messages.begin(), system.messages.end(), [](const auto& text) { return text.find(L"oem3.inf") != std::wstring::npos; }));
+        }},
+        {"what-if reports package versions without deleting them", [] {
+            FakeSystem system; system.packages = {L"oem3.inf", L"oem4.inf"};
+            auto options = Uninstall(); options.what_if = true;
+            Require(Execute(options, system) == 0);
+            system.RequireNoMutation();
+            Require(system.packages.size() == 2 && !system.Called("confirm"));
+        }},
+        {"package inventory is refreshed after confirmation", [] {
+            FakeSystem system; system.packages = {L"oem3.inf"}; system.package_after_confirmation = true;
+            Require(Execute(Uninstall(), system) == 0);
+            Require(system.packages.empty() && system.removed_packages.size() == 2);
+        }},
+        {"component reboot postpones all package removal", [] {
+            FakeSystem system; system.Installed(); system.packages = {L"oem3.inf"};
+            system.remove_result = Change::RebootRequired;
+            Require(Execute(Uninstall(), system) == kRebootRequired);
+            Require(!system.Called("purge") && system.packages.size() == 1 && system.config && !system.recovery);
+        }},
+        {"residual service prevents package deletion", [] {
+            FakeSystem system; system.Installed(); system.leave_service = true; system.packages = {L"oem3.inf"};
+            Throws([&] { Execute(Uninstall(), system); }, L"incomplete");
+            Require(!system.Called("purge") && system.packages.size() == 1 && system.config);
+        }},
+        {"one package failure does not skip the other old versions", [] {
+            FakeSystem system; system.Installed();
+            system.packages = {L"oem3.inf", L"oem4.inf", L"oem5.inf"}; system.package_failure = L"oem3.inf";
+            Throws([&] { Execute(Uninstall(), system); }, L"cleanup is incomplete");
+            Require(system.removed_packages.size() == 3 && system.packages == std::vector<std::wstring>{L"oem3.inf"});
+            Require(system.config && !system.allowed && !system.recovery && !system.Called("delete-config"));
+        }},
+        {"remaining packages are not silently accepted", [] {
+            FakeSystem system; system.Installed(); system.packages = {L"oem3.inf"}; system.package_remove_effect = false;
+            Throws([&] { Execute(Uninstall(), system); }, L"packages remain");
+            Require(system.config && !system.Called("delete-config") && !system.allowed);
+        }},
+        {"package reboot retains disarmed configuration and later cleanup can finish", [] {
+            FakeSystem system; system.Installed(); system.allowed = system.recovery = true;
+            system.packages = {L"oem3.inf", L"oem4.inf"};
+            system.package_remove_result = Change::RebootRequired; system.package_remove_effect = false;
+            Require(Execute(Uninstall(), system) == kRebootRequired);
+            Require(system.removed_packages.size() == 2 && system.config && !system.allowed && !system.recovery);
+            Require(!system.Called("delete-config"));
+            system.package_remove_result = Change::Complete; system.package_remove_effect = true;
+            Require(Execute(Uninstall(), system) == 0 && system.packages.empty() && !system.config);
+        }},
+        {"post-removal inventory errors retain configuration", [] {
+            FakeSystem system; system.Installed(); system.packages = {L"oem3.inf"};
+            system.fail = "packages"; system.fail_on_occurrence = 3;
+            Throws([&] { Execute(Uninstall(), system); }, L"injected");
+            Require(system.packages.empty() && system.config && !system.Called("delete-config"));
+        }},
+        {"package reboot instruction survives a later package failure", [] {
+            FakeSystem system; system.Installed(); system.packages = {L"oem3.inf", L"oem4.inf"};
+            system.package_remove_result = Change::RebootRequired; system.package_failure = L"oem4.inf";
+            Throws([&] { Execute(Uninstall(), system); }, L"cleanup is incomplete");
+            Require(system.config && !system.allowed && !system.recovery);
+            Require(std::any_of(system.messages.begin(), system.messages.end(), [](const auto& text) {
+                return text.find(L"reboot") != std::wstring::npos && text.find(L"Uninstall.exe") != std::wstring::npos;
+            }), "lost reboot instruction after a later package failure");
+        }},
+        {"package reboot instruction survives final inventory failure", [] {
+            FakeSystem system; system.Installed(); system.packages = {L"oem3.inf"};
+            system.package_remove_result = Change::RebootRequired;
+            system.fail = "packages"; system.fail_on_occurrence = 3;
+            Throws([&] { Execute(Uninstall(), system); }, L"injected");
+            Require(system.config && !system.allowed && !system.recovery);
+            Require(std::any_of(system.messages.begin(), system.messages.end(), [](const auto& text) {
+                return text.find(L"reboot") != std::wstring::npos && text.find(L"Uninstall.exe") != std::wstring::npos;
+            }), "lost reboot instruction after final inventory failure");
+        }},
+        {"failed fresh install never purges preexisting driver store packages", [] {
+            FakeSystem system; system.packages = {L"oem3.inf"}; system.fail = "enable";
+            Throws([&] { Execute(Install(), system); }, L"injected");
+            Require(!system.Called("purge") && !system.Called("packages") && system.packages.size() == 1);
         }},
         {"already absent component removal is safe", [] {
             FakeSystem system;

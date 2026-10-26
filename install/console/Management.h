@@ -86,6 +86,8 @@ public:
     virtual void AllowRuntimeRecovery() = 0;
     virtual Change InstallComponent(const std::filesystem::path& package) = 0;
     virtual Change RemoveComponent() = 0;
+    virtual std::vector<std::wstring> ReadDriverPackages() = 0;
+    virtual Change RemoveDriverPackage(const std::wstring& published_inf) = 0;
     virtual std::vector<Binding> ReadBindings() = 0;
     virtual Change DisableTarget(const Adapter& target) = 0;
     virtual Change EnableTarget(const Adapter& target) = 0;
