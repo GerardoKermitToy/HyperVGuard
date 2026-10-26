@@ -1,10 +1,10 @@
-# Native HyperVGuard setup tools
+# Native HyperVXNdisFilter setup tools
 
 Current driver-store package and SYS/device API version: **0.3.1.0**. Nonzero device reads now wait for data and support cancellation; the PID-free full-packet layouts from 0.3.0.0 are unchanged. Existing GUID/LUID target checks and disable-before-arm setup behavior are unchanged. Use the coherent new INF/DLL/CAT/setup EXE set and matching monitor; older device versions are rejected. Package generation does not replace the installed driver.
 
 `Install.exe` and `Uninstall.exe` replace `scripts/Install.ps1` and `scripts/Uninstall.ps1`. They are native Windows x64 C++ console programs using system APIs directly, not compiled script launchers. No PowerShell module, PowerShell execution policy, `netcfg.exe` child process, SCM service creation, or driver-device access is involved.
 
-The binaries are packaged beside `HyperVGuard.inf`, `.sys`, `.cat`, and the required `HyperVGuardNotify.dll` in `dist/`. The default package directory is the **EXE directory**, not the current working directory. Actions require an already elevated Administrator/SYSTEM console; the EXEs deliberately use `asInvoker` so help and invalid-CLI tests need no elevation or UAC prompt.
+The binaries are packaged beside **`HyperVXNdisFilter.sys`**, `HyperVXNdisFilter.inf`, `HyperVXNdisFilter.cat`, and the required `HyperVXNdisFilterNotify.dll` in `dist/`; matching debug symbols are `HyperVXNdisFilter.pdb`. The service is `HyperVXNdisFilter` and the NetCfg component is `hyperv_xndis_filter`; the device, startup event and clients use the same product name. A package with inconsistent filenames or service identities is rejected. Before using this renamed package, remove a previous-name installation with its matching old `Uninstall.exe`. The new tools reject a conflicting filter instance GUID and never migrate or remove a differently named component. Never rename an installed SYS. The default package directory is the **EXE directory**, not the current working directory. Actions require an already elevated Administrator/SYSTEM console; the EXEs deliberately use `asInvoker` so help and invalid-CLI tests need no elevation or UAC prompt.
 
 ## Commands
 
@@ -32,7 +32,7 @@ Resume an installed component **after** a requested reboot, using the existing G
 ./dist/Install.exe --enable
 ```
 
-Remove only HyperVGuard, even if Default Switch or its adapter no longer exists:
+Remove only HyperVXNdisFilter, even if Default Switch or its adapter no longer exists:
 
 ```bash
 ./dist/Uninstall.exe
@@ -63,11 +63,11 @@ When installation requests reboot, do not bypass the disarmed state. Reboot, the
 ## Native lifecycle and scope
 
 - `Target.cpp` queries only local WMI. It verifies the built-in Default Switch identity `c08cb7b8-9b3c-408e-8e30-5e16a3aeb444`, follows **internal management-OS Ethernet port → LAN endpoint → active connection → switch endpoint** associations, and matches the port's `Microsoft:{GUID}` device ID to the exact `MSFT_NetAdapter`. Ethernet type, virtual/hardware flags, nonzero LUID, and native GUID/LUID round-trip conversion are checked. Names are diagnostic only. Missing/ambiguous/stale identity aborts; there is no friendly-name fallback.
-- `Package.cpp` keeps non-write/non-delete-sharing handles open on all four package files. SetupAPI parses the supported 0.3.1.0 NetService/LWF INF, notify CLSID, driver-store destinations and binding policy. WinVerifyTrust validates SYS/DLL/CAT trust and SHA-256 catalog membership of INF/SYS/DLL. Verification uses cached trust information without a timestamp request, certificate import, trust-store mutation or security-policy change.
+- `Package.cpp` keeps non-write/non-delete-sharing handles open on all four package files. SetupAPI parses the supported 0.3.1.0 NetService/LWF INF, notify CLSID, driver-store destinations and binding policy. The INF service binary, driver copy list and source-disk entry must name `HyperVXNdisFilter.sys`; the driver and notify copy lists each contain exactly one expected file. WinVerifyTrust validates SYS/DLL/CAT trust and SHA-256 catalog membership of INF/SYS/DLL. Verification uses cached trust information without a timestamp request, certificate import, trust-store mutation or security-policy change.
 - `Management.cpp` implements an injectable workflow shared by the real EXEs and offline fake-system tests. Before installation it refuses an existing service/component and a running monitor, requires confirmation, acquires a NetCfg write lock, and rechecks the target and installation state. `AllowBindings=0` is written before target identity and before NetCfg can install the component; `ConfigVersion=2` is written last.
-- `WindowsSetup.cpp` stages the validated INF through `SetupCopyOEMInfW` and uses `INetCfgClassSetup::Install` / `DeInstall` plus `INetCfg::Apply` directly. It inspects only `hyperv_guard` binding paths, requiring each path to terminate at exactly one adapter GUID. An automatically enabled non-PnP exact-target path is explicitly disabled while disarmed, applied/refreshed and verified disabled before arming; resume follows the same ordering. Only paths to the exact target may be enabled; an enabled foreign path causes abort/rollback, not edits to that adapter. Several NetCfg paths to the same exact target are handled together.
+- `WindowsSetup.cpp` stages the validated INF through `SetupCopyOEMInfW` and uses `INetCfgClassSetup::Install` / `DeInstall` plus `INetCfg::Apply` directly. It inspects only `hyperv_xndis_filter` binding paths, requiring each path to terminate at exactly one adapter GUID. An automatically enabled non-PnP exact-target path is explicitly disabled while disarmed, applied/refreshed and verified disabled before arming; resume follows the same ordering. Only paths to the exact target may be enabled; an enabled foreign path causes abort/rollback, not edits to that adapter. Several NetCfg paths to the same exact target are handled together.
 - A failed **new installation** first disarms, discards pending NetCfg changes, and attempts to remove only its own new component. A failed **resume** after mutation disarms but never removes a preexisting component; rejected preflight remains read-only. Configuration is deleted only after complete component/service removal. On failure or reboot it is retained for safe recovery. Staged Driver Store packages are not forcibly purged.
-- Uninstall does not resolve a target or require the Hyper-V WMI provider. It disarms first and removes only `hyperv_guard`. It does not change switches, VMs, HNS, ICS, NAT, routes, certificate stores or unrelated network components. NetCfg itself can still cause system-wide network reconfiguration; use local console/recovery, not an irreplaceable remote connection.
+- Uninstall does not resolve a target or require the Hyper-V WMI provider. It disarms first and removes only `hyperv_xndis_filter`. It does not change switches, VMs, HNS, ICS, NAT, routes, certificate stores or unrelated network components. NetCfg itself can still cause system-wide network reconfiguration; use local console/recovery, not an irreplaceable remote connection.
 
 Disarming `AllowBindings` prevents new target attachments; it is **not** an unload/detach operation and does not undo binding changes that NetCfg has already committed. Setup now forces target disable-before-arm/enable even when a non-PnP path initially reports enabled. Real failed-resume/reboot recovery still needs NDIS runtime validation. An enabled NetCfg path alone is not proof of a working filter attachment.
 
@@ -101,7 +101,7 @@ The native setup sources are licensed under the GNU General Public License versi
 
 ## Historical validation
 
-The explicitly authorized 2026-10-25 installation of **0.2.1.4** completed with exit 0, without a reboot request. HyperVGuard is Running; only the exact Default Switch host adapter binding is enabled. All 239 unrelated bindings match the pre-install snapshot and installed package hashes match dist. No monitor/device/traffic test was run; packet interception and real resume remain unverified. See [the live report](../../docs/NETCFG-IDENTITY-FIX.md).
+The explicitly authorized 2026-10-25 installation of **0.2.1.4** predates the product rename. It completed with exit 0 and no reboot request; the pre-rename service was running with only the exact Default Switch host adapter binding enabled, all 239 unrelated bindings unchanged, and installed package hashes matching that snapshot's dist. This does not describe an installed renamed package. No monitor/device/traffic test was run; packet interception and real resume remain unverified. See [the historical live report](../../docs/NETCFG-IDENTITY-FIX.md).
 
 ### Historical offline validation
 

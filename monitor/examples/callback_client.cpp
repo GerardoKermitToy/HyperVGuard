@@ -1,8 +1,8 @@
-#include "HyperVGuard.hpp"
+#include "HyperVXNdisFilter.hpp"
 #include <cstdio>
 
 int main() {
-    hypervguard::Client driver;
+    hypervxndisfilter::Client driver;
     DWORD error = driver.Open();
     if (error) { std::fprintf(stderr, "Open failed: %lu\n", error); return 1; }
     uint32_t devices = 0;
@@ -10,14 +10,14 @@ int main() {
     if (error) { std::fprintf(stderr, "Device count failed: %lu\n", error); return 1; }
     std::printf("Filtered network devices: %u\n", devices);
 
-    struct State { hypervguard::Client& driver; DWORD error = 0; uint64_t packets = 0; } state{driver};
-    hypervguard::Client::Callbacks callbacks;
+    struct State { hypervxndisfilter::Client& driver; DWORD error = 0; uint64_t packets = 0; } state{driver};
+    hypervxndisfilter::Client::Callbacks callbacks;
     callbacks.context = &state;
     const auto accept = []<class T>(void* context, const T* packet, const uint8_t*, uint32_t) {
         auto& s = *static_cast<State*>(context);
         ++s.packets;
         // Header and payload point into the read buffer; valid only during this callback.
-        s.error = s.driver.SendVerdict(packet->id, hypervguard::Client::Verdict::PermanentAccept);
+        s.error = s.driver.SendVerdict(packet->id, hypervxndisfilter::Client::Verdict::PermanentAccept);
         if (s.error) s.driver.Stop();
     };
     callbacks.on_connection_v4 = accept;

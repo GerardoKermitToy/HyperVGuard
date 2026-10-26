@@ -7,7 +7,7 @@
 #include <vector>
 
 using Microsoft::WRL::ComPtr;
-using namespace hyperv_guard;
+using namespace hyperv_xndis_filter;
 
 #define CHECK(expression) do { if (!(expression)) { \
     std::fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #expression); return 1; } } while (false)
@@ -105,6 +105,7 @@ public:
     HRESULT enum_result = S_OK, next_result = S_OK;
     bool null_enumerator = false, bad_count = false, false_with_object = false;
     unsigned mutations = 0, class_queries = 0;
+    GUID expected_class = GUID_DEVCLASS_NET;
     HRESULT STDMETHODCALLTYPE Initialize(PVOID) override { return E_NOTIMPL; }
     HRESULT STDMETHODCALLTYPE Uninitialize() override { return E_NOTIMPL; }
     HRESULT STDMETHODCALLTYPE Apply() override { ++mutations; return E_ACCESSDENIED; }
@@ -113,7 +114,7 @@ public:
         if (!cls || !out) return E_POINTER;
         *out = nullptr;
         ++class_queries;
-        if (*cls != GUID_DEVCLASS_NET) return E_INVALIDARG;
+        if (*cls != expected_class) return E_INVALIDARG;
         if (enum_result != S_OK) return enum_result;
         if (null_enumerator) return S_OK;
         auto enumerator = Make<ComponentEnumerator>();
@@ -230,6 +231,48 @@ int main() {
     CHECK(adapter_instances == std::vector<GUID>({target_guid, other_guid}));
     CHECK(target->class_calls == 0 && foreign->class_calls == 0 && config->class_queries == 1);
     BindingPathIdentity identity;
+
+    // Reject the same package GUID under any other component ID, without
+    // querying display names/IDs or mutating the previous installation.
+    auto services = Make<Configuration>();
+    services->expected_class = GUID_DEVCLASS_NETSERVICE;
+    CHECK(CheckFilterIdentityAvailable(nullptr) == E_POINTER);
+    CHECK(CheckFilterIdentityAvailable(services.Get()) == S_OK);
+    services->components = {service};
+    CHECK(CheckFilterIdentityAvailable(services.Get()) == S_OK);
+    services->components.push_back(filter);
+    CHECK(CheckFilterIdentityAvailable(services.Get()) == HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS));
+    CHECK(filter->id_calls == 0 && service->id_calls == 0);
+    services->components = {service};
+    service->instance_guid = GUID_NULL;
+    CHECK(CheckFilterIdentityAvailable(services.Get()) == E_UNEXPECTED);
+    service->instance_guid = service_guid;
+    for (const HRESULT result : {E_POINTER, E_ACCESSDENIED, S_FALSE}) {
+        const HRESULT expected = FAILED(result) ? result : E_UNEXPECTED;
+        services->enum_result = result;
+        CHECK(CheckFilterIdentityAvailable(services.Get()) == expected);
+        services->enum_result = S_OK;
+        services->next_result = result;
+        CHECK(CheckFilterIdentityAvailable(services.Get()) == (result == S_FALSE ? S_OK : expected));
+        services->next_result = S_OK;
+        service->instance_result = result;
+        CHECK(CheckFilterIdentityAvailable(services.Get()) == expected);
+        service->instance_result = S_OK;
+    }
+    services->bad_count = true;
+    CHECK(CheckFilterIdentityAvailable(services.Get()) == E_UNEXPECTED);
+    services->bad_count = false;
+    services->false_with_object = true;
+    CHECK(CheckFilterIdentityAvailable(services.Get()) == E_UNEXPECTED);
+    services->false_with_object = false;
+    services->null_enumerator = true;
+    CHECK(CheckFilterIdentityAvailable(services.Get()) == E_UNEXPECTED);
+    services->null_enumerator = false;
+    services->components.assign(4096, service);
+    CHECK(CheckFilterIdentityAvailable(services.Get()) == S_OK);
+    services->components.push_back(service);
+    CHECK(CheckFilterIdentityAvailable(services.Get()) == E_UNEXPECTED);
+    CHECK(services->mutations == 0);
 
     // Reproduce the failing API independently, then run the production inspector
     // on exactly these components. No real NetCfg object or registry is used.

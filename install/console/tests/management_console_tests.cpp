@@ -6,7 +6,7 @@
 #include <stdexcept>
 #include <utility>
 
-using namespace hyperv_guard::setup;
+using namespace hyperv_xndis_filter::setup;
 namespace {
 
 void Require(bool value, const char* message = "assertion failed") {
@@ -223,7 +223,7 @@ int main() {
             Throws([&] { ValidateBindings({{target.guid, true}}, target, true); }, L"unexpectedly enabled");
             Throws([&] { ValidateBindings({{target.guid, true}, {foreign_guid, true}}, target, false); }, L"unexpectedly enabled");
             Throws([&] { ValidateBindings({{target.guid, true}, {target.guid, false}}, target, false, true); }, L"did not enable");
-            Throws([&] { ValidateBindings({{foreign_guid, false}}, target, false); }, L"No HyperVGuard binding");
+            Throws([&] { ValidateBindings({{foreign_guid, false}}, target, false); }, L"No HyperVXNdisFilter binding");
             Throws([&] { ValidateBindings({{GUID_NULL, false}}, target, false); }, L"ambiguous");
         }},
         {"fresh install orders validation, disarm, NetCfg, arm and exact enable", [] {

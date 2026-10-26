@@ -19,7 +19,7 @@
 #include <span>
 #include <string_view>
 
-namespace hypervguard {
+namespace hypervxndisfilter {
 
 // One caller-owned Run() thread, no polling thread or per-packet allocations.
 // Callbacks run inline. Views expire on callback return; copy only what you keep.
@@ -93,8 +93,9 @@ public:
     Client(const Client&) = delete;
     Client& operator=(const Client&) = delete;
 
-    // Never installs a driver. Waits indefinitely on DriverReady after an open
-    // failure; only a successful open or Stop() ends this startup wait.
+    // Не устанавливает драйвер. DriverReady ожидается без тайм-аута при запуске.
+    // Занятое эксклюзивное устройство возвращает ERROR_SHARING_VIOLATION сразу:
+    // освобождение чужого handle не сигнализирует DriverReady повторно.
     DWORD Open() {
         if (device_ != INVALID_HANDLE_VALUE || stop_event_) return ERROR_ALREADY_EXISTS;
         AcquireSRWLockExclusive(&stop_lock_);
@@ -280,18 +281,18 @@ private:
     }
     DWORD OpenDevice() {
         auto try_open = [&]() {
-            device_ = CreateFileW(L"\\\\.\\HyperVGuard", GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+            device_ = CreateFileW(L"\\\\.\\HyperVXNdisFilter", GENERIC_READ | GENERIC_WRITE, 0, nullptr,
                                    OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
             return device_ == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
         };
         const DWORD first = try_open();
-        if (!first) return first;
+        if (!first || first == ERROR_SHARING_VIOLATION) return first;
         PSECURITY_DESCRIPTOR sd = nullptr;
         if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
                 L"D:P(A;;GA;;;SY)(A;;GA;;;BA)", SDDL_REVISION_1, &sd, nullptr)) return GetLastError();
         SECURITY_ATTRIBUTES sa{sizeof(sa), sd, FALSE};
         struct Event { HANDLE h; ~Event() { if (h) CloseHandle(h); } } ready{
-            CreateEventW(&sa, TRUE, FALSE, L"Global\\HyperVGuard.DriverReady")};
+            CreateEventW(&sa, TRUE, FALSE, L"Global\\HyperVXNdisFilter.DriverReady")};
         const DWORD create_error = ready.h ? ERROR_SUCCESS : GetLastError();
         LocalFree(sd);
         if (create_error) return create_error;
@@ -299,7 +300,8 @@ private:
             // Reset BEFORE retrying: no lost startup signal or stale-signal loop.
             if (!ResetEvent(ready.h)) return GetLastError();
             if (stopping_.load()) return ERROR_OPERATION_ABORTED;
-            if (!try_open()) return ERROR_SUCCESS;
+            const DWORD error = try_open();
+            if (!error || error == ERROR_SHARING_VIOLATION) return error;
             const HANDLE events[]{stop_event_, ready.h};
             const DWORD wait = WaitForMultipleObjects(2, events, FALSE, INFINITE);
             if (wait == WAIT_OBJECT_0) return ERROR_OPERATION_ABORTED;
@@ -360,4 +362,4 @@ private:
     std::atomic<bool> stopping_{false}, running_{false};
 };
 
-} // namespace hypervguard
+} // namespace hypervxndisfilter

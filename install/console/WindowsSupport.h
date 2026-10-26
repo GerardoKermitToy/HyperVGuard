@@ -5,7 +5,7 @@
 #include <array>
 #include <utility>
 
-namespace hyperv_guard::setup {
+namespace hyperv_xndis_filter::setup {
 using Microsoft::WRL::ComPtr;
 
 // RegFlushKey requires KEY_QUERY_VALUE, including on write-only operations.
@@ -75,4 +75,4 @@ Adapter ResolveWindowsTarget();
 void ValidateInfFile(const std::filesystem::path& inf);
 std::vector<Handle> LockAndVerifyPackage(const std::filesystem::path& package);
 
-} // namespace hyperv_guard::setup
+} // namespace hyperv_xndis_filter::setup

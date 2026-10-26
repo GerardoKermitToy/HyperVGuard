@@ -145,7 +145,7 @@ bool ParseOptions(int argc, const wchar_t* const* argv, Options& opt, std::strin
             else if (verdict == L"drop") opt.alt_verdict = Verdict::Drop;
             else if (verdict == L"permanent-drop") opt.alt_verdict = Verdict::PermanentDrop;
             else if (verdict.starts_with(L"redirect")) {
-                error = "redirect verdicts are not supported by HyperVGuard";
+                error = "redirect verdicts are not supported by HyperVXNdisFilter";
                 return false;
             } else {
                 error = "unknown verdict; use accept, permanent-accept, block, permanent-block, drop or permanent-drop";
@@ -206,7 +206,7 @@ void PrintUsage(FILE* out) {
     std::fprintf(out,
         "Usage: hyperv_monitor.exe [--duration SECONDS] [options]\n"
         "       hyperv_monitor.exe --help\n\n"
-        "Opens the existing \\\\.\\HyperVGuard device; never installs/starts/stops an SCM service.\n"
+        "Opens the existing \\\\.\\HyperVXNdisFilter device; never installs/starts/stops an SCM service.\n"
         "Install explicitly with dist/Install.exe for the host adapter\n"
         "vEthernet (Default Switch). Device access requires elevated admin/SYSTEM.\n"
         "Without --duration, wait for driver startup if open fails; Ctrl+C exits\n"

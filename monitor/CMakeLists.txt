@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.20)
 project(hyperv_monitor LANGUAGES CXX)
 
 if(NOT WIN32)
-    message(FATAL_ERROR "HyperVGuard monitor targets Windows only.")
+    message(FATAL_ERROR "HyperVXNdisFilter monitor targets Windows only.")
 endif()
 
 # Direct device access only. No transport subproject or installed driver is
@@ -44,19 +44,19 @@ endif()
 
 # NetCfg loads this user-mode COM object during explicit installation/binding.
 # Building it never registers it or changes network configuration.
-add_library(hyperv_guard_notify SHARED
+add_library(hyperv_xndis_filter_notify SHARED
     ../install/notify/BindingPolicy.cpp
     ../install/notify/NotifyObject.cpp
-    ../install/notify/HyperVGuardNotify.def
+    ../install/notify/HyperVXNdisFilterNotify.def
 )
-set_target_properties(hyperv_guard_notify PROPERTIES OUTPUT_NAME HyperVGuardNotify
+set_target_properties(hyperv_xndis_filter_notify PROPERTIES OUTPUT_NAME HyperVXNdisFilterNotify
     MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
-target_compile_features(hyperv_guard_notify PRIVATE cxx_std_20)
-target_compile_definitions(hyperv_guard_notify PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN)
-target_link_libraries(hyperv_guard_notify PRIVATE ole32 advapi32 uuid iphlpapi)
+target_compile_features(hyperv_xndis_filter_notify PRIVATE cxx_std_20)
+target_compile_definitions(hyperv_xndis_filter_notify PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN)
+target_link_libraries(hyperv_xndis_filter_notify PRIVATE ole32 advapi32 uuid iphlpapi)
 if(MSVC)
-    target_compile_options(hyperv_guard_notify PRIVATE /W4 /WX /permissive- /utf-8 /guard:cf)
-    target_link_options(hyperv_guard_notify PRIVATE /DYNAMICBASE /NXCOMPAT /GUARD:CF)
+    target_compile_options(hyperv_xndis_filter_notify PRIVATE /W4 /WX /permissive- /utf-8 /guard:cf)
+    target_link_options(hyperv_xndis_filter_notify PRIVATE /DYNAMICBASE /NXCOMPAT /GUARD:CF)
 endif()
 
 # Independent header-only consumers: no pmkext library or codec dependency.
@@ -101,11 +101,11 @@ if(BUILD_TESTING)
     add_executable(notify_object_tests tests/notify_object_tests.cpp)
     target_compile_features(notify_object_tests PRIVATE cxx_std_20)
     target_link_libraries(notify_object_tests PRIVATE uuid)
-    add_dependencies(notify_object_tests hyperv_guard_notify)
+    add_dependencies(notify_object_tests hyperv_xndis_filter_notify)
     if(MSVC)
         target_compile_options(notify_object_tests PRIVATE /W4 /permissive- /utf-8 /wd4191)
     endif()
-    add_test(NAME notify_object_tests COMMAND notify_object_tests $<TARGET_FILE:hyperv_guard_notify>)
+    add_test(NAME notify_object_tests COMMAND notify_object_tests $<TARGET_FILE:hyperv_xndis_filter_notify>)
     set_tests_properties(notify_object_tests PROPERTIES TIMEOUT 15 LABELS "no-driver")
     add_test(NAME monitor_help COMMAND hyperv_monitor --help)
     set_tests_properties(monitor_help PROPERTIES TIMEOUT 10 LABELS "no-driver"

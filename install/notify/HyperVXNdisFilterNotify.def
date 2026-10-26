@@ -1,4 +1,4 @@
-LIBRARY HyperVGuardNotify
+LIBRARY HyperVXNdisFilterNotify
 EXPORTS
     DllGetClassObject PRIVATE
     DllCanUnloadNow PRIVATE

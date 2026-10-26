@@ -286,7 +286,7 @@ impl Engine {
         self.clear_events();
         self.clear_cache();
         self.bandwidth.fill(Bandwidth::EMPTY);
-        self.log(3, "HyperVGuard LWF: full IP packets; no process ID; direction=0 outbound/1 inbound from guest side (host receive/send); no TID, redirects, UpdateV4/V6 or synthetic END");
+        self.log(3, "HyperVXNdisFilter LWF: full IP packets; no process ID; direction=0 outbound/1 inbound from guest side (host receive/send); no TID, redirects, UpdateV4/V6 or synthetic END");
     }
     // Complete actions using take_due() after dropping the lock.
     pub fn disconnect(&mut self) {
@@ -661,7 +661,7 @@ impl Engine {
         let s = self.stats;
         let _ = write!(
             text,
-            "HyperVGuard: fixed_bytes={} event_bytes={}/{} pending={}/{} cached={} rx={} allow={} drop={} queued={} cache_hits={} timeout={} overflow={} cancel={} invalidated={} malformed={} non_ip={}",
+            "HyperVXNdisFilter: fixed_bytes={} event_bytes={}/{} pending={}/{} cached={} rx={} allow={} drop={} queued={} cache_hits={} timeout={} overflow={} cancel={} invalidated={} malformed={} non_ip={}",
             core::mem::size_of::<Self>(),
             self.queued_bytes,
             MAX_EVENT_BYTES,

@@ -6,7 +6,7 @@
 #include <memory>
 #include "BindingPath.h"
 
-namespace hyperv_guard {
+namespace hyperv_xndis_filter {
 
 // NetCfg omits dynamic NonPnpNetworkInterface adapters from EnumComponents(Net).
 // NETIO supplies their independent GUID/NET_LUID identity, without friendly names.
@@ -32,4 +32,4 @@ inline HRESULT ReadBindingAdapterInventory(INetCfg* config, std::vector<GUID>& a
     return S_OK;
 }
 
-} // namespace hyperv_guard
+} // namespace hyperv_xndis_filter

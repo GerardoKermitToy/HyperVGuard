@@ -19,8 +19,8 @@ int wmain(int argc, wchar_t** argv) {
     IClassFactory* factory = nullptr;
     CHECK(getClass(GUID_NULL, IID_IClassFactory, reinterpret_cast<void**>(&factory)) == CLASS_E_CLASSNOTAVAILABLE);
     CHECK(factory == nullptr);
-    CHECK(getClass(hyperv_guard::kNotifyClsid, IID_IClassFactory, nullptr) == E_POINTER);
-    CHECK(getClass(hyperv_guard::kNotifyClsid, IID_IClassFactory, reinterpret_cast<void**>(&factory)) == S_OK);
+    CHECK(getClass(hyperv_xndis_filter::kNotifyClsid, IID_IClassFactory, nullptr) == E_POINTER);
+    CHECK(getClass(hyperv_xndis_filter::kNotifyClsid, IID_IClassFactory, reinterpret_cast<void**>(&factory)) == S_OK);
     CHECK(canUnload() == S_FALSE);
     INetCfgComponentControl* control = nullptr;
     CHECK(factory->CreateInstance(nullptr, IID_INetCfgComponentControl, reinterpret_cast<void**>(&control)) == S_OK);

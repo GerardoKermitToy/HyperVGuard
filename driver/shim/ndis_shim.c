@@ -62,9 +62,9 @@ static KDPC TimerDpc;
 static volatile LONG64 NextAdapter;
 static volatile LONG64 EventPoolBytes;
 static volatile LONG FilteredDeviceCount;
-static NDIS_STRING Friendly = RTL_CONSTANT_STRING(L"HyperV Guard Rust Host Adapter LWF");
+static NDIS_STRING Friendly = RTL_CONSTANT_STRING(L"HyperVXNdisFilter Rust Host Adapter LWF");
 static NDIS_STRING Unique = RTL_CONSTANT_STRING(L"{6E76EAD1-7BCB-49C4-9547-D3E6B3488F71}");
-static NDIS_STRING ServiceName = RTL_CONSTANT_STRING(L"HyperVGuard");
+static NDIS_STRING ServiceName = RTL_CONSTANT_STRING(L"HyperVXNdisFilter");
 
 DRIVER_UNLOAD HvUnload;
 DRIVER_DISPATCH HvDispatch;
@@ -763,7 +763,7 @@ static UINT64 ReadQword(HANDLE key, PCWSTR name) {
     return result;
 }
 static BOOLEAN TargetAdapter(PNDIS_FILTER_ATTACH_PARAMETERS p) {
-    UNICODE_STRING path = RTL_CONSTANT_STRING(L"\\Registry\\Machine\\SOFTWARE\\HyperVGuard\\Lwf");
+    UNICODE_STRING path = RTL_CONSTANT_STRING(L"\\Registry\\Machine\\SOFTWARE\\HyperVXNdisFilter\\Lwf");
     UNICODE_STRING name = RTL_CONSTANT_STRING(L"TargetInterfaceGuid");
     UNICODE_STRING text;
     OBJECT_ATTRIBUTES attributes;
@@ -838,14 +838,14 @@ Failed:
     // At system boot BaseNamedObjects may not exist yet, so no monitor can be
     // waiting there. Notification failure must not disable an otherwise ready LWF.
     DbgPrintEx(DPFLTR_IHVNETWORK_ID, DPFLTR_WARNING_LEVEL,
-        "HyperVGuard: driver-ready event unavailable: 0x%08lX\n", (ULONG)status);
+        "HyperVXNdisFilter: driver-ready event unavailable: 0x%08lX\n", (ULONG)status);
 }
 NTSTATUS hv_initialize(PDRIVER_OBJECT driver, PUNICODE_STRING registry) {
     NDIS_FILTER_DRIVER_CHARACTERISTICS c = {0};
     NDIS_DEVICE_OBJECT_ATTRIBUTES attributes = {0};
     PDRIVER_DISPATCH dispatch[IRP_MJ_MAXIMUM_FUNCTION + 1] = {0};
-    NDIS_STRING device = RTL_CONSTANT_STRING(L"\\Device\\HyperVGuard");
-    NDIS_STRING link = RTL_CONSTANT_STRING(L"\\DosDevices\\HyperVGuard");
+    NDIS_STRING device = RTL_CONSTANT_STRING(L"\\Device\\HyperVXNdisFilter");
+    NDIS_STRING link = RTL_CONSTANT_STRING(L"\\DosDevices\\HyperVXNdisFilter");
     UNICODE_STRING sddl = RTL_CONSTANT_STRING(L"D:P(A;;GA;;;SY)(A;;GA;;;BA)");
     NDIS_STATUS status;
     LARGE_INTEGER due;

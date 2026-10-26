@@ -1,4 +1,4 @@
-// HyperVGuard console monitor, adapted from kext_client on 2026-10-25 (see README.md/LICENSE).
+// HyperVXNdisFilter console monitor, adapted from kext_client on 2026-10-25 (see README.md/LICENSE).
 // Interactive runs wait for driver startup; --duration runs never wait.
 #include "PortmasterKext.h"
 #include "DriverProtocol.h"
@@ -61,7 +61,7 @@ public:
             return false;
         }
         SECURITY_ATTRIBUTES security{sizeof(security), descriptor, FALSE};
-        mutex_ = CreateMutexW(&security, TRUE, L"Global\\HyperVGuardMonitor.Singleton");
+        mutex_ = CreateMutexW(&security, TRUE, L"Global\\HyperVXNdisFilterMonitor.Singleton");
         const DWORD status = GetLastError();
         LocalFree(descriptor);
         if (mutex_ == nullptr) {
@@ -156,14 +156,14 @@ int MonitorMain(int argc, wchar_t** argv) {
     OutputFile output;
     if (!output.Open(opt.out_path)) return 1;
 
-    std::printf("Device name : HyperVGuard\n"
+    std::printf("Device name : HyperVXNdisFilter\n"
                 "Opening explicitly installed host-adapter NDIS LWF (no SCM lifecycle).\n");
     pmkext::Driver driver;
     const auto startup = pmkext::monitor::OpenDriverWhenReady(
         [&](std::string& reason) { return driver.Open(reason); }, opt.duration_s == 0,
         g_shutdown_requested, [&](const std::string& reason) {
             std::printf("Device open failed: %s\n"
-                        "Waiting for driver startup (Global\\HyperVGuard.DriverReady); Ctrl+C to exit.\n",
+                        "Waiting for driver startup (Global\\HyperVXNdisFilter.DriverReady); Ctrl+C to exit.\n",
                         reason.c_str());
             std::fflush(stdout);
         }, error);
@@ -204,7 +204,7 @@ int MonitorMain(int argc, wchar_t** argv) {
     }
     std::printf("Driver version: %u.%u.%u.%u\n", version[0], version[1], version[2], version[3]);
     if (!pmkext::wire::IsCompatibleVersion(version)) {
-        std::fprintf(stderr, "ERROR: incompatible HyperVGuard driver version (expected 0.3.1.0); "
+        std::fprintf(stderr, "ERROR: incompatible HyperVXNdisFilter driver version (expected 0.3.1.0); "
                              "installed SYS uses a different wire layout\n");
         return 1;
     }

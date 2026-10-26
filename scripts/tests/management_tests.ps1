@@ -1,6 +1,6 @@
 # Offline tests: every network/registry function used by helpers is mocked.
 $ErrorActionPreference = 'Stop'
-. (Join-Path (Split-Path $PSScriptRoot -Parent) 'HyperVGuard.Common.ps1')
+. (Join-Path (Split-Path $PSScriptRoot -Parent) 'HyperVXNdisFilter.Common.ps1')
 $script:passed = 0
 $targetGuid = [guid]'9eb6ca05-3905-4420-a34f-4fa09dcc6a2d'
 function Assert-True {
@@ -31,29 +31,29 @@ function Get-NetAdapterBinding {
 }
 function Get-ItemProperty {
     [CmdletBinding()] param([string]$LiteralPath)
-    Assert-True ($LiteralPath -eq $script:HyperVGuardConfigPath)
+    Assert-True ($LiteralPath -eq $script:HyperVXNdisFilterConfigPath)
     [pscustomobject]$script:config
 }
 function New-Item {
     [CmdletBinding()] param([string]$Path, [switch]$Force)
-    Assert-True ($Path -eq $script:HyperVGuardConfigPath -and $Force)
+    Assert-True ($Path -eq $script:HyperVXNdisFilterConfigPath -and $Force)
 }
 function New-ItemProperty {
     [CmdletBinding()] param([string]$LiteralPath, [string]$Name, [string]$PropertyType, [object]$Value, [switch]$Force)
-    Assert-True ($LiteralPath -eq $script:HyperVGuardConfigPath -and $Force)
+    Assert-True ($LiteralPath -eq $script:HyperVXNdisFilterConfigPath -and $Force)
     $script:writes += "$Name/$PropertyType"
     $script:config[$Name] = $Value
 }
 function Reset-Fixtures {
-    $script:switches = @([pscustomobject]@{ Id = $script:HyperVGuardDefaultSwitchId; Name = 'Default Switch' })
-    $script:vnics = @([pscustomobject]@{ IsManagementOs = $true; SwitchId = $script:HyperVGuardDefaultSwitchId; DeviceId = $targetGuid.ToString('B') })
+    $script:switches = @([pscustomobject]@{ Id = $script:HyperVXNdisFilterDefaultSwitchId; Name = 'Default Switch' })
+    $script:vnics = @([pscustomobject]@{ IsManagementOs = $true; SwitchId = $script:HyperVXNdisFilterDefaultSwitchId; DeviceId = $targetGuid.ToString('B') })
     $script:adapters = @(
         [pscustomobject]@{ Name = 'vEthernet (Default Switch)'; InterfaceGuid = $targetGuid; NetLuid = [uint64]1689399750295552; Virtual = $true; HardwareInterface = $false; InterfaceType = 6 },
         [pscustomobject]@{ Name = 'Ethernet'; InterfaceGuid = [guid]::NewGuid(); NetLuid = [uint64]10; Virtual = $false; HardwareInterface = $true; InterfaceType = 6 }
     )
     $script:bindings = @(
-        [pscustomobject]@{ Name = 'vEthernet (Default Switch)'; ComponentID = 'hyperv_guard'; Enabled = $false },
-        [pscustomobject]@{ Name = 'Ethernet'; ComponentID = 'hyperv_guard'; Enabled = $false },
+        [pscustomobject]@{ Name = 'vEthernet (Default Switch)'; ComponentID = 'hyperv_xndis_filter'; Enabled = $false },
+        [pscustomobject]@{ Name = 'Ethernet'; ComponentID = 'hyperv_xndis_filter'; Enabled = $false },
         [pscustomobject]@{ Name = 'Ethernet'; ComponentID = 'ms_tcpip'; Enabled = $true }
     )
     $script:config = @{ ConfigVersion = 2; TargetInterfaceGuid = $targetGuid.ToString('B'); TargetNetLuid = $script:adapters[0].NetLuid; AllowBindings = 0 }
@@ -68,100 +68,100 @@ function Test-Case {
 }
 
 Test-Case 'resolve actual management vNIC by Default Switch ID and interface GUID' {
-    Assert-True ((Resolve-HyperVGuardAdapter).InterfaceGuid -eq $targetGuid)
+    Assert-True ((Resolve-HyperVXNdisFilterAdapter).InterfaceGuid -eq $targetGuid)
 }
 Test-Case 'adapter alias is not an authorization identity' {
     $script:adapters[0].Name = 'Renamed host vNIC'
-    Assert-True ((Resolve-HyperVGuardAdapter).Name -eq 'Renamed host vNIC')
+    Assert-True ((Resolve-HyperVXNdisFilterAdapter).Name -eq 'Renamed host vNIC')
 }
 Test-Case 'a matching display name on the wrong switch is rejected' {
     $script:switches[0].Id = [guid]::NewGuid()
-    Assert-Throws { Resolve-HyperVGuardAdapter } 'Default Switch is missing'
+    Assert-Throws { Resolve-HyperVXNdisFilterAdapter } 'Default Switch is missing'
 }
 Test-Case 'absent Default Switch is rejected' {
     $script:switches = @()
-    Assert-Throws { Resolve-HyperVGuardAdapter } 'Default Switch is missing'
+    Assert-Throws { Resolve-HyperVXNdisFilterAdapter } 'Default Switch is missing'
 }
 Test-Case 'ambiguous management vNIC is rejected' {
     $script:vnics += $script:vnics[0]
-    Assert-Throws { Resolve-HyperVGuardAdapter } 'Expected one management-OS vNIC'
+    Assert-Throws { Resolve-HyperVXNdisFilterAdapter } 'Expected one management-OS vNIC'
 }
 Test-Case 'guest vNIC cannot be selected' {
     $script:vnics[0].IsManagementOs = $false
-    Assert-Throws { Resolve-HyperVGuardAdapter } 'Expected one management-OS vNIC'
+    Assert-Throws { Resolve-HyperVXNdisFilterAdapter } 'Expected one management-OS vNIC'
 }
 Test-Case 'unrelated switch management vNIC cannot be selected' {
     $script:vnics[0].SwitchId = [guid]::NewGuid()
-    Assert-Throws { Resolve-HyperVGuardAdapter } 'Expected one management-OS vNIC'
+    Assert-Throws { Resolve-HyperVXNdisFilterAdapter } 'Expected one management-OS vNIC'
 }
 Test-Case 'invalid management device GUID is rejected' {
     $script:vnics[0].DeviceId = 'not-a-guid'
-    Assert-Throws { Resolve-HyperVGuardAdapter } 'no valid interface GUID'
+    Assert-Throws { Resolve-HyperVXNdisFilterAdapter } 'no valid interface GUID'
 }
 Test-Case 'same alias cannot substitute a different interface GUID' {
     $script:adapters[0].InterfaceGuid = [guid]::NewGuid()
-    Assert-Throws { Resolve-HyperVGuardAdapter } 'exact Default Switch host adapter was not found'
+    Assert-Throws { Resolve-HyperVXNdisFilterAdapter } 'exact Default Switch host adapter was not found'
 }
 Test-Case 'physical adapter cannot be selected' {
     $script:adapters[0].HardwareInterface = $true
-    Assert-Throws { Resolve-HyperVGuardAdapter } 'not an Ethernet host vNIC'
+    Assert-Throws { Resolve-HyperVXNdisFilterAdapter } 'not an Ethernet host vNIC'
 }
 Test-Case 'nonvirtual adapter cannot be selected' {
     $script:adapters[0].Virtual = $false
-    Assert-Throws { Resolve-HyperVGuardAdapter } 'not an Ethernet host vNIC'
+    Assert-Throws { Resolve-HyperVXNdisFilterAdapter } 'not an Ethernet host vNIC'
 }
 Test-Case 'non-Ethernet adapter cannot be selected' {
     $script:adapters[0].InterfaceType = 71
-    Assert-Throws { Resolve-HyperVGuardAdapter } 'not an Ethernet host vNIC'
+    Assert-Throws { Resolve-HyperVXNdisFilterAdapter } 'not an Ethernet host vNIC'
 }
 Test-Case 'missing NET_LUID cannot be selected' {
     $script:adapters[0].NetLuid = 0
-    Assert-Throws { Resolve-HyperVGuardAdapter } 'not an Ethernet host vNIC'
+    Assert-Throws { Resolve-HyperVXNdisFilterAdapter } 'not an Ethernet host vNIC'
 }
 Test-Case 'only own-component bindings are enumerated' {
-    Assert-True (@(Get-HyperVGuardBindings).Count -eq 2)
+    Assert-True (@(Get-HyperVXNdisFilterBindings).Count -eq 2)
 }
 Test-Case 'disabled foreign bindings do not get enabled or edited' {
-    $binding = Assert-HyperVGuardBindingScope -Adapter $script:adapters[0] -AllDisabled
+    $binding = Assert-HyperVXNdisFilterBindingScope -Adapter $script:adapters[0] -AllDisabled
     Assert-True ($binding.Name -eq $script:adapters[0].Name -and $script:writes.Count -eq 0)
     Assert-True (!$script:bindings[1].Enabled -and $script:bindings[2].Enabled)
 }
 Test-Case 'foreign enabled binding causes abort instead of editing that adapter' {
     $script:bindings[1].Enabled = $true
-    Assert-Throws { Assert-HyperVGuardBindingScope -Adapter $script:adapters[0] } 'unexpectedly enabled binding'
+    Assert-Throws { Assert-HyperVXNdisFilterBindingScope -Adapter $script:adapters[0] } 'unexpectedly enabled binding'
     Assert-True ($script:bindings[1].Enabled -and $script:writes.Count -eq 0)
 }
 Test-Case 'installation requires all new bindings to remain disabled' {
     $script:bindings[0].Enabled = $true
-    Assert-Throws { Assert-HyperVGuardBindingScope -Adapter $script:adapters[0] -AllDisabled } 'unexpectedly enabled binding'
+    Assert-Throws { Assert-HyperVXNdisFilterBindingScope -Adapter $script:adapters[0] -AllDisabled } 'unexpectedly enabled binding'
 }
 Test-Case 'target enabled is accepted after explicit enable' {
     $script:bindings[0].Enabled = $true
-    Assert-True ([bool](Assert-HyperVGuardBindingScope -Adapter $script:adapters[0]).Enabled)
+    Assert-True ([bool](Assert-HyperVXNdisFilterBindingScope -Adapter $script:adapters[0]).Enabled)
 }
 Test-Case 'matching GUID and NET_LUID configuration is accepted' {
-    Assert-HyperVGuardTargetConfiguration -Adapter $script:adapters[0]
+    Assert-HyperVXNdisFilterTargetConfiguration -Adapter $script:adapters[0]
 }
 Test-Case 'stale GUID configuration is rejected' {
     $script:config.TargetInterfaceGuid = [guid]::NewGuid().ToString('B')
-    Assert-Throws { Assert-HyperVGuardTargetConfiguration -Adapter $script:adapters[0] } 'does not match'
+    Assert-Throws { Assert-HyperVXNdisFilterTargetConfiguration -Adapter $script:adapters[0] } 'does not match'
 }
 Test-Case 'stale NET_LUID configuration is rejected' {
     $script:config.TargetNetLuid = [uint64]10
-    Assert-Throws { Assert-HyperVGuardTargetConfiguration -Adapter $script:adapters[0] } 'does not match'
+    Assert-Throws { Assert-HyperVXNdisFilterTargetConfiguration -Adapter $script:adapters[0] } 'does not match'
 }
 Test-Case 'old configuration schema is rejected' {
     $script:config.ConfigVersion = 1
-    Assert-Throws { Assert-HyperVGuardTargetConfiguration -Adapter $script:adapters[0] } 'does not match'
+    Assert-Throws { Assert-HyperVXNdisFilterTargetConfiguration -Adapter $script:adapters[0] } 'does not match'
 }
 Test-Case 'fresh configuration is disarmed first and versioned last' {
-    Set-HyperVGuardTargetConfiguration -Adapter $script:adapters[0]
+    Set-HyperVXNdisFilterTargetConfiguration -Adapter $script:adapters[0]
     Assert-True (($script:writes -join ',') -eq 'AllowBindings/DWord,TargetInterfaceGuid/String,TargetNetLuid/QWord,ConfigVersion/DWord')
     Assert-True ($script:config.AllowBindings -eq 0 -and $script:config.ConfigVersion -eq 2)
     Assert-True ($script:config.TargetInterfaceGuid.Length -eq 38)
 }
 Test-Case 'arming changes only the own-component configuration' {
-    Set-HyperVGuardBindingsAllowed -Allowed $true
+    Set-HyperVXNdisFilterBindingsAllowed -Allowed $true
     Assert-True ($script:config.AllowBindings -eq 1 -and $script:writes.Count -eq 1)
     Assert-True (!$script:bindings[1].Enabled -and $script:bindings[2].Enabled)
 }

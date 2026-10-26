@@ -34,8 +34,8 @@ public:
     }
     HRESULT STDMETHODCALLTYPE Initialize(INetCfgComponent*, INetCfg* config, BOOL) override {
         try {
-            const HRESULT hr = hyperv_guard::ReadBindingAdapterInventory(config, adapters_);
-            hyperv_guard::TraceNetCfg("Initialize adapter inventory", hr);
+            const HRESULT hr = hyperv_xndis_filter::ReadBindingAdapterInventory(config, adapters_);
+            hyperv_xndis_filter::TraceNetCfg("Initialize adapter inventory", hr);
             return hr;
         } catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
         catch (...) { return E_UNEXPECTED; }
@@ -44,10 +44,10 @@ public:
     HRESULT STDMETHODCALLTYPE ApplyPnpChanges(INetCfgPnpReconfigCallback*) override { return S_OK; }
     HRESULT STDMETHODCALLTYPE CancelChanges() override { return S_OK; }
     HRESULT STDMETHODCALLTYPE QueryBindingPath(DWORD flags, INetCfgBindingPath* path) override {
-        return hyperv_guard::EvaluateBindingPath(flags, path, adapters_);
+        return hyperv_xndis_filter::EvaluateBindingPath(flags, path, adapters_);
     }
     HRESULT STDMETHODCALLTYPE NotifyBindingPath(DWORD flags, INetCfgBindingPath*) override {
-        hyperv_guard::TraceNetCfg("NotifyBindingPath", S_OK, flags);
+        hyperv_xndis_filter::TraceNetCfg("NotifyBindingPath", S_OK, flags);
         return S_OK;
     }
 };
@@ -87,7 +87,7 @@ public:
 
 std::wstring ClassKey() {
     wchar_t guid[39]{};
-    if (!StringFromGUID2(hyperv_guard::kNotifyClsid, guid, 39)) return {};
+    if (!StringFromGUID2(hyperv_xndis_filter::kNotifyClsid, guid, 39)) return {};
     return std::wstring(L"SOFTWARE\\Classes\\CLSID\\") + guid;
 }
 }
@@ -99,7 +99,7 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID) {
 extern "C" HRESULT __stdcall DllGetClassObject(REFCLSID clsid, REFIID iid, void** out) {
     if (out == nullptr) return E_POINTER;
     *out = nullptr;
-    if (clsid != hyperv_guard::kNotifyClsid) return CLASS_E_CLASSNOTAVAILABLE;
+    if (clsid != hyperv_xndis_filter::kNotifyClsid) return CLASS_E_CLASSNOTAVAILABLE;
     auto* factory = new (std::nothrow) ClassFactory;
     if (factory == nullptr) return E_OUTOFMEMORY;
     const HRESULT hr = factory->QueryInterface(iid, out);
@@ -116,7 +116,7 @@ extern "C" HRESULT __stdcall DllRegisterServer() {
         if (length == 0 || length >= MAX_PATH) return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
         const auto key = ClassKey();
         if (key.empty()) return E_UNEXPECTED;
-        const wchar_t description[] = L"HyperV Guard target-adapter binding policy";
+        const wchar_t description[] = L"HyperVXNdisFilter target-adapter binding policy";
         LSTATUS status = RegSetKeyValueW(HKEY_LOCAL_MACHINE, key.c_str(), nullptr, REG_SZ,
                                          description, sizeof(description));
         if (status != ERROR_SUCCESS) return HRESULT_FROM_WIN32(status);

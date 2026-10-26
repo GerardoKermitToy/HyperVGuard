@@ -9,10 +9,10 @@
 #include <tlhelp32.h>
 #include <iostream>
 
-namespace hyperv_guard::setup {
+namespace hyperv_xndis_filter::setup {
 namespace {
 
-constexpr wchar_t kServiceKey[] = L"SYSTEM\\CurrentControlSet\\Services\\HyperVGuard";
+constexpr wchar_t kServiceKey[] = L"SYSTEM\\CurrentControlSet\\Services\\HyperVXNdisFilter";
 
 class Network {
 public:
@@ -22,7 +22,7 @@ public:
             if (writable_) {
                 Check(config.As(&lock_), L"Get NetCfg write lock");
                 CoString holder;
-                const HRESULT result = lock_->AcquireWriteLock(15000, L"HyperVGuard console setup", &holder.value);
+                const HRESULT result = lock_->AcquireWriteLock(15000, L"HyperVXNdisFilter console setup", &holder.value);
                 if (result != S_OK) {
                     throw Error{L"NetCfg write lock is unavailable" +
                                 (holder.value ? L" (held by " + std::wstring(holder.value) + L")" : std::wstring{}) +
@@ -39,7 +39,7 @@ public:
     ~Network() { Close(); }
 
     void Refresh(bool cancel = false) {
-        if (cancel) Check(config->Cancel(), L"Discard pending HyperVGuard NetCfg changes");
+        if (cancel) Check(config->Cancel(), L"Discard pending HyperVXNdisFilter NetCfg changes");
         Check(config->Uninitialize(), L"Refresh NetCfg session");
         initialized_ = false;
         Initialize();
@@ -48,8 +48,15 @@ public:
     ComPtr<INetCfgComponent> Component() {
         ComPtr<INetCfgComponent> component;
         const HRESULT result = config->FindComponent(kComponentId, &component);
-        Check(result, L"Find HyperVGuard component");
+        Check(result, L"Find HyperVXNdisFilter component");
         if (result != S_OK && result != S_FALSE) throw Error{L"Unexpected NetCfg component lookup result."};
+        if (!component) {
+            const HRESULT identity = CheckFilterIdentityAvailable(config.Get());
+            if (identity == HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS)) {
+                throw Error{L"A previous package with the same filter instance is installed under another component ID. Remove it with its matching Uninstall.exe before installing the renamed package; no in-place migration is performed."};
+            }
+            Check(identity, L"Check for a conflicting filter instance");
+        }
         return component;
     }
 
@@ -83,18 +90,18 @@ struct Path {
 
 std::vector<Path> Paths(Network& network) {
     auto component = network.Component();
-    if (!component) throw Error{L"The HyperVGuard component is not installed."};
+    if (!component) throw Error{L"The HyperVXNdisFilter component is not installed."};
     GUID filter_instance{}, component_class{};
-    Check(component->GetInstanceGuid(&filter_instance), L"Read HyperVGuard instance GUID");
-    Check(component->GetClassGuid(&component_class), L"Read HyperVGuard component class");
+    Check(component->GetInstanceGuid(&filter_instance), L"Read HyperVXNdisFilter instance GUID");
+    Check(component->GetClassGuid(&component_class), L"Read HyperVXNdisFilter component class");
     if (filter_instance != kFilterInstanceId || component_class != GUID_DEVCLASS_NETSERVICE) {
-        throw Error{L"The installed component is not the expected HyperVGuard LWF instance."};
+        throw Error{L"The installed component is not the expected HyperVXNdisFilter LWF instance."};
     }
     ComPtr<INetCfgComponentBindings> bindings;
-    Check(component.As(&bindings), L"Get HyperVGuard bindings");
+    Check(component.As(&bindings), L"Get HyperVXNdisFilter bindings");
     ComPtr<IEnumNetCfgBindingPath> enumerator;
-    Check(bindings->EnumBindingPaths(EBP_BELOW, &enumerator), L"Enumerate HyperVGuard binding paths");
-    if (!enumerator) throw Error{L"Missing HyperVGuard binding path enumerator."};
+    Check(bindings->EnumBindingPaths(EBP_BELOW, &enumerator), L"Enumerate HyperVXNdisFilter binding paths");
+    if (!enumerator) throw Error{L"Missing HyperVXNdisFilter binding path enumerator."};
     std::vector<GUID> adapter_instances;
     Check(ReadBindingAdapterInventory(network.config.Get(), adapter_instances), L"Read NetCfg/NETIO adapter inventory");
     std::vector<Path> paths;
@@ -103,12 +110,12 @@ std::vector<Path> Paths(Network& network) {
         ULONG fetched = 0;
         HRESULT result = enumerator->Next(1, &entry.path, &fetched);
         if (result == S_FALSE && fetched == 0 && !entry.path) break;
-        Check(result, L"Read HyperVGuard binding path");
+        Check(result, L"Read HyperVXNdisFilter binding path");
         if (result != S_OK || fetched != 1 || !entry.path || paths.size() == 4096) throw Error{L"Invalid or excessive NetCfg binding paths."};
         result = entry.path->IsEnabled();
         if (result != S_OK && result != S_FALSE) {
-            Check(result, L"Read HyperVGuard binding state");
-            throw Error{L"Unexpected HyperVGuard binding state."};
+            Check(result, L"Read HyperVXNdisFilter binding state");
+            throw Error{L"Unexpected HyperVXNdisFilter binding state."};
         }
         entry.binding.enabled = result == S_OK;
         BindingPathIdentity identity;
@@ -125,7 +132,7 @@ std::vector<Path> Paths(Network& network) {
         }
         Check(inspected, context.c_str());
         if (!identity.owns_path || identity.adapters != 1 || identity.adapter == GUID_NULL) {
-            throw Error{L"HyperVGuard binding path does not resolve to exactly one adapter. No binding will be guessed."};
+            throw Error{L"HyperVXNdisFilter binding path does not resolve to exactly one adapter. No binding will be guessed."};
         }
         entry.binding.adapter = identity.adapter;
         paths.push_back(std::move(entry));
@@ -135,7 +142,7 @@ std::vector<Path> Paths(Network& network) {
 
 Change Applied(Network& network, HRESULT operation) {
     const HRESULT result = network.config->Apply();
-    Check(result, L"Apply HyperVGuard NetCfg changes");
+    Check(result, L"Apply HyperVXNdisFilter NetCfg changes");
     const bool reboot = result == NETCFG_S_REBOOT || operation == NETCFG_S_REBOOT;
     network.Refresh();
     return reboot ? Change::RebootRequired : Change::Complete;
@@ -145,7 +152,7 @@ bool KeyExists(const wchar_t* path) {
     RegistryKey key;
     const LSTATUS result = RegOpenKeyExW(HKEY_LOCAL_MACHINE, path, 0, KEY_QUERY_VALUE | KEY_WOW64_64KEY, &key.value);
     if (result == ERROR_FILE_NOT_FOUND || result == ERROR_PATH_NOT_FOUND) return false;
-    CheckWin32(result, L"Check HyperVGuard registry state");
+    CheckWin32(result, L"Check HyperVXNdisFilter registry state");
     return true;
 }
 
@@ -289,7 +296,7 @@ public:
         CheckWin32(result, L"Open target configuration for disarm");
         const DWORD disarmed = 0;
         CheckWin32(RegSetValueExW(key.value, L"AllowBindings", 0, REG_DWORD,
-                                 reinterpret_cast<const BYTE*>(&disarmed), sizeof(disarmed)), L"Disarm HyperVGuard bindings");
+                                 reinterpret_cast<const BYTE*>(&disarmed), sizeof(disarmed)), L"Disarm HyperVXNdisFilter bindings");
         CheckWin32(RegFlushKey(key.value), L"Persist disarmed target configuration");
     }
 
@@ -303,7 +310,7 @@ public:
 
     Change InstallComponent(const std::filesystem::path&) override {
         if (!network_ || files_.size() != 4) throw Error{L"Installation was not preflighted or locked."};
-        if (!SetupCopyOEMInfW((package_ / L"HyperVGuard.inf").c_str(), package_.c_str(), SPOST_PATH,
+        if (!SetupCopyOEMInfW((package_ / L"HyperVXNdisFilter.inf").c_str(), package_.c_str(), SPOST_PATH,
                               0, nullptr, 0, nullptr, nullptr)) {
             throw Error{L"Stage the validated driver-store package: " + ErrorCode(GetLastError())};
         }
@@ -313,8 +320,8 @@ public:
         token.Type = OBO_USER;
         ComPtr<INetCfgComponent> installed;
         const HRESULT result = setup->Install(kComponentId, &token, NSF_POSTSYSINSTALL, 0, nullptr, nullptr, &installed);
-        Check(result, L"Install only hyperv_guard");
-        if (!installed) throw Error{L"NetCfg did not return the installed HyperVGuard component."};
+        Check(result, L"Install only hyperv_xndis_filter");
+        if (!installed) throw Error{L"NetCfg did not return the installed HyperVXNdisFilter component."};
         installed.Reset();
         setup.Reset();
         return Applied(*network_, result);
@@ -327,18 +334,18 @@ public:
         network_->Refresh(true);
         auto component = network_->Component();
         if (!component) {
-            if (HasService()) throw Error{L"HyperVGuard service remains without a NetCfg component; no SCM service will be forcibly deleted. Reboot/repair the old installation explicitly."};
+            if (HasService()) throw Error{L"HyperVXNdisFilter service remains without a NetCfg component; no SCM service will be forcibly deleted. Reboot/repair the old installation explicitly."};
             return Change::Complete;
         }
         GUID component_class{};
-        Check(component->GetClassGuid(&component_class), L"Get HyperVGuard component class");
+        Check(component->GetClassGuid(&component_class), L"Get HyperVXNdisFilter component class");
         ComPtr<INetCfgClassSetup> setup;
-        Check(network_->config->QueryNetCfgClass(&component_class, IID_PPV_ARGS(&setup)), L"Get HyperVGuard removal class");
+        Check(network_->config->QueryNetCfgClass(&component_class, IID_PPV_ARGS(&setup)), L"Get HyperVXNdisFilter removal class");
         OBO_TOKEN token{};
         token.Type = OBO_USER;
         CoString references;
         const HRESULT result = setup->DeInstall(component.Get(), &token, &references.value);
-        Check(result, L"Uninstall only hyperv_guard");
+        Check(result, L"Uninstall only hyperv_xndis_filter");
         component.Reset();
         setup.Reset();
         return Applied(*network_, result);
@@ -358,7 +365,7 @@ public:
 
     void DeleteConfiguration() override {
         const LSTATUS result = RegDeleteTreeW(HKEY_LOCAL_MACHINE, kConfigKey);
-        if (result != ERROR_FILE_NOT_FOUND && result != ERROR_PATH_NOT_FOUND) CheckWin32(result, L"Remove only HyperVGuard target configuration");
+        if (result != ERROR_FILE_NOT_FOUND && result != ERROR_PATH_NOT_FOUND) CheckWin32(result, L"Remove only HyperVXNdisFilter target configuration");
     }
 private:
     Change SetTargetBinding(const Adapter& target, bool enabled) {
@@ -410,4 +417,4 @@ void WriteText(const std::wstring& text, bool error) {
     }
 }
 
-} // namespace hyperv_guard::setup
+} // namespace hyperv_xndis_filter::setup

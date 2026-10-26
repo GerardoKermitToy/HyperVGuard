@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
@@ -30,7 +31,7 @@ BOOL CancelIoEx(HANDLE, LPOVERLAPPED);
 #define WriteFile testio::WriteFile
 #define GetOverlappedResult testio::GetOverlappedResult
 #define CancelIoEx testio::CancelIoEx
-#include "HyperVGuard.hpp"
+#include "HyperVXNdisFilter.hpp"
 #undef CreateEventW
 #undef CreateFileW
 #undef CloseHandle
@@ -41,7 +42,7 @@ BOOL CancelIoEx(HANDLE, LPOVERLAPPED);
 #undef CancelIoEx
 
 #define CHECK(x) do { if (!(x)) { std::fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #x); return false; } } while (false)
-using Client = hypervguard::Client;
+using Client = hypervxndisfilter::Client;
 using Bytes = std::vector<uint8_t>;
 
 namespace testio {
@@ -59,6 +60,7 @@ struct State {
     HANDLE startup_seen = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
     HANDLE driver_ready = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
     Bytes queued, written;
+    std::vector<DWORD> open_errors;
     size_t offset = 0;
     unsigned reads = 0, cancels = 0, opens = 0, closes = 0;
     bool empty_read = false, short_control = false, wrong_version = false, fail_open = false, secure_ready = false;
@@ -71,7 +73,7 @@ void Reset() {
     std::lock_guard lock(state.mutex);
     if (!state.operations.empty()) throw std::runtime_error("unreaped fake I/O");
     state.pending = nullptr;
-    state.queued.clear(); state.written.clear(); state.offset = 0;
+    state.queued.clear(); state.written.clear(); state.open_errors.clear(); state.offset = 0;
     state.reads = state.cancels = state.opens = state.closes = 0;
     state.empty_read = state.short_control = state.wrong_version = state.fail_open = state.secure_ready = false;
     state.first_buffer = nullptr; state.stop_on_read = nullptr;
@@ -98,7 +100,7 @@ void Inject(Bytes bytes) {
 HANDLE CreateEventW(LPSECURITY_ATTRIBUTES sa, BOOL manual, BOOL initial, LPCWSTR name) {
     if (!name) return ::CreateEventW(sa, manual, initial, nullptr);
     std::lock_guard lock(state.mutex);
-    if (std::wcscmp(name, L"Global\\HyperVGuard.DriverReady")) {
+    if (std::wcscmp(name, L"Global\\HyperVXNdisFilter.DriverReady")) {
         ::SetLastError(ERROR_INVALID_NAME); return nullptr;
     }
     SECURITY_DESCRIPTOR_CONTROL control = 0;
@@ -114,11 +116,16 @@ HANDLE CreateEventW(LPSECURITY_ATTRIBUTES sa, BOOL manual, BOOL initial, LPCWSTR
 }
 HANDLE CreateFileW(LPCWSTR path, DWORD access, DWORD sharing, LPSECURITY_ATTRIBUTES, DWORD mode, DWORD flags, HANDLE) {
     std::lock_guard lock(state.mutex);
-    if (std::wcscmp(path, L"\\\\.\\HyperVGuard") || access != (GENERIC_READ | GENERIC_WRITE) ||
+    if (std::wcscmp(path, L"\\\\.\\HyperVXNdisFilter") || access != (GENERIC_READ | GENERIC_WRITE) ||
         sharing || mode != OPEN_EXISTING || !(flags & FILE_FLAG_OVERLAPPED)) {
         ::SetLastError(ERROR_INVALID_PARAMETER); return INVALID_HANDLE_VALUE;
     }
     ++state.opens;
+    if (state.opens <= state.open_errors.size()) {
+        const DWORD error = state.open_errors[state.opens - 1];
+        if (state.opens == 2) ::SetEvent(state.submitted);
+        if (error) { ::SetLastError(error); return INVALID_HANDLE_VALUE; }
+    }
     if (state.fail_open) { ::SetLastError(ERROR_FILE_NOT_FOUND); return INVALID_HANDLE_VALUE; }
     return Device();
 }
@@ -478,6 +485,35 @@ bool TestStartupWait() {
     }
     return true;
 }
+bool TestBusyStartup() {
+    for (const auto& errors : std::vector<std::vector<DWORD>>{
+            {ERROR_SHARING_VIOLATION},
+            {ERROR_FILE_NOT_FOUND, ERROR_SHARING_VIOLATION},
+            {ERROR_FILE_NOT_FOUND, ERROR_FILE_NOT_FOUND, ERROR_SHARING_VIOLATION}}) {
+        testio::Reset();
+        testio::state.open_errors = errors;
+        Client client;
+        auto open = std::async(std::launch::async, [&] { return client.Open(); });
+        struct Guard {
+            Client& client; std::future<DWORD>& open;
+            ~Guard() { client.Stop(); if (open.valid()) open.wait(); }
+        } guard{client, open};
+        if (errors.size() == 3) {
+            CHECK(::WaitForSingleObject(testio::state.submitted, 2000) == WAIT_OBJECT_0);
+            ::SetEvent(testio::state.driver_ready);
+        }
+        const bool completed = open.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+        if (!completed) client.Stop();
+        CHECK(open.get() == ERROR_SHARING_VIOLATION && completed);
+        CHECK(testio::state.opens == errors.size() && testio::state.operations.empty());
+        if (errors.size() == 1) CHECK(::WaitForSingleObject(testio::state.startup_seen, 0) == WAIT_TIMEOUT);
+        testio::state.open_errors.clear();
+        CHECK(client.Open() == ERROR_SUCCESS);
+        CHECK(client.Close() == ERROR_SUCCESS && testio::state.operations.empty());
+    }
+    return true;
+}
+
 bool TestTimeoutAndLegacy() {
     testio::Reset();
     Client client;
@@ -560,6 +596,7 @@ int main() {
         {"borrowed logs and batched bandwidth arrays, exact layouts and malformed records", TestLogAndBandwidth},
         {"idle read without polling, concurrent IOCTL, Stop/Shutdown cancellation and reaping", TestIdleAndStop},
         {"unlimited DriverReady startup wait, protected ACL, stale signal and Stop without device polling", TestStartupWait},
+        {"exclusive-device sharing errors never wait for DriverReady and allow a later reopen", TestBusyStartup},
         {"deadline reaping, no legacy-read spin, and Stop during read admission", TestTimeoutAndLegacy},
         {"callback verdict bytes and full maximum packet read without payload allocation/copy", TestCallbacksAndLargeRead},
         {"unopened/short/version errors and callback exception cleanup", TestErrorsAndException},

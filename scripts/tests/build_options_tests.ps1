@@ -6,12 +6,12 @@ $parseErrors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($buildScript, [ref]$tokens, [ref]$parseErrors)
 if ($parseErrors.Count -ne 0 -or $null -eq $ast.ParamBlock) { throw 'Build.ps1 parameter parsing failed.' }
 $probe = [scriptblock]::Create($ast.ParamBlock.Extent.Text + "`n" + '$PfxPassword')
-$oldPassword = $env:HYPERVGUARD_PFX_PASSWORD
+$oldPassword = $env:HYPERVXNDISFILTER_PFX_PASSWORD
 $script:passed = 0
 
 function Test-Password {
     param([string]$Name, [string]$EnvironmentPassword, [hashtable]$Arguments, [string]$Expected)
-    $env:HYPERVGUARD_PFX_PASSWORD = $EnvironmentPassword
+    $env:HYPERVXNDISFILTER_PFX_PASSWORD = $EnvironmentPassword
     $actual = & $probe @Arguments
     if ($actual -cne $Expected) { throw "Unexpected password selection: $Name" }
     ++$script:passed
@@ -29,5 +29,5 @@ try {
     Test-Password 'a PFX path does not change the default or open a file' $null @{ PfxPath = 'never-opened-by-parser.pfx' } '1'
     Write-Host "PASS $script:passed build option cases (no compiler, signing tool, key or driver access)."
 } finally {
-    $env:HYPERVGUARD_PFX_PASSWORD = $oldPassword
+    $env:HYPERVXNDISFILTER_PFX_PASSWORD = $oldPassword
 }

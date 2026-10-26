@@ -4,12 +4,12 @@
 #include <cwchar>
 #include <string_view>
 
-namespace hyperv_guard::setup {
+namespace hyperv_xndis_filter::setup {
 namespace {
 
 void RequireFresh(System& system) {
     if (system.HasService() || system.HasComponent()) {
-        throw Error{L"HyperVGuard is already installed or removal is pending. Stop the monitor and run Uninstall.exe first; a live driver is never replaced."};
+        throw Error{L"HyperVXNdisFilter is already installed or removal is pending. Stop the monitor and run Uninstall.exe first; a live driver is never replaced."};
     }
 }
 
@@ -42,7 +42,7 @@ int Enable(System& system, const Adapter& target) {
     ValidateBindings(system.ReadBindings(), target, false, true);
     RevalidateTarget(system, target);
     system.VerifyConfiguration(target);
-    system.Print(L"HyperVGuard is enabled only on the exact Default Switch host vNIC.\n");
+    system.Print(L"HyperVXNdisFilter is enabled only on the exact Default Switch host vNIC.\n");
     return 0;
 }
 
@@ -55,7 +55,7 @@ void Rollback(System& system, bool attempted_install) noexcept {
         system.Print(L"WARNING: could not disarm configuration.\n");
     }
     if (!attempted_install) return;
-    system.Print(L"Installation failed; rolling back only this new HyperVGuard component.\n");
+    system.Print(L"Installation failed; rolling back only this new HyperVXNdisFilter component.\n");
     try {
         if (system.RemoveComponent() == Change::RebootRequired) {
             system.Print(L"Rollback requires a reboot; configuration is retained disarmed.\n");
@@ -109,7 +109,7 @@ std::wstring Usage(Action executable) {
         ? L"Usage: Uninstall.exe [--yes] [--what-if]\n       Uninstall.exe --help\n\n"
         : L"Usage: Install.exe [--package DIRECTORY] [--yes] [--what-if]\n       Install.exe --enable [--yes] [--what-if]\n       Install.exe --help\n\n";
     result += uninstall
-        ? L"Disarms and removes only the hyperv_guard NetCfg component.\nNo Default Switch, VM, HNS, NAT or unrelated binding is changed.\n"
+        ? L"Disarms and removes only the hyperv_xndis_filter NetCfg component.\nNo Default Switch, VM, HNS, NAT or unrelated binding is changed.\n"
         : L"Installs the optional NDIS LWF only on the Default Switch host vNIC.\nThe package directory defaults to the directory containing this EXE.\n--enable resumes an installed, disarmed component after a requested reboot;\nit never retargets stale GUID/NET_LUID configuration.\n";
     result += L"\nRun from an elevated Administrator/SYSTEM console; stop hyperv_monitor first.\nConfirmation is required unless --yes is supplied. --what-if performs read-only\npreflight without a write lock, registry writes, installation or binding changes.\n--help and invalid arguments do not access WMI, NetCfg, registry or the driver.\n\nExit codes: 0 success/dry run, 1 failure, 2 invalid arguments,\n1223 cancelled, 3010 reboot required (configuration retained disarmed).\nThe programs never open the driver device or create an SCM service manually.\n";
     return result;
@@ -168,9 +168,9 @@ void ValidateBindings(const std::vector<Binding>& bindings, const Adapter& targe
                       bool all_disabled, bool require_enabled) {
     size_t targets = 0;
     for (const auto& binding : bindings) {
-        if (binding.adapter == GUID_NULL) throw Error{L"An ambiguous HyperVGuard binding path was found."};
+        if (binding.adapter == GUID_NULL) throw Error{L"An ambiguous HyperVXNdisFilter binding path was found."};
         if (binding.enabled && (all_disabled || binding.adapter != target.guid)) {
-            throw Error{L"HyperVGuard has an unexpectedly enabled binding. No foreign adapter will be edited."};
+            throw Error{L"HyperVXNdisFilter has an unexpectedly enabled binding. No foreign adapter will be edited."};
         }
         if (binding.adapter == target.guid) {
             ++targets;
@@ -179,7 +179,7 @@ void ValidateBindings(const std::vector<Binding>& bindings, const Adapter& targe
     }
     // NetCfg can expose several paths to one adapter. Every path must terminate
     // at exactly one GUID; only paths to the same exact target may be enabled.
-    if (!targets) throw Error{L"No HyperVGuard binding exists on the exact Default Switch host adapter."};
+    if (!targets) throw Error{L"No HyperVXNdisFilter binding exists on the exact Default Switch host adapter."};
 }
 
 int Execute(const Options& options, System& system) {
@@ -193,7 +193,7 @@ int Execute(const Options& options, System& system) {
             RequireFresh(system);
             system.ValidatePackage(options.package);
         } else {
-            if (!system.HasComponent()) throw Error{L"HyperVGuard is not installed. Run Install.exe without --enable first."};
+            if (!system.HasComponent()) throw Error{L"HyperVXNdisFilter is not installed. Run Install.exe without --enable first."};
             system.VerifyConfiguration(target);
             ValidateBindings(system.ReadBindings(), target, false);
         }
@@ -205,9 +205,9 @@ int Execute(const Options& options, System& system) {
         return 0;
     }
     const std::wstring operation = options.action == Action::Uninstall
-        ? L"Disarm and uninstall ONLY HyperVGuard"
+        ? L"Disarm and uninstall ONLY HyperVXNdisFilter"
         : options.action == Action::Enable ? L"Enable ONLY the configured Default Switch host binding"
-                                          : L"Install HyperVGuard and enable ONLY the Default Switch host binding";
+                                          : L"Install HyperVXNdisFilter and enable ONLY the Default Switch host binding";
     if (!options.yes && !system.Confirm(operation)) {
         system.Print(L"Cancelled. No system state was changed.\n");
         return ERROR_CANCELLED;
@@ -218,15 +218,15 @@ int Execute(const Options& options, System& system) {
         system.DisarmIfPresent();
         if (system.RemoveComponent() == Change::RebootRequired) return NeedsReboot(system);
         if (system.HasComponent() || system.HasService()) {
-            throw Error{L"HyperVGuard removal is incomplete. Configuration remains disarmed; reboot if requested and run Uninstall.exe again."};
+            throw Error{L"HyperVXNdisFilter removal is incomplete. Configuration remains disarmed; reboot if requested and run Uninstall.exe again."};
         }
         system.DeleteConfiguration();
-        system.Print(L"HyperVGuard removed. No other component, switch, VM, HNS or NAT setting was changed.\n");
+        system.Print(L"HyperVXNdisFilter removed. No other component, switch, VM, HNS or NAT setting was changed.\n");
         return 0;
     }
     RevalidateTarget(system, target);
     if (options.action == Action::Enable) {
-        if (!system.HasComponent()) throw Error{L"The installed HyperVGuard component disappeared."};
+        if (!system.HasComponent()) throw Error{L"The installed HyperVXNdisFilter component disappeared."};
         try {
             return Enable(system, target);
         } catch (...) {
@@ -248,4 +248,4 @@ int Execute(const Options& options, System& system) {
     }
 }
 
-} // namespace hyperv_guard::setup
+} // namespace hyperv_xndis_filter::setup

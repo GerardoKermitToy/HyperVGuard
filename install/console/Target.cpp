@@ -5,7 +5,7 @@
 #include <netioapi.h>
 #include <limits>
 
-namespace hyperv_guard::setup {
+namespace hyperv_xndis_filter::setup {
 namespace {
 
 struct Variant {
@@ -154,4 +154,4 @@ Adapter ResolveWindowsTarget() {
     return target;
 }
 
-} // namespace hyperv_guard::setup
+} // namespace hyperv_xndis_filter::setup

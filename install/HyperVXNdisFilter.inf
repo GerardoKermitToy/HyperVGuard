@@ -4,7 +4,7 @@ Signature="$Windows NT$"
 Class=NetService
 ClassGUID={4D36E974-E325-11CE-BFC1-08002BE10318}
 Provider=%Provider%
-CatalogFile=HyperVGuard.cat
+CatalogFile=HyperVXNdisFilter.cat
 DriverVer=10/25/2026,0.3.1.0
 PnpLockdown=1
 
@@ -13,7 +13,7 @@ PnpLockdown=1
 %Provider%=Models,NTamd64.10.0...25341
 
 [Models.NTamd64.10.0...25341]
-%Description%=Install, hyperv_guard
+%Description%=Install, hyperv_xndis_filter
 
 [Install]
 Characteristics=0x40000
@@ -22,7 +22,7 @@ CopyFiles=DriverFiles,NotifyFiles
 AddReg=Ndi
 
 [Install.Services]
-AddService=HyperVGuard,,Service
+AddService=HyperVXNdisFilter,,Service
 
 [Service]
 DisplayName=%Description%
@@ -30,43 +30,43 @@ Description=%Help%
 ServiceType=1
 StartType=1
 ErrorControl=1
-ServiceBinary=%13%\HyperVGuard.sys
+ServiceBinary=%13%\HyperVXNdisFilter.sys
 LoadOrderGroup=NDIS
 
 [Ndi]
-HKR,Ndi,Service,,"HyperVGuard"
-HKR,Ndi,CoServices,0x00010000,"HyperVGuard"
+HKR,Ndi,Service,,"HyperVXNdisFilter"
+HKR,Ndi,CoServices,0x00010000,"HyperVXNdisFilter"
 HKR,Ndi,HelpText,,%Help%
 HKR,Ndi,FilterClass,,"custom"
 HKR,Ndi,FilterType,0x00010001,2
 HKR,Ndi,FilterRunType,0x00010001,2
 HKR,Ndi,ClsID,,"{1CFED41E-4579-42CF-962C-2A7E04C6DBC8}"
-HKR,Ndi,ComponentDll,,"%13%\HyperVGuardNotify.dll"
+HKR,Ndi,ComponentDll,,"%13%\HyperVXNdisFilterNotify.dll"
 HKR,Ndi\Interfaces,UpperRange,,"noupper"
 HKR,Ndi\Interfaces,LowerRange,,"nolower"
 HKR,Ndi\Interfaces,FilterMediaTypes,,"ethernet"
 
 [Install.Remove.Services]
-DelService=HyperVGuard,0x200
+DelService=HyperVXNdisFilter,0x200
 
 [DriverFiles]
-HyperVGuard.sys,,,2
+HyperVXNdisFilter.sys,,,2
 
 [NotifyFiles]
-HyperVGuardNotify.dll,,,2
+HyperVXNdisFilterNotify.dll,,,2
 
 [SourceDisksNames]
 1=%Description%,,,
 
 [SourceDisksFiles]
-HyperVGuard.sys=1
-HyperVGuardNotify.dll=1
+HyperVXNdisFilter.sys=1
+HyperVXNdisFilterNotify.dll=1
 
 [DestinationDirs]
 DriverFiles=13
 NotifyFiles=13
 
 [Strings]
-Provider="HyperV Guard Project"
-Description="HyperV Guard Rust Host Adapter LWF"
+Provider="HyperVXNdisFilter Project"
+Description="HyperVXNdisFilter Rust Host Adapter LWF"
 Help="Rust packet verdicts for the Default Switch host vEthernet adapter only."

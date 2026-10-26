@@ -1,7 +1,7 @@
 #include "BindingPolicy.h"
 #include "NetCfgTrace.h"
 
-namespace hyperv_guard {
+namespace hyperv_xndis_filter {
 
 static bool ReadTarget(GUID& guid) {
     DWORD version = 0, size = sizeof(version);

@@ -3,8 +3,8 @@
 #include <exception>
 
 int wmain(int argc, wchar_t** argv) {
-    using namespace hyperv_guard::setup;
-#ifdef HYPERVGUARD_UNINSTALL
+    using namespace hyperv_xndis_filter::setup;
+#ifdef HYPERVXNDISFILTER_UNINSTALL
     constexpr Action executable = Action::Uninstall;
 #else
     constexpr Action executable = Action::Install;

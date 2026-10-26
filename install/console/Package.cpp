@@ -6,7 +6,7 @@
 #include <mscat.h>
 #include <map>
 
-namespace hyperv_guard::setup {
+namespace hyperv_xndis_filter::setup {
 namespace {
 
 class Inf {
@@ -30,7 +30,7 @@ public:
 
     void Require(const wchar_t* section, const wchar_t* key, DWORD field, const wchar_t* expected) {
         if (_wcsicmp(Field(section, key, field).c_str(), expected) != 0) {
-            throw Error{std::wstring(L"Not the target-restricted HyperVGuard LWF package: ") + section + L"/" + key};
+            throw Error{std::wstring(L"Not the target-restricted HyperVXNdisFilter LWF package: ") + section + L"/" + key};
         }
     }
 
@@ -38,25 +38,24 @@ public:
         INFCONTEXT context{};
         if (!SetupFindFirstLineW(handle_, L"Models.NTamd64.10.0...25341", nullptr, &context) ||
             _wcsicmp(Get(context, 1).c_str(), L"Install") != 0 ||
-            _wcsicmp(Get(context, 2).c_str(), L"hyperv_guard") != 0 ||
+            _wcsicmp(Get(context, 2).c_str(), L"hyperv_xndis_filter") != 0 ||
             SetupFindNextLine(&context, &context)) {
-            throw Error{L"Expected exactly the target-restricted HyperVGuard LWF model."};
+            throw Error{L"Expected exactly the target-restricted HyperVXNdisFilter LWF model."};
         }
     }
 
     void RequireDriverStoreFiles() {
         Require(L"DestinationDirs", L"DriverFiles", 1, L"13");
         Require(L"DestinationDirs", L"NotifyFiles", 1, L"13");
-        DWORD size = 0;
-        SetupGetTargetPathW(handle_, nullptr, L"NotifyFiles", nullptr, 0, &size);
-        if (!size || size > 32768) throw Error{L"Invalid notify DLL destination."};
-        std::vector<wchar_t> directory(size);
-        if (!SetupGetTargetPathW(handle_, nullptr, L"NotifyFiles", directory.data(), size, nullptr)) {
-            throw Error{L"Read notify DLL destination: " + ErrorCode(GetLastError())};
-        }
+        RequireFileList(L"DriverFiles", kDriverFileName);
+        RequireFileList(L"NotifyFiles", L"HyperVXNdisFilterNotify.dll");
+        Require(L"SourceDisksFiles", kDriverFileName, 1, L"1");
+        Require(L"SourceDisksFiles", L"HyperVXNdisFilterNotify.dll", 1, L"1");
         // SetupAPI expands DIRID 13 to a temporary destination (normally '.')
-        // until the INF is staged. Compare both fields in the same parse context.
-        const auto dll = std::filesystem::path(directory.data()) / L"HyperVGuardNotify.dll";
+        // until the INF is staged. Compare fields in the same parse context.
+        const auto driver = TargetFile(L"DriverFiles", kDriverFileName);
+        Require(L"Service", L"ServiceBinary", 1, driver.c_str());
+        const auto dll = TargetFile(L"NotifyFiles", L"HyperVXNdisFilterNotify.dll");
         RequireNdi(L"Ndi", L"ComponentDll", dll.c_str());
     }
 
@@ -77,6 +76,24 @@ public:
         if (matches != 1) throw Error{std::wstring(L"Missing or ambiguous INF binding policy: ") + name};
     }
 private:
+    void RequireFileList(const wchar_t* section, const wchar_t* expected) {
+        INFCONTEXT context{};
+        if (!SetupFindFirstLineW(handle_, section, nullptr, &context) ||
+            _wcsicmp(Get(context, 1).c_str(), expected) != 0 ||
+            SetupFindNextLine(&context, &context)) {
+            throw Error{std::wstring(L"Unexpected INF file list: ") + section};
+        }
+    }
+    std::filesystem::path TargetFile(const wchar_t* section, const wchar_t* name) {
+        DWORD size = 0;
+        SetupGetTargetPathW(handle_, nullptr, section, nullptr, 0, &size);
+        if (!size || size > 32768) throw Error{L"Invalid driver-store file destination."};
+        std::vector<wchar_t> directory(size);
+        if (!SetupGetTargetPathW(handle_, nullptr, section, directory.data(), size, nullptr)) {
+            throw Error{L"Read driver-store file destination: " + ErrorCode(GetLastError())};
+        }
+        return std::filesystem::path(directory.data()) / name;
+    }
     static std::wstring Get(INFCONTEXT& context, DWORD field) {
         DWORD size = 0;
         SetupGetStringFieldW(&context, field, nullptr, 0, &size);
@@ -165,9 +182,14 @@ void ValidateInfFile(const std::filesystem::path& path) {
     Inf inf(path);
     inf.Require(L"Version", L"Class", 1, L"NetService");
     inf.Require(L"Version", L"ClassGUID", 1, L"{4D36E974-E325-11CE-BFC1-08002BE10318}");
-    inf.Require(L"Version", L"CatalogFile", 1, L"HyperVGuard.cat");
+    inf.Require(L"Version", L"CatalogFile", 1, L"HyperVXNdisFilter.cat");
     inf.Require(L"Version", L"DriverVer", 2, kPackageVersion);
     inf.RequireModel();
+    inf.Require(L"Install.Services", L"AddService", 1, kServiceName);
+    inf.Require(L"Install.Services", L"AddService", 3, L"Service");
+    inf.Require(L"Install.Remove.Services", L"DelService", 1, kServiceName);
+    inf.RequireNdi(L"Ndi", L"Service", kServiceName);
+    inf.RequireNdi(L"Ndi", L"CoServices", kServiceName);
     inf.Require(L"Install", L"NetCfgInstanceId", 1, L"{6E76EAD1-7BCB-49C4-9547-D3E6B3488F71}");
     inf.RequireNdi(L"Ndi", L"FilterClass", L"custom");
     inf.RequireNdi(L"Ndi", L"FilterType", L"2");
@@ -181,7 +203,7 @@ void ValidateInfFile(const std::filesystem::path& path) {
 
 std::vector<Handle> LockAndVerifyPackage(const std::filesystem::path& package) {
     constexpr std::array<const wchar_t*, 4> names = {
-        L"HyperVGuard.inf", L"HyperVGuard.sys", L"HyperVGuardNotify.dll", L"HyperVGuard.cat"
+        L"HyperVXNdisFilter.inf", kDriverFileName, L"HyperVXNdisFilterNotify.dll", L"HyperVXNdisFilter.cat"
     };
     std::vector<Handle> files;
     for (const auto name : names) {
@@ -205,4 +227,4 @@ std::vector<Handle> LockAndVerifyPackage(const std::filesystem::path& package) {
     return files;
 }
 
-} // namespace hyperv_guard::setup
+} // namespace hyperv_xndis_filter::setup

@@ -1,6 +1,6 @@
 // Portable pieces of the kernel ownership contract, shared with offline tests.
-#ifndef HYPERV_GUARD_LWF_CONTRACT_H
-#define HYPERV_GUARD_LWF_CONTRACT_H
+#ifndef HYPERV_XNDIS_FILTER_LWF_CONTRACT_H
+#define HYPERV_XNDIS_FILTER_LWF_CONTRACT_H
 
 // Internal host-vNIC ownership paths, NOT public outbound/inbound values.
 #define HV_DIRECTION_SEND 0u

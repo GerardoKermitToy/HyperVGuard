@@ -1,4 +1,4 @@
-// Portmaster-compatible client API for the HyperVGuard host-adapter NDIS LWF.
+// Portmaster-compatible client API for the HyperVXNdisFilter host-adapter NDIS LWF.
 // Adapted from kext_client on 2026-10-25; see README.md and LICENSE for provenance.
 // Wire integers are little-endian; record headers are [u8 type][u32 size].
 #pragma once
@@ -39,7 +39,7 @@ enum class CommandType : uint8_t {
     CleanEndedConnections = 8,
 };
 
-// Values outside 2..7 are retained for source compatibility only. HyperVGuard
+// Values outside 2..7 are retained for source compatibility only. HyperVXNdisFilter
 // rejects them (including all redirect verdicts) before any device write.
 enum class Verdict : uint8_t {
     Undecided           = 0,
@@ -69,7 +69,7 @@ enum class Severity : uint8_t {
 const char* ToString(Verdict v);
 const char* ToString(Severity s);
 const char* ToString(InfoType t);
-// HyperVGuard captures an IP packet, so its payload_layer is always 3.
+// HyperVXNdisFilter captures an IP packet, so its payload_layer is always 3.
 const char* PayloadLayerToString(uint8_t layer);
 const char* ProtocolToString(uint8_t proto);
 // 0 means guest outbound (host receive), 1 means guest inbound (host send).
@@ -156,7 +156,7 @@ struct Handlers {
 // Opening the device requires an elevated Administrator or SYSTEM token.
 class Driver {
 public:
-    explicit Driver(std::wstring service_name = L"HyperVGuard");
+    explicit Driver(std::wstring service_name = L"HyperVXNdisFilter");
     ~Driver();
 
     Driver(const Driver&) = delete;

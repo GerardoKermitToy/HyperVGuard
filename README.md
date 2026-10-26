@@ -1,4 +1,4 @@
-# HyperVGuard
+# HyperVXNdisFilter
 
 Experimental Rust-based **NDIS Lightweight Filter (LWF)** and a C++ monitor with a `kext_monitor`-style API. The filter targets only the management-OS host adapter **`vEthernet (Default Switch)`**. It is not a Hyper-V switch extension or a WFP callout.
 
@@ -16,9 +16,11 @@ Commands below use Git Bash at the repository root:
 powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts/Build.ps1 -Test
 ```
 
-This builds the package and runs offline tests without installing, loading, or binding the driver. Output goes to `dist/`: SYS/PDB/INF/CAT, `HyperVGuardNotify.dll`, `hyperv_monitor.exe`, `Install.exe`, and `Uninstall.exe`. Keep package files together; do not mix versions.
+This builds the package and runs offline tests without installing, loading, or binding the driver. Output goes to `dist/`: **`HyperVXNdisFilter.sys`**, `HyperVXNdisFilter.pdb`, `HyperVXNdisFilter.inf`, `HyperVXNdisFilter.cat`, `HyperVXNdisFilterNotify.dll`, `hyperv_monitor.exe`, `Install.exe`, and `Uninstall.exe`. Keep package files together; do not mix versions.
 
-The default build is unsigned. For signing, pass `-PfxPath` and `-RootCertificate` to the build script. The local test-PFX password defaults to `1`; a nonempty process environment variable `HYPERVGUARD_PFX_PASSWORD` overrides that default, and an explicit `-PfxPassword` overrides both (including an explicitly empty password). The script does not import certificates or change security policy. Installation requires trusted package signatures.
+All product identities use the new name: service `HyperVXNdisFilter`, device `\\.\HyperVXNdisFilter`, startup event `Global\HyperVXNdisFilter.DriverReady`, NetCfg component `hyperv_xndis_filter`, and header-only client `HyperVXNdisFilter.hpp` / `hypervxndisfilter::Client`. Wire layouts, IOCTLs, version 0.3.1.0 and the `pmkext` API are unchanged; old header/namespace/device aliases are not provided. Use a clean `dist/` when rebuilding after the rename and deploy the entire new package, not individually renamed binaries. An existing installation under a previous name must first be removed with **its matching old `Uninstall.exe`**. The new installer rejects another component with the same filter GUID; it does not migrate, replace or remove it automatically.
+
+The default build is unsigned. For signing, pass `-PfxPath` and `-RootCertificate` to the build script. The local test-PFX password defaults to `1`; a nonempty process environment variable `HYPERVXNDISFILTER_PFX_PASSWORD` overrides that default, and an explicit `-PfxPassword` overrides both (including an explicitly empty password). The script does not import certificates or change security policy. Installation requires trusted package signatures.
 
 ## Install
 
@@ -28,7 +30,7 @@ Use an **elevated Administrator/SYSTEM console**, stop the monitor, and have loc
 ./dist/Install.exe
 ```
 
-The native installer reads the package beside its EXE and enables HyperVGuard only on the exact Default Switch host vNIC. `--what-if` performs read-only preflight; `--yes` skips confirmation only.
+The native installer reads the package beside its EXE and enables HyperVXNdisFilter only on the exact Default Switch host vNIC. `--what-if` performs read-only preflight; `--yes` skips confirmation only.
 
 If installation returns **3010**, reboot, then resume explicitly:
 
@@ -56,7 +58,7 @@ For an interactive session, omit `--duration` and exit with **Ctrl+C**:
 ./dist/hyperv_monitor.exe
 ```
 
-Without `--duration`, an open failure makes the monitor create/open `Global\HyperVGuard.DriverReady` and wait for driver startup. Ctrl+C also cancels this wait. With a positive `--duration N`, it never waits for startup: an open failure exits immediately; a successful session stops after N seconds. Use `--duration` for automated/live tests; zero, negative and malformed values remain invalid.
+Without `--duration`, an open failure makes the monitor create/open `Global\HyperVXNdisFilter.DriverReady` and wait for driver startup. Ctrl+C also cancels this wait. With a positive `--duration N`, it never waits for startup: an open failure exits immediately; a successful session stops after N seconds. Use `--duration` for automated/live tests; zero, negative and malformed values remain invalid.
 
 The monitor prints `Filtered network devices: N (running NDIS modules)` after the version check and whenever the count changes, checking at the `--poll` interval (default 1000 ms). This is the driver's live attachment/running-state count, not the number of configured or enabled bindings. A loaded driver can report zero. Status lines honor `--out` and `--timestamps`. If the installed SYS lacks the new IOCTL or a query fails, the monitor warns that the count is unavailable rather than reporting zero; monitoring continues and later polls retry.
 
@@ -72,7 +74,7 @@ Stop the monitor, then run from an elevated console:
 ./dist/Uninstall.exe
 ```
 
-Only HyperVGuard is removed. If removal returns **3010**, reboot before reinstalling. No manual SCM service creation or deletion is needed.
+Only HyperVXNdisFilter is removed. If removal returns **3010**, reboot before reinstalling. No manual SCM service creation or deletion is needed.
 
 ## API
 
@@ -94,7 +96,7 @@ This is experimental kernel code. Offline tests and an enabled binding do not pr
 
 ### Device session and IOCTLs
 
-Open **`\\.\HyperVGuard`** as Administrator/SYSTEM with `GENERIC_READ | GENERIC_WRITE`, `OPEN_EXISTING`, and exclusive sharing. The C++ client uses `FILE_FLAG_OVERLAPPED`; nonzero buffered reads wait for event bytes and are cancellable. Only **one controller** may hold the device. There is no named-pipe/winrpc transport.
+Open **`\\.\HyperVXNdisFilter`** as Administrator/SYSTEM with `GENERIC_READ | GENERIC_WRITE`, `OPEN_EXISTING`, and exclusive sharing. The C++ client uses `FILE_FLAG_OVERLAPPED`; nonzero buffered reads wait for event bytes and are cancellable. Only **one controller** may hold the device. There is no named-pipe/winrpc transport.
 
 Opening the device activates a policy session and resets its event queue, permanent cache, and bandwidth buckets. The client must verify the device version before relying on the protocol. `Driver::Open` only opens the session; the monitor separately checks the version.
 
@@ -114,13 +116,13 @@ Reads return an event byte stream, at most **65536 bytes per driver read**. A no
 
 ### Driver-start notification
 
-`Global\HyperVGuard.DriverReady` (kernel name `\BaseNamedObjects\HyperVGuard.DriverReady`) is a named manual-reset event, separate from the device byte stream and IOCTLs. New objects allow access only to Administrator/SYSTEM. At startup, after initializing the control device and timer, the driver creates/opens the event, signals it, and keeps its handle until unload; unload clears the event and closes the handle. This requires the updated SYS, not just the monitor. Event creation is best-effort if the global object directory is not yet available during early system boot; device initialization does not depend on notification success.
+`Global\HyperVXNdisFilter.DriverReady` (kernel name `\BaseNamedObjects\HyperVXNdisFilter.DriverReady`) is a named manual-reset event, separate from the device byte stream and IOCTLs. New objects allow access only to Administrator/SYSTEM. At startup, after initializing the control device and timer, the driver creates/opens the event, signals it, and keeps its handle until unload; unload clears the event and closes the handle. This requires the updated SYS, not just the monitor. Event creation is best-effort if the global object directory is not yet available during early system boot; device initialization does not depend on notification success.
 
 Only the console monitor's **unlimited mode** uses startup waiting. It first tries `Driver::Open`. On failure it creates/opens the event, clears it **before** retrying the device, and waits only if that retry also fails. A signal causes another reset/retry; a stale signal cannot cause a busy loop. Wait timeouts check Ctrl+C at 100 ms intervals without polling the device. A signal is only a retry hint, not proof of successful NDIS attachment, device authorization, compatible version or packet interception. The monitor never installs or loads the LWF while waiting; another application releasing an exclusive device handle does not itself generate a startup signal. No automatic reconnect is added after an established session ends.
 
 ### C++ client methods
 
-Construct `Driver(std::wstring service_name = L"HyperVGuard")`; the argument selects the device basename, not a service to create. The class is non-copyable. Boolean methods report failures through `std::string& error`; sending a request does not imply a synchronous event response or confirmation that a verdict was applied.
+Construct `Driver(std::wstring service_name = L"HyperVXNdisFilter")`; the argument selects the device basename, not a service to create. The class is non-copyable. Boolean methods report failures through `std::string& error`; sending a request does not imply a synchronous event response or confirmation that a verdict was applied.
 
 | Method | Contract |
 |---|---|
@@ -143,13 +145,13 @@ A typical integration opens the device, checks its version, installs handlers, a
 
 ### Lightweight header-only client
 
-[HyperVGuard.hpp](monitor/include/HyperVGuard.hpp) provides the separate **`hypervguard::Client`** namespace/API. Include just that file in a Windows x64 **C++20** application; no `pmkext` sources, codec, or client library are needed. It uses Kernel32 and Advapi32 (MSVC links Advapi32 through the header's pragma; other toolchains must link it explicitly). A compiled example is [callback_client.cpp](monitor/examples/callback_client.cpp), built as `build/monitor/callback_client.exe`. The example opens a real device if explicitly run; offline tests never run it.
+[HyperVXNdisFilter.hpp](monitor/include/HyperVXNdisFilter.hpp) provides the separate **`hypervxndisfilter::Client`** namespace/API. Include just that file in a Windows x64 **C++20** application; no `pmkext` sources, codec, or client library are needed. It uses Kernel32 and Advapi32 (MSVC links Advapi32 through the header's pragma; other toolchains must link it explicitly). A compiled example is [callback_client.cpp](monitor/examples/callback_client.cpp), built as `build/monitor/callback_client.exe`. The example opens a real device if explicitly run; offline tests never run it.
 
 `Run` uses one caller-owned thread: it blocks on overlapped read completion, Stop, or an optional runtime deadline. There is no second reader/poll thread, idle read polling, automatic statistics timer, or automatic verdict. The receive buffer is allocated once per Run; reads go directly into it. Connection headers, payloads, bandwidth arrays and log-message views borrow that storage: no per-event structure reconstruction, allocation or payload copy. Bandwidth dispatch calls once per nonempty record, not once per tuple. A head/tail cursor retains partial frames in place; compaction happens only when the writable tail is short, not after every read. Callback function pointers plus a `void*` context avoid type-erasure/capture allocations. Copy the actual data (not just its pointer) if it must outlive the callback. This minimizes idle wakeups and hot-path work, not a measured guarantee of zero CPU usage.
 
 | Method | Contract (`DWORD`: 0 is success, otherwise a Win32 error) |
 |---|---|
-| `Open()` | Tries the existing exclusive Administrator/SYSTEM device. After an open failure, creates/opens the protected `Global\HyperVGuard.DriverReady` event, resets it before retrying, then waits **indefinitely**, without device polling or a startup timeout. A signal only requests a retry. `Stop()` cancels this wait with `ERROR_OPERATION_ABORTED`. Never installs/loads the driver. Requires version `{0,3,1,0}` after opening; version/I/O errors are returned rather than treated as startup signals. |
+| `Open()` | Tries the existing exclusive Administrator/SYSTEM device. An exclusive-device `ERROR_SHARING_VIOLATION` is returned immediately on any attempt; the caller may retry after the other controller releases its handle. After any other open failure, creates/opens the protected `Global\HyperVXNdisFilter.DriverReady` event, resets it before retrying, then waits **indefinitely**, without device polling or a startup timeout. A signal only requests a retry. `Stop()` cancels this wait with `ERROR_OPERATION_ABORTED`. Never installs/loads the driver. Requires version `{0,3,1,0}` after opening; version/I/O errors are returned rather than treated as startup signals. |
 | `Run(const Callbacks&, DWORD duration_ms = INFINITE)` | Blocking callback dispatch on the calling thread. A positive duration limits monitoring only, **not Open's unlimited startup wait**; zero is invalid. Stop/runtime expiry returns success after cancelling/reaping the outstanding read. Unexpected zero-byte reads are an error, not a retry loop. Callback exceptions propagate after pending I/O is reaped. |
 | `Stop()` | Thread-safe local stop, usable during Open/Run; wakes the wait. Does not itself shut down policy, close handles or unload the LWF. |
 | `Close()` | Returns `ERROR_BUSY` during Run. Otherwise closes handles; device cleanup disconnects policy and releases pending packets through fallback. Join Run and all other callers before Close/destruction. |
@@ -319,4 +321,4 @@ Empty/oversized/truncated writes are rejected with `STATUS_INVALID_PARAMETER`; u
 
 ## License
 
-Copyright (c) 2026 HyperV Guard contributors. Licensed under **GNU General Public License version 3 only** (`GPL-3.0-only`); see [LICENSE](LICENSE). The adapted monitor retains its original GPLv3 license and source-provenance notices; see [monitor/README.md](monitor/README.md) and [monitor/LICENSE](monitor/LICENSE).
+Copyright (c) 2026 HyperVXNdisFilter contributors. Licensed under **GNU General Public License version 3 only** (`GPL-3.0-only`); see [LICENSE](LICENSE). The adapted monitor retains its original GPLv3 license and source-provenance notices; see [monitor/README.md](monitor/README.md) and [monitor/LICENSE](monitor/LICENSE).

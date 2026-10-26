@@ -17,7 +17,7 @@ using pmkext::monitor::StartupResult;
 
 std::wstring UniqueName() {
     static unsigned sequence = 0;
-    return L"Local\\HyperVGuard.StartupTests." + std::to_wstring(GetCurrentProcessId()) +
+    return L"Local\\HyperVXNdisFilter.StartupTests." + std::to_wstring(GetCurrentProcessId()) +
            L"." + std::to_wstring(++sequence);
 }
 

@@ -6,7 +6,7 @@ param(
     [string]$CertificateThumbprint,
     [string]$PfxPath,
     [string]$RootCertificate,
-    [string]$PfxPassword = $(if ($env:HYPERVGUARD_PFX_PASSWORD) { $env:HYPERVGUARD_PFX_PASSWORD } else { '1' })
+    [string]$PfxPassword = $(if ($env:HYPERVXNDISFILTER_PFX_PASSWORD) { $env:HYPERVXNDISFILTER_PFX_PASSWORD } else { '1' })
 )
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
@@ -41,16 +41,16 @@ try {
     $object = Join-Path $build 'ndis_shim.obj'
     & cl.exe /nologo /c /TC /O2 /W4 /WX /wd4324 /GS /kernel /Zl /Zi /D_AMD64_ /DAMD64 /DNDIS640 /DNDIS_SUPPORT_NDIS640=1 /D_WIN64 /DWINVER=0x0A00 /D_WIN32_WINNT=0x0A00 /DNTDDI_VERSION=0x0A00000C "/I$include\km" "/I$include\shared" "/I$include\ucrt" "/Fo$object" "/Fd$build\shim.pdb" "$root\driver\shim\ndis_shim.c"
     if ($LASTEXITCODE) { throw 'WDK ABI shim compilation failed.' }
-    & link.exe /NOLOGO /DRIVER /SUBSYSTEM:NATIVE,10.00 /ENTRY:GsDriverEntry /MACHINE:X64 /MANIFEST:NO /NODEFAULTLIB /INCREMENTAL:NO /INTEGRITYCHECK /DYNAMICBASE /NXCOMPAT /OPT:REF /OPT:ICF /DEBUG:FULL /RELEASE "/OUT:$dist\HyperVGuard.sys" "/PDB:$dist\HyperVGuard.pdb" $object "$root\target\x86_64-pc-windows-msvc\release\hyperv_driver.lib" "$lib\ndis.lib" "$lib\netio.lib" "$lib\ntoskrnl.lib" "$lib\hal.lib" "$lib\BufferOverflowK.lib"
+    & link.exe /NOLOGO /DRIVER /SUBSYSTEM:NATIVE,10.00 /ENTRY:GsDriverEntry /MACHINE:X64 /MANIFEST:NO /NODEFAULTLIB /INCREMENTAL:NO /INTEGRITYCHECK /DYNAMICBASE /NXCOMPAT /OPT:REF /OPT:ICF /DEBUG:FULL /RELEASE "/OUT:$dist\HyperVXNdisFilter.sys" "/PDB:$dist\HyperVXNdisFilter.pdb" $object "$root\target\x86_64-pc-windows-msvc\release\hyperv_driver.lib" "$lib\ndis.lib" "$lib\netio.lib" "$lib\ntoskrnl.lib" "$lib\hal.lib" "$lib\BufferOverflowK.lib"
     if ($LASTEXITCODE) { throw 'Kernel image link failed.' }
     $cmake = Join-Path $vs 'Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe'
     $ninja = Join-Path $vs 'Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe'
     & $cmake -S "$root\monitor" -B "$build\monitor" -G Ninja "-DCMAKE_MAKE_PROGRAM=$ninja" -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
     if ($LASTEXITCODE) { throw 'User-mode CMake configuration failed.' }
-    if ($SkipMonitor) { & $cmake --build "$build\monitor" --target hyperv_guard_notify hyperv_Install hyperv_Uninstall }
+    if ($SkipMonitor) { & $cmake --build "$build\monitor" --target hyperv_xndis_filter_notify hyperv_Install hyperv_Uninstall }
     else { & $cmake --build "$build\monitor" }
     if ($LASTEXITCODE) { throw 'User-mode build failed.' }
-    Copy-Item "$build\monitor\HyperVGuardNotify.dll" $dist -Force
+    Copy-Item "$build\monitor\HyperVXNdisFilterNotify.dll" $dist -Force
     foreach ($tool in @('Install.exe', 'Uninstall.exe')) { Copy-Item (Join-Path "$build\monitor" $tool) $dist -Force }
     if (!$SkipMonitor) {
         Copy-Item "$build\monitor\hyperv_monitor.exe" $dist -Force
@@ -59,7 +59,7 @@ try {
             if ($LASTEXITCODE) { throw 'Offline user-mode tests failed.' }
         }
     }
-    Copy-Item "$root\install\HyperVGuard.inf" $dist -Force
+    Copy-Item "$root\install\HyperVXNdisFilter.inf" $dist -Force
     if ($CertificateThumbprint -and $PfxPath) { throw 'Choose a PFX or a certificate-store thumbprint, not both.' }
     $signArgs = @('sign', '/fd', 'SHA256')
     $sign = $CertificateThumbprint -or $PfxPath
@@ -71,7 +71,7 @@ try {
     if ($sign) {
         # Local signing only: no timestamp request, key copy, certificate import
         # or boot/security policy change. The PFX remains at the supplied path.
-        foreach ($file in @('HyperVGuard.sys', 'HyperVGuardNotify.dll', 'Install.exe', 'Uninstall.exe')) {
+        foreach ($file in @('HyperVXNdisFilter.sys', 'HyperVXNdisFilterNotify.dll', 'Install.exe', 'Uninstall.exe')) {
             & "$bin\signtool.exe" @signArgs (Join-Path $dist $file)
             if ($LASTEXITCODE) { throw "Signing failed: $file" }
         }
@@ -93,14 +93,14 @@ try {
     & "$catalogTools\Inf2Cat.exe" "/driver:$dist" /os:10_X64 /uselocaltime
     if ($LASTEXITCODE) { throw 'Inf2Cat package validation failed.' }
     if ($sign) {
-        & "$bin\signtool.exe" @signArgs "$dist\HyperVGuard.cat"
+        & "$bin\signtool.exe" @signArgs "$dist\HyperVXNdisFilter.cat"
         if ($LASTEXITCODE) { throw 'Catalog signing failed.' }
-        foreach ($file in @('HyperVGuard.sys', 'HyperVGuardNotify.dll', 'HyperVGuard.cat', 'Install.exe', 'Uninstall.exe')) {
+        foreach ($file in @('HyperVXNdisFilter.sys', 'HyperVXNdisFilterNotify.dll', 'HyperVXNdisFilter.cat', 'Install.exe', 'Uninstall.exe')) {
             & "$bin\signtool.exe" verify /pa (Join-Path $dist $file)
             if ($LASTEXITCODE) { throw "Authenticode verification failed: $file (not a kernel admission test)." }
         }
-        foreach ($file in @('HyperVGuard.sys', 'HyperVGuardNotify.dll', 'HyperVGuard.inf')) {
-            & "$bin\signtool.exe" verify /pa /c "$dist\HyperVGuard.cat" (Join-Path $dist $file)
+        foreach ($file in @('HyperVXNdisFilter.sys', 'HyperVXNdisFilterNotify.dll', 'HyperVXNdisFilter.inf')) {
+            & "$bin\signtool.exe" verify /pa /c "$dist\HyperVXNdisFilter.cat" (Join-Path $dist $file)
             if ($LASTEXITCODE) { throw "Catalog membership verification failed: $file" }
         }
     }
@@ -109,7 +109,7 @@ try {
         & cargo test --release -p hyperv-protocol -p hyperv-policy --locked
         if ($LASTEXITCODE) { throw 'Offline Rust tests failed.' }
     }
-    Write-Host "Built $dist (no driver was installed, loaded or bound; notify COM was not registered)."
+    Write-Host "Built $dist (HyperVXNdisFilter.sys; no driver was installed, loaded or bound; notify COM was not registered)."
     if (!$sign) { Write-Warning 'SYS, notify DLL, CAT and setup tools are unsigned. Driver package signatures must be trusted before installation.' }
 } finally {
     $env:RUSTFLAGS = $oldFlags

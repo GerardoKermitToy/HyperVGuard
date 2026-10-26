@@ -5,7 +5,7 @@
 #define CHECK(expression) do { if (!(expression)) { \
     std::fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #expression); return 1; } } while (false)
 int main() {
-    using hyperv_guard::BindingDecision;
+    using hyperv_xndis_filter::BindingDecision;
     CHECK(NETCFG_S_DISABLE_QUERY == static_cast<HRESULT>(0x0004a022));
     for (DWORD flags : {DWORD(NCN_ADD), DWORD(NCN_ENABLE), DWORD(NCN_ADD | NCN_ENABLE),
                         DWORD(NCN_UPDATE | NCN_ENABLE)}) {

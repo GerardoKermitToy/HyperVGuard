@@ -71,7 +71,7 @@ if(NOT result STREQUAL "0" OR NOT output MATCHES "direction=0 outbound, 1 inboun
    NOT output MATCHES "up to 1 MiB, no truncation" OR
    NOT output MATCHES "Connection events carry no process/thread identity" OR
    output MATCHES "--filter-pid|PID=0|possibly shortened" OR
-   output MATCHES "HyperVGuardPipe|Bridge:|winrpc|named-pipe" OR
+   output MATCHES "HyperVXNdisFilterPipe|Bridge:|winrpc|named-pipe" OR
    output MATCHES "Opening explicitly installed|Driver version")
     message(FATAL_ERROR "Help did not stay on the no-device path: ${result}: ${output}${errors}")
 endif()

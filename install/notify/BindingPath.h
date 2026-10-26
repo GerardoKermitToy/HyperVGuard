@@ -9,7 +9,7 @@
 #include <vector>
 #include <utility>
 
-namespace hyperv_guard {
+namespace hyperv_xndis_filter {
 
 struct BindingPathIdentity {
     bool owns_path = false;
@@ -139,4 +139,4 @@ inline HRESULT InspectBindingPath(INetCfgBindingPath* path, const GUID& filter,
     }
 }
 
-} // namespace hyperv_guard
+} // namespace hyperv_xndis_filter
