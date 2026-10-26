@@ -42,6 +42,7 @@ int Enable(System& system, const Adapter& target) {
     ValidateBindings(system.ReadBindings(), target, false, true);
     RevalidateTarget(system, target);
     system.VerifyConfiguration(target);
+    system.AllowRuntimeRecovery();
     system.Print(L"HyperVXNdisFilter is enabled only on the exact Default Switch host vNIC.\n");
     return 0;
 }

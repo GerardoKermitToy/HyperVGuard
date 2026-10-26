@@ -275,6 +275,9 @@ public:
         CheckWin32(RegCreateKeyExW(HKEY_LOCAL_MACHINE, kConfigKey, 0, nullptr, 0,
                                   kDurableConfigAccess, nullptr, &key.value, nullptr), L"Create target configuration");
         const DWORD disarmed = 0, version = 2;
+        CheckWin32(RegSetValueExW(key.value, L"AutoRepairAllowed", 0, REG_DWORD,
+                                 reinterpret_cast<const BYTE*>(&disarmed), sizeof(disarmed)), L"Block runtime recovery during installation");
+        CheckWin32(RegFlushKey(key.value), L"Persist installer-controlled recovery state");
         CheckWin32(RegSetValueExW(key.value, L"AllowBindings", 0, REG_DWORD,
                                  reinterpret_cast<const BYTE*>(&disarmed), sizeof(disarmed)), L"Disarm bindings before installation");
         const auto guid = GuidText(target.guid);
@@ -295,6 +298,9 @@ public:
         if (result == ERROR_FILE_NOT_FOUND || result == ERROR_PATH_NOT_FOUND) return;
         CheckWin32(result, L"Open target configuration for disarm");
         const DWORD disarmed = 0;
+        CheckWin32(RegSetValueExW(key.value, L"AutoRepairAllowed", 0, REG_DWORD,
+                                 reinterpret_cast<const BYTE*>(&disarmed), sizeof(disarmed)), L"Block runtime recovery during setup");
+        CheckWin32(RegFlushKey(key.value), L"Persist installer-controlled recovery state");
         CheckWin32(RegSetValueExW(key.value, L"AllowBindings", 0, REG_DWORD,
                                  reinterpret_cast<const BYTE*>(&disarmed), sizeof(disarmed)), L"Disarm HyperVXNdisFilter bindings");
         CheckWin32(RegFlushKey(key.value), L"Persist disarmed target configuration");
@@ -306,6 +312,15 @@ public:
         const DWORD allowed = 1;
         CheckWin32(RegSetValueExW(key.value, L"AllowBindings", 0, REG_DWORD,
                                  reinterpret_cast<const BYTE*>(&allowed), sizeof(allowed)), L"Arm the exact target binding");
+    }
+
+    void AllowRuntimeRecovery() override {
+        RegistryKey key;
+        CheckWin32(RegOpenKeyExW(HKEY_LOCAL_MACHINE, kConfigKey, 0, kDurableConfigAccess, &key.value), L"Open completed configuration");
+        const DWORD allowed = 1;
+        CheckWin32(RegSetValueExW(key.value, L"AutoRepairAllowed", 0, REG_DWORD,
+                                 reinterpret_cast<const BYTE*>(&allowed), sizeof(allowed)), L"Allow runtime recovery after successful setup");
+        CheckWin32(RegFlushKey(key.value), L"Persist completed configuration");
     }
 
     Change InstallComponent(const std::filesystem::path&) override {

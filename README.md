@@ -4,7 +4,7 @@ Experimental Rust-based **NDIS Lightweight Filter (LWF)** and a C++ monitor with
 
 Driver package and device API: **0.3.1.0**. Nonzero reads now wait for event data and support cancellation. The PID-free, complete-IP-packet Connection layouts from 0.3.0.0 are unchanged. Use a matching SYS and monitor; the monitor rejects older device versions.
 
-Only traffic passing through the host vNIC is covered; VM-to-VM traffic is not guaranteed to be visible. The installer and kernel check the exact adapter GUID/NET_LUID, not its display name. If Windows recreates the adapter with a new identity, explicitly uninstall and reinstall.
+Only traffic passing through the host vNIC is covered; VM-to-VM traffic is not guaranteed to be visible. The installer and kernel check the exact adapter GUID/NET_LUID, not its display name. The standalone setup tools do not automatically retarget a recreated adapter. A compatible controller can perform validated target-only recovery as described below; otherwise explicitly uninstall and reinstall.
 
 ## Build
 
@@ -37,6 +37,12 @@ If installation returns **3010**, reboot, then resume explicitly:
 ```bash
 ./dist/Install.exe --enable
 ```
+
+### Controller-managed binding recovery
+
+`HKLM\SOFTWARE\HyperVXNdisFilter\Lwf` separates current attach admission (`AllowBindings`) from permission for runtime repair (`AutoRepairAllowed`). Setup durably writes `AutoRepairAllowed=0` before installation, resume or removal and publishes `1` only after the exact target paths have enabled successfully. A failed setup or a requested reboot remains installer-controlled; complete the reboot and explicit resume instead of overriding these flags.
+
+A compatible controller such as FirewallX can use `AutoRepairAllowed=1` to retry a transient runtime failure, including `AllowBindings=0`, or refresh a recreated Default Switch host-vNIC GUID/LUID. It must resolve the switch through Hyper-V topology, hold the NetCfg write lock, refuse enabled foreign paths, disarm and disable only the target paths before updating identity, and revalidate before exact-target enable. A NetCfg reboot request must block subsequent automatic repair. Legacy installations without this flag are not permission to override an already disarmed configuration. Kernel GUID/LUID and notify-object gates remain unchanged; no new service is needed. NetCfg enabled state alone is not proof of a running NDIS module.
 
 ## Monitor
 

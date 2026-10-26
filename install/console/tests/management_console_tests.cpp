@@ -44,7 +44,7 @@ public:
     std::string fail;
     size_t fail_on_occurrence = 1;
     bool appear_after_confirm = false, remove_fails = false;
-    bool service = false, component = false, config = false, allowed = false;
+    bool service = false, component = false, config = false, allowed = false, recovery = false;
     bool consent = true, foreign_enabled = false, target_enabled_on_install = false;
     bool change_luid_after_install = false, change_target_after_confirm = false;
     bool enable_has_effect = true, disable_has_effect = true, leave_service = false;
@@ -80,12 +80,17 @@ public:
     void LockNetwork() override { Step("lock"); }
     void WriteDisarmedConfiguration(const Adapter& adapter) override {
         config = true;
-        allowed = false;
+        allowed = recovery = false;
         configured = adapter;
         Step("write-disarmed");
     }
-    void DisarmIfPresent() override { Step("disarm"); if (config) allowed = false; }
+    void DisarmIfPresent() override { Step("disarm"); if (config) allowed = recovery = false; }
     void AllowBindings() override { allowed = true; Step("arm"); }
+    void AllowRuntimeRecovery() override {
+        Require(config && allowed, "recovery requires completed armed configuration");
+        ValidateBindings(bindings, configured, false, true);
+        recovery = true; Step("ready");
+    }
     Change InstallComponent(const std::filesystem::path&) override {
         Require(config && !allowed, "NetCfg must never install armed");
         component = service = true;
@@ -122,7 +127,7 @@ public:
         }
         return enable_result;
     }
-    void DeleteConfiguration() override { Step("delete-config"); config = allowed = false; }
+    void DeleteConfiguration() override { Step("delete-config"); config = allowed = recovery = false; }
 
     bool Called(const char* name) const { return std::find(calls.begin(), calls.end(), name) != calls.end(); }
     size_t At(const char* name) const {
@@ -131,7 +136,7 @@ public:
         return static_cast<size_t>(found - calls.begin());
     }
     void RequireNoMutation() const {
-        for (const auto name : {"lock", "write-disarmed", "disarm", "arm", "install", "disable", "enable", "remove", "delete-config"}) {
+        for (const auto name : {"lock", "write-disarmed", "disarm", "arm", "ready", "install", "disable", "enable", "remove", "delete-config"}) {
             Require(!Called(name), "unexpected mutation in read-only path");
         }
     }
@@ -235,7 +240,8 @@ int main() {
             Require(system.At("install") < system.At("verify-config"));
             Require(system.At("verify-config") < system.At("arm"));
             Require(system.At("arm") < system.At("enable"));
-            Require(system.component && system.service && system.config && system.allowed);
+            Require(system.At("enable") < system.At("ready"));
+            Require(system.component && system.service && system.config && system.allowed && system.recovery);
             Require(system.bindings[0].enabled && !system.bindings[1].enabled);
             Require(!system.Called("remove"));
         }},
@@ -330,10 +336,10 @@ int main() {
             Require(system.Called("remove") && !system.Called("arm"));
         }},
         {"arming and enable errors disarm and roll back fresh installs", [] {
-            for (const auto stage : {"arm", "enable"}) {
+            for (const auto stage : {"arm", "enable", "ready"}) {
                 FakeSystem system; system.fail = stage;
                 Throws([&] { Execute(Install(), system); }, L"injected");
-                Require(system.Called("disarm") && system.Called("remove") && !system.allowed);
+                Require(system.Called("disarm") && system.Called("remove") && !system.allowed && !system.recovery);
             }
         }},
         {"a binding that did not enable is never silently accepted", [] {
@@ -368,13 +374,32 @@ int main() {
         {"resume enables only existing target without reinstalling", [] {
             FakeSystem system; system.Installed();
             Require(Execute(Enable(), system) == 0);
-            Require(system.allowed && system.bindings[0].enabled && !system.bindings[1].enabled);
+            Require(system.allowed && system.recovery && system.bindings[0].enabled && !system.bindings[1].enabled);
+            Require(system.At("enable") < system.At("ready"));
             Require(!system.Called("write-disarmed") && !system.Called("package") && !system.Called("install"));
         }},
         {"failed resume disarms but never removes an existing installation", [] {
             FakeSystem system; system.Installed(); system.fail = "enable";
             Throws([&] { Execute(Enable(), system); }, L"injected");
             Require(system.component && system.config && !system.allowed && !system.Called("remove"));
+        }},
+        {"resume failures and reboot block previously permitted runtime recovery", [] {
+            for (const bool reboot : {false, true}) {
+                FakeSystem system; system.Installed(); system.allowed = system.recovery = true;
+                if (reboot) system.enable_result = Change::RebootRequired;
+                else system.fail = "ready";
+                if (reboot) Require(Execute(Enable(), system) == kRebootRequired);
+                else Throws([&] { Execute(Enable(), system); }, L"injected");
+                Require(system.component && system.config && !system.allowed && !system.recovery && !system.Called("remove"));
+                if (reboot) Require(!system.Called("ready"));
+            }
+        }},
+        {"removal requiring reboot blocks runtime recovery before removing", [] {
+            FakeSystem system; system.Installed(); system.allowed = system.recovery = true;
+            system.remove_result = Change::RebootRequired;
+            Require(Execute(Uninstall(), system) == kRebootRequired);
+            Require(!system.allowed && !system.recovery && system.config && !system.Called("ready"));
+            Require(system.At("disarm") < system.At("remove"));
         }},
         {"uninstall disarms then removes own component and configuration", [] {
             FakeSystem system; system.Installed(); system.allowed = true;
