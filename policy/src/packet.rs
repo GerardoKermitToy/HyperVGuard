@@ -197,8 +197,13 @@ pub fn parse(
             return Err(ParseError::Malformed);
         }
         let payload = usize::from(be16(ip, 4));
-        let total = if payload == 0 || offload {
+        // This bounded parser does not decode the Jumbo Payload option. For a
+        // non-offload zero length, keep only the base header so Ethernet padding
+        // cannot be mistaken for transport data; offload keeps its logical length.
+        let total = if offload {
             logical
+        } else if payload == 0 {
+            40
         } else {
             40 + payload
         };
@@ -337,6 +342,31 @@ mod tests {
                 assert!(!offload.cacheable);
             }
         }
+    }
+    #[test]
+    fn ipv6_zero_payload_is_rejected_without_offload() {
+        let mut b = [0; 64];
+        b[12..14].copy_from_slice(&0x86ddu16.to_be_bytes());
+        b[14] = 0x60;
+        b[20] = 17;
+        b[22..38].copy_from_slice(&[0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        b[38..54].copy_from_slice(&[0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+        b[54..56].copy_from_slice(&1234u16.to_be_bytes());
+        b[56..58].copy_from_slice(&53u16.to_be_bytes());
+        b[58..60].copy_from_slice(&8u16.to_be_bytes());
+        assert_eq!(
+            parse(&b, b.len(), b.len(), false).unwrap_err(),
+            ParseError::Malformed
+        );
+        let offload = parse(&b, b.len(), b.len(), true).unwrap().unwrap();
+        assert_eq!(offload.payload_len, 50);
+        assert!(!offload.cacheable);
+
+        b[20] = 59; // No Next Header: a valid empty IPv6 payload.
+        let empty = parse(&b, b.len(), b.len(), false).unwrap().unwrap();
+        assert_eq!(empty.payload_len, 40);
+        assert_eq!(empty.flow.protocol, 59);
+        assert!(!empty.cacheable);
     }
     #[test]
     fn homogeneous_batch_has_no_nb_quota_and_preserves_first_payload() {
