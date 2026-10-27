@@ -7,6 +7,10 @@
     std::fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #expression); return 1; } } while (false)
 
 int main() {
+    CHECK(HvIoctlInputEmpty(0));
+    CHECK(!HvIoctlInputEmpty(1));
+    CHECK(!HvIoctlInputEmpty(~0ul));
+
     CHECK(!HvTargetMatches(0, 0));
     CHECK(!HvTargetMatches(0, 123));
     CHECK(!HvTargetMatches(123, 0));

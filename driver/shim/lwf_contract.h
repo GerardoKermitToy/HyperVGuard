@@ -23,6 +23,9 @@ typedef enum _HV_FINISH_ROUTE {
 static int HvTargetMatches(unsigned long long target, unsigned long long actual) {
     return target != 0 && target == actual;
 }
+static int HvIoctlInputEmpty(unsigned long inputLength) {
+    return inputLength == 0;
+}
 // Caller holds the adapter lock and adds the returned delta to the global count.
 static int HvSetFilterRunning(unsigned char* state, int running) {
     int previous = *state != 0;

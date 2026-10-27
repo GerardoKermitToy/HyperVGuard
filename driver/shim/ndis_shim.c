@@ -933,11 +933,15 @@ NTSTATUS HvDispatch(PDEVICE_OBJECT device, PIRP irp) {
         } else if (stack->MajorFunction == IRP_MJ_DEVICE_CONTROL) {
             ULONG code = stack->Parameters.DeviceIoControl.IoControlCode;
             if (code == VERSION_IOCTL) {
-                if (stack->Parameters.DeviceIoControl.OutputBufferLength < sizeof(HV_API_VERSION)) status = STATUS_BUFFER_TOO_SMALL;
+                if (!HvIoctlInputEmpty(stack->Parameters.DeviceIoControl.InputBufferLength)) status = STATUS_INVALID_PARAMETER;
+                else if (stack->Parameters.DeviceIoControl.OutputBufferLength < sizeof(HV_API_VERSION)) status = STATUS_BUFFER_TOO_SMALL;
                 else {RtlCopyMemory(irp->AssociatedIrp.SystemBuffer, HV_API_VERSION, sizeof(HV_API_VERSION)); transferred = sizeof(HV_API_VERSION);}
-            } else if (code == SHUTDOWN_IOCTL) {HvDisconnect(); cancelReads = TRUE;}
+            } else if (code == SHUTDOWN_IOCTL) {
+                if (!HvIoctlInputEmpty(stack->Parameters.DeviceIoControl.InputBufferLength)) status = STATUS_INVALID_PARAMETER;
+                else {HvDisconnect(); cancelReads = TRUE;}
+            }
             else if (code == FILTERED_DEVICE_COUNT_IOCTL) {
-                if (stack->Parameters.DeviceIoControl.InputBufferLength != 0) status = STATUS_INVALID_PARAMETER;
+                if (!HvIoctlInputEmpty(stack->Parameters.DeviceIoControl.InputBufferLength)) status = STATUS_INVALID_PARAMETER;
                 else if (stack->Parameters.DeviceIoControl.OutputBufferLength < sizeof(ULONG)) status = STATUS_BUFFER_TOO_SMALL;
                 else if (irp->AssociatedIrp.SystemBuffer == NULL) status = STATUS_INVALID_PARAMETER;
                 else {
@@ -949,7 +953,7 @@ NTSTATUS HvDispatch(PDEVICE_OBJECT device, PIRP irp) {
                     }
                 }
             } else if (code == ADAPTER_INFO_IOCTL) {
-                if (stack->Parameters.DeviceIoControl.InputBufferLength != 0) status = STATUS_INVALID_PARAMETER;
+                if (!HvIoctlInputEmpty(stack->Parameters.DeviceIoControl.InputBufferLength)) status = STATUS_INVALID_PARAMETER;
                 else status = QueryAdapterInfo(irp->AssociatedIrp.SystemBuffer,
                     stack->Parameters.DeviceIoControl.OutputBufferLength, &transferred);
             } else status = STATUS_NOT_SUPPORTED;
