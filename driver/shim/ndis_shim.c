@@ -1,4 +1,4 @@
-// WDK ABI shim. Rust owns parsing, bounded policy queues, wire API and verdicts.
+// WDK ABI shim. Rust owns parsing, policy queues, wire API and verdicts.
 #include <ntifs.h>
 #include <ndis.h>
 #include <netioapi.h>
@@ -9,8 +9,6 @@
 #define TAG 'gVHH'
 #define CACHE_TAG 'cVHH'
 #define INFO_TAG 'iVHH'
-// Shared by packet records and dynamic policy/NBL ownership metadata.
-#define MAX_EVENT_POOL_BYTES (16u * 1024u * 1024u)
 #define VERSION_IOCTL CTL_CODE(40000, 0x800, METHOD_BUFFERED, FILE_READ_DATA | FILE_WRITE_DATA)
 #define SHUTDOWN_IOCTL CTL_CODE(40000, 0x801, METHOD_BUFFERED, FILE_READ_DATA | FILE_WRITE_DATA)
 #define FILTERED_DEVICE_COUNT_IOCTL CTL_CODE(40000, 0x802, METHOD_BUFFERED, FILE_READ_DATA | FILE_WRITE_DATA)
@@ -24,7 +22,7 @@ typedef struct _HV_TOKEN {
     HV_ADAPTER* Adapter;
     PNET_BUFFER_LIST Nbl;
     NDIS_PORT_NUMBER Port;
-    ULONG Flags, Direction, CopyBytes;
+    ULONG Flags, Direction;
     BOOLEAN Copied, Forwarded;
 } HV_TOKEN;
 struct _HV_ADAPTER {
@@ -36,7 +34,7 @@ struct _HV_ADAPTER {
     HV_ADAPTER_INFO Info; // Protected by AdapterInfoLock; no borrowed NDIS pointers.
     UINT64 Id; // Diagnostic module ID only; policy uses InterfaceIndex.
     UINT64 Active; // Callback guards plus retained/forwarded NBL ownership.
-    ULONG CopyBytes, InterfaceIndex;
+    ULONG InterfaceIndex;
     BOOLEAN Running, PausePending;
 };
 
@@ -73,7 +71,6 @@ static KTIMER PendingTimer, CacheTimer;
 static KDPC PendingTimerDpc, CacheTimerDpc;
 static UCHAR PendingTimerArmed, CacheTimerArmed;
 static volatile LONG64 NextAdapter;
-static volatile LONG64 EventPoolBytes;
 static volatile LONG64 FilteredDeviceCount;
 static NDIS_STRING Friendly = RTL_CONSTANT_STRING(L"HyperVXNdisFilter Rust Host Adapter LWF");
 static NDIS_STRING Unique = RTL_CONSTANT_STRING(L"{6E76EAD1-7BCB-49C4-9547-D3E6B3488F71}");
@@ -98,15 +95,15 @@ FILTER_STATUS HvStatus;
 static BOOLEAN TargetAdapter(PNDIS_FILTER_ATTACH_PARAMETERS p, GUID* interfaceGuid);
 __declspec(noreturn) void hv_bugcheck(void);
 
-// A byte-budgeted cancel-safe queue. NDIS only schedules the reader; buffered
-// copies and IRP completions run outside policy/NDIS locks on a system work item.
+// A cancel-safe queue without an admission quota. NDIS only schedules the reader;
+// a system work item copies bytes in short policy-locked chunks and completes
+// IRPs outside policy/NDIS locks.
 static IO_CSQ ReadCsq;
 static LIST_ENTRY ReadIrps;
 static KSPIN_LOCK ReadLock;
 static PFILE_OBJECT ReadClient;
 static EX_RUNDOWN_REF ReadRundown, CacheRundown;
 static PIO_WORKITEM ReadWorkItem, CacheWorkItem;
-static UINT64 ReadQueueBytes; // Protected by ReadLock; includes original read lengths.
 static volatile LONG ReadPending, ReadReady, ReadOnline, ReadScheduled; // ReadPending is a boolean.
 static volatile LONG CacheScheduled;
 static IO_CSQ_INSERT_IRP_EX ReadInsert;
@@ -118,21 +115,6 @@ static IO_CSQ_COMPLETE_CANCELED_IRP ReadCancelled;
 static IO_WORKITEM_ROUTINE ReadWorker;
 static IO_WORKITEM_ROUTINE CacheWorker;
 
-static BOOLEAN ReadCost(PIRP irp, UINT64* out) {
-    PMDL mdl;
-    UINT64 mdlBytes = 0, cost;
-    for (mdl = irp->MdlAddress; mdl != NULL; mdl = mdl->Next) {
-        UINT64 pages = ((UINT64)MmGetMdlByteOffset(mdl) + MmGetMdlByteCount(mdl) + PAGE_SIZE - 1) / PAGE_SIZE;
-        UINT64 bytes;
-        if (!HvMultiplyU64(pages, sizeof(PFN_NUMBER), &bytes) ||
-            !HvAddU64(bytes, sizeof(MDL), &bytes) || !HvAddU64(mdlBytes, bytes, &mdlBytes)) return FALSE;
-    }
-    if (!HvQueuedReadCost(IoGetCurrentIrpStackLocation(irp)->Parameters.Read.Length,
-        sizeof(IRP), (UCHAR)irp->StackCount, sizeof(IO_STACK_LOCATION), mdlBytes,
-        sizeof(IO_CSQ_IRP_CONTEXT), &cost) || cost > MAXULONG_PTR) return FALSE;
-    *out = cost;
-    return TRUE;
-}
 static void CompleteRead(PIRP irp, NTSTATUS status, ULONG bytes) {
     irp->IoStatus.Status = status;
     irp->IoStatus.Information = bytes;
@@ -144,10 +126,6 @@ static NTSTATUS ReadInsert(PIO_CSQ csq, PIRP irp, PVOID context) {
     UNREFERENCED_PARAMETER(csq); UNREFERENCED_PARAMETER(context);
     if (Stopping || ReadClient != IoGetCurrentIrpStackLocation(irp)->FileObject || !ReadOnline)
         return STATUS_DEVICE_NOT_CONNECTED;
-    // DriverContext[0] keeps the original cost across worker reinsertion. CSQ
-    // owns DriverContext[3]; neither a 64 KiB completion nor removal changes cost.
-    if (!HvReserveBytes(&ReadQueueBytes, (ULONG_PTR)irp->Tail.Overlay.DriverContext[0],
-        HV_MAX_QUEUED_READ_BYTES)) return STATUS_DEVICE_BUSY;
     InsertTailList(&ReadIrps, &irp->Tail.Overlay.ListEntry);
     InterlockedExchange(&ReadPending, 1);
     return STATUS_SUCCESS;
@@ -156,7 +134,6 @@ _Use_decl_annotations_
 static void ReadRemove(PIO_CSQ csq, PIRP irp) {
     UNREFERENCED_PARAMETER(csq);
     RemoveEntryList(&irp->Tail.Overlay.ListEntry);
-    if (!HvReleaseBytes(&ReadQueueBytes, (ULONG_PTR)irp->Tail.Overlay.DriverContext[0])) hv_bugcheck();
     InterlockedExchange(&ReadPending, !IsListEmpty(&ReadIrps));
 }
 _Use_decl_annotations_
@@ -247,7 +224,7 @@ static void ReadWorker(PDEVICE_OBJECT device, PVOID context) {
         if (Stopping || !ReadOnline || Client != IoGetCurrentIrpStackLocation(irp)->FileObject)
             status = STATUS_CANCELLED;
         else bytes = HvRead(irp->AssociatedIrp.SystemBuffer,
-            min(IoGetCurrentIrpStackLocation(irp)->Parameters.Read.Length, 65536));
+            IoGetCurrentIrpStackLocation(irp)->Parameters.Read.Length);
         ExReleaseFastMutex(&IoMutex);
         if (!NT_SUCCESS(status) || bytes != 0) CompleteRead(irp, status, bytes);
         else {
@@ -268,31 +245,16 @@ ULONG_PTR hv_lock(void) {
 }
 void hv_unlock(ULONG_PTR irql) { KeReleaseSpinLock(&PolicyLock, (KIRQL)irql); }
 UINT64 hv_now(void) { return KeQueryInterruptTime() / 10000; }
+// Nonpaged allocations are fallible, with no driver-defined byte budget.
 void* hv_allocate(SIZE_T size) {
-    LONG64 used;
-    void* data;
-    if (size == 0 || size > MAX_EVENT_POOL_BYTES) return NULL;
-    used = InterlockedCompareExchange64(&EventPoolBytes, 0, 0);
-    for (;;) {
-        LONG64 previous;
-        if (used > MAX_EVENT_POOL_BYTES - (LONG64)size) return NULL;
-        previous = InterlockedCompareExchange64(&EventPoolBytes, used + (LONG64)size, used);
-        if (previous == used) break;
-        used = previous;
-    }
-    data = ExAllocatePool2(POOL_FLAG_NON_PAGED | POOL_FLAG_UNINITIALIZED, size, TAG);
-    if (data == NULL) InterlockedAdd64(&EventPoolBytes, -(LONG64)size);
-    return data;
+    if (size == 0) return NULL;
+    return ExAllocatePool2(POOL_FLAG_NON_PAGED | POOL_FLAG_UNINITIALIZED, size, TAG);
 }
 void hv_free(void* data, SIZE_T size) {
-    LONG64 remaining;
+    UNREFERENCED_PARAMETER(size);
     ExFreePoolWithTag(data, TAG);
-    remaining = InterlockedAdd64(&EventPoolBytes, -(LONG64)size);
-    NT_ASSERT(remaining >= 0);
-    UNREFERENCED_PARAMETER(remaining);
 }
-// Cache tables are fallible and independent of the 16 MiB event/capture budget.
-// Rust prepares/zeros and retires them outside PolicyLock; no fixed cache cap.
+// Cache preparation and retirement use a separate allocator outside PolicyLock.
 void* hv_cache_allocate(SIZE_T size) {
     if (size == 0) return NULL;
     return ExAllocatePool2(POOL_FLAG_NON_PAGED | POOL_FLAG_UNINITIALIZED, size, CACHE_TAG);
@@ -319,7 +281,7 @@ static void ReleaseActive(HV_ADAPTER* a, UINT64 count) {
     BOOLEAN complete = FALSE;
     NDIS_HANDLE filter = a->Filter;
     NdisAcquireSpinLock(&a->Lock);
-    if (!HvReleaseBytes(&a->Active, count)) hv_bugcheck();
+    if (!HvSubtractU64(a->Active, count, &a->Active)) hv_bugcheck();
     if (a->Active == 0 && a->PausePending) { a->PausePending = FALSE; complete = TRUE; }
     NdisReleaseSpinLock(&a->Lock);
     // Last access to a: PauseComplete may synchronously cause detach/free.
@@ -349,7 +311,7 @@ static BOOLEAN BeginIo(HV_ADAPTER* a) {
     NdisReleaseSpinLock(&a->Lock);
     return running;
 }
-static void FreeReceiveCopy(HV_ADAPTER* a, PNET_BUFFER_LIST nbl, ULONG bytes) {
+static void FreeReceiveCopy(PNET_BUFFER_LIST nbl) {
     PNET_BUFFER nb = NET_BUFFER_LIST_FIRST_NB(nbl);
     while (nb != NULL) {
         PNET_BUFFER next = NET_BUFFER_NEXT_NB(nb);
@@ -361,10 +323,6 @@ static void FreeReceiveCopy(HV_ADAPTER* a, PNET_BUFFER_LIST nbl, ULONG bytes) {
         nb = next;
     }
     NdisFreeNetBufferList(nbl);
-    NdisAcquireSpinLock(&a->Lock);
-    NT_ASSERT(a->CopyBytes >= bytes);
-    a->CopyBytes -= bytes;
-    NdisReleaseSpinLock(&a->Lock);
 }
 static BOOLEAN CopyMetadataSupported(PNET_BUFFER_LIST nbl) {
     ULONG i;
@@ -386,34 +344,22 @@ static BOOLEAN CopyMetadataSupported(PNET_BUFFER_LIST nbl) {
     }
     return TRUE;
 }
-static PNET_BUFFER_LIST CopyReceive(HV_ADAPTER* a, PNET_BUFFER_LIST source, ULONG* copyBytes) {
+static PNET_BUFFER_LIST CopyReceive(HV_ADAPTER* a, PNET_BUFFER_LIST source) {
     PNET_BUFFER nb, tail = NULL;
     PNET_BUFFER_LIST copy;
-    ULONG bytes = 0, count = 0;
-    if (!CopyMetadataSupported(source)) return NULL;
-    for (nb = NET_BUFFER_LIST_FIRST_NB(source); nb != NULL; nb = NET_BUFFER_NEXT_NB(nb)) {
-        ULONG length = NET_BUFFER_DATA_LENGTH(nb);
-        if (!HvCopyFits(count, bytes, length)) return NULL;
-        bytes += length; ++count;
-    }
-    if (count == 0) return NULL;
-    NdisAcquireSpinLock(&a->Lock);
-    if (!HvCopyPoolFits(a->CopyBytes, bytes)) { NdisReleaseSpinLock(&a->Lock); return NULL; }
-    a->CopyBytes += bytes;
-    NdisReleaseSpinLock(&a->Lock);
+    if (!CopyMetadataSupported(source) || NET_BUFFER_LIST_FIRST_NB(source) == NULL) return NULL;
     copy = NdisAllocateNetBufferList(a->NblPool, 0, 0);
-    if (copy == NULL) {
-        NdisAcquireSpinLock(&a->Lock); a->CopyBytes -= bytes; NdisReleaseSpinLock(&a->Lock);
-        return NULL;
-    }
+    if (copy == NULL) return NULL;
     NET_BUFFER_LIST_FIRST_NB(copy) = NULL;
     NET_BUFFER_LIST_NEXT_NBL(copy) = NULL;
     for (nb = NET_BUFFER_LIST_FIRST_NB(source); nb != NULL; nb = NET_BUFFER_NEXT_NB(nb)) {
         ULONG length = NET_BUFFER_DATA_LENGTH(nb);
-        void* storage = ExAllocatePool2(POOL_FLAG_NON_PAGED, length, TAG);
+        void* storage;
         void* data;
         PMDL mdl;
         PNET_BUFFER created;
+        if (length == 0) goto Fail;
+        storage = ExAllocatePool2(POOL_FLAG_NON_PAGED, length, TAG);
         if (storage == NULL) goto Fail;
         data = NdisGetDataBuffer(nb, length, storage, 1, 0);
         if (data == NULL) { ExFreePoolWithTag(storage, TAG); goto Fail; }
@@ -433,10 +379,9 @@ static PNET_BUFFER_LIST CopyReceive(HV_ADAPTER* a, PNET_BUFFER_LIST source, ULON
         (NDIS_NBL_FLAGS_IS_IPV4 | NDIS_NBL_FLAGS_IS_IPV6 |
          NDIS_NBL_FLAGS_IS_TCP | NDIS_NBL_FLAGS_IS_UDP | NDIS_NBL_FLAGS_IS_LOOPBACK_PACKET);
     copy->SourceHandle = a->Filter;
-    *copyBytes = bytes;
     return copy;
 Fail:
-    FreeReceiveCopy(a, copy, bytes);
+    FreeReceiveCopy(copy);
     return NULL;
 }
 static PLIST_ENTRY TokenBucket(HV_ADAPTER* a, PNET_BUFFER_LIST nbl, ULONG direction) {
@@ -459,15 +404,15 @@ static HV_TOKEN* CreateToken(HV_ADAPTER* a, PNET_BUFFER_LIST nbl, NDIS_PORT_NUMB
     if (!a->Running) { NdisReleaseSpinLock(&a->Lock); return NULL; }
     RetainActiveLocked(a);
     NdisReleaseSpinLock(&a->Lock);
-    // Tokens are dynamic, charged to the same byte budget as policy metadata
-    // and event records. Allocation failure preserves the existing drop path.
+    // Tokens grow fallibly without a count or byte quota.
+    // Allocation failure preserves the existing drop path.
     t = hv_allocate(sizeof(*t));
     if (t == NULL) { ReleaseActive(a, 1); return NULL; }
     RtlZeroMemory(t, sizeof(*t));
     t->Adapter = a; t->Nbl = nbl; t->Port = port; t->Flags = flags;
     t->Direction = direction;
     if (resources) {
-        t->Nbl = CopyReceive(a, nbl, &t->CopyBytes);
+        t->Nbl = CopyReceive(a, nbl);
         if (t->Nbl == NULL) { ReleaseToken(t); return NULL; }
         t->Copied = TRUE;
         // The new storage has no shared-memory/header-split/queue assertions.
@@ -510,7 +455,7 @@ void hv_finish(ULONG_PTR token, ULONG finish) {
         NdisFReturnNetBufferLists(a->Filter, nbl, ReturnFlags());
         break;
     case HvRouteFreeReceive:
-        FreeReceiveCopy(a, nbl, t->CopyBytes);
+        FreeReceiveCopy(nbl);
         break;
     }
     ReleaseToken(t);
@@ -624,7 +569,7 @@ void HvReturn(NDIS_HANDLE context, PNET_BUFFER_LIST chain, ULONG flags) {
         HV_TOKEN* t;
         chain = NET_BUFFER_LIST_NEXT_NBL(nbl); NET_BUFFER_LIST_NEXT_NBL(nbl) = NULL;
         t = TakeForwarded(a, nbl, HV_DIRECTION_RECEIVE);
-        if (t != NULL && t->Copied) FreeReceiveCopy(a, nbl, t->CopyBytes);
+        if (t != NULL && t->Copied) FreeReceiveCopy(nbl);
         else NdisFReturnNetBufferLists(a->Filter, nbl, flags);
         if (t != NULL) ReleaseToken(t);
     }
@@ -942,10 +887,10 @@ _Use_decl_annotations_
 void HvFilterDetach(NDIS_HANDLE context) {
     HV_ADAPTER* a = context;
     KIRQL irql;
-    if (a->Running || a->Active != 0 || !TokensEmpty(a) || a->CopyBytes != 0) hv_bugcheck();
+    if (a->Running || a->Active != 0 || !TokensEmpty(a)) hv_bugcheck();
     KeAcquireSpinLock(&AdapterInfoLock, &irql);
     RemoveEntryList(&a->AdapterLink);
-    if (!HvReleaseBytes(&AdapterCount, 1)) hv_bugcheck();
+    if (!HvSubtractU64(AdapterCount, 1, &AdapterCount)) hv_bugcheck();
     KeReleaseSpinLock(&AdapterInfoLock, irql);
     ExWaitForRundownProtectionRelease(&a->OidRundown);
     HvDetach(a->InterfaceIndex);
@@ -975,17 +920,11 @@ NTSTATUS HvDispatch(PDEVICE_OBJECT device, PIRP irp) {
     default:
         if (Stopping || Client != stack->FileObject) {status = STATUS_DEVICE_NOT_CONNECTED; break;}
         if (stack->MajorFunction == IRP_MJ_READ) {
-            ULONG n = min(stack->Parameters.Read.Length, 65536);
+            ULONG n = stack->Parameters.Read.Length;
             if (n && irp->AssociatedIrp.SystemBuffer == NULL) status = STATUS_INVALID_PARAMETER;
             else if (n != 0) {
-                UINT64 cost;
-                if (!ReadCost(irp, &cost)) status = STATUS_INTEGER_OVERFLOW;
-                else if (!ExAcquireRundownProtection(&ReadRundown)) status = STATUS_DEVICE_NOT_CONNECTED;
-                else {
-                    // Preserve the full requested SystemBuffer cost, not n.
-                    irp->Tail.Overlay.DriverContext[0] = (PVOID)(ULONG_PTR)cost;
-                    queueRead = TRUE;
-                }
+                if (!ExAcquireRundownProtection(&ReadRundown)) status = STATUS_DEVICE_NOT_CONNECTED;
+                else queueRead = TRUE;
             }
         } else if (stack->MajorFunction == IRP_MJ_WRITE) {
             status = HvWrite(irp->AssociatedIrp.SystemBuffer, stack->Parameters.Write.Length);

@@ -147,7 +147,8 @@ bool IsSupportedVerdict(uint8_t verdict) noexcept {
 
 bool ValidateCommands(const uint8_t* bytes, size_t length, std::string& error) {
     if (bytes == nullptr || length == 0 || length > kMaxCommandBatchSize) {
-        error = "command batch must contain 1..65536 bytes";
+        error = "command batch must contain 1.." +
+                std::to_string(kMaxCommandBatchSize) + " bytes";
         return false;
     }
     size_t offset = 0;

@@ -19,7 +19,7 @@ impl<T> Clone for Handle<T> {
 
 // Fallible, fixed-size allocations: growth never relocates live elements or
 // copies an ever-growing array while the driver's policy spin lock is held.
-// The kernel global allocator charges nodes to the existing nonpaged byte budget.
+// The kernel uses fallible nonpaged allocation without an aggregate byte quota.
 pub(crate) struct List<T> {
     head: Option<Handle<T>>,
     tail: Option<Handle<T>>,

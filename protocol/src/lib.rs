@@ -89,9 +89,9 @@ pub enum Error {
     BufferTooSmall,
 }
 
-// Validate the ENTIRE write before applying any command. This also bounds batches.
+// Validate the ENTIRE write before applying any command; only the Windows u32 length bounds it.
 pub fn validate_commands(mut bytes: &[u8]) -> Result<(), Error> {
-    if bytes.is_empty() || bytes.len() > 65536 {
+    if bytes.is_empty() || u32::try_from(bytes.len()).is_err() {
         return Err(Error::Malformed);
     }
     while !bytes.is_empty() {
@@ -442,6 +442,25 @@ mod tests {
         let b = [1, 1, 0, 0, 0, 0, 0, 0, 0, 3, 4, 5, 6, 7, 8];
         assert_eq!(validate_commands(&b), Ok(()));
         assert_eq!(validate_commands(&b[..9]), Err(Error::Malformed));
+    }
+    #[test]
+    fn command_batches_above_64_kib_validate_the_entire_suffix() {
+        for size in [65536, 65537, 1024 * 1024 + 1] {
+            let mut bytes = vec![4; size];
+            assert_eq!(validate_commands(&bytes), Ok(()));
+            bytes.push(99);
+            assert_eq!(validate_commands(&bytes), Err(Error::Unsupported));
+            bytes.pop();
+            bytes.push(1);
+            assert_eq!(validate_commands(&bytes), Err(Error::Malformed));
+        }
+        let verdict = [1, 1, 0, 0, 0, 0, 0, 0, 0, 3];
+        let bytes = verdict.repeat(10000);
+        assert_eq!(validate_commands(&bytes), Ok(()));
+        assert_eq!(
+            validate_commands(&bytes[..bytes.len() - 1]),
+            Err(Error::Malformed)
+        );
     }
     #[test]
     fn validate_complete_batch_before_side_effects() {

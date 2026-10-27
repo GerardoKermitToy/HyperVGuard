@@ -20,7 +20,9 @@ constexpr size_t kConnectionIpv6PrefixSize = 60;
 constexpr size_t kMaxPayloadSize = 1024 * 1024;
 constexpr size_t kMaxRecordSize = kConnectionIpv6PrefixSize + kMaxPayloadSize;
 constexpr size_t kMaxLogRecordSize = 512;
-constexpr size_t kMaxCommandBatchSize = 64 * 1024;
+// Commands are unframed; this is the native Windows DWORD/u32 write length,
+// not a driver-defined or protocol-level 64 KiB cap.
+constexpr size_t kMaxCommandBatchSize = UINT32_MAX;
 constexpr size_t kVerdictCommandSize = 10;
 constexpr std::array<uint8_t, 4> kRequiredDeviceVersion = {0, 3, 2, 0};
 
@@ -64,7 +66,7 @@ bool DispatchRecord(const uint8_t* bytes, size_t length, const Handlers& handler
                     std::string& error);
 
 // Accept arbitrary read boundaries while keeping at most one bounded record
-// on the heap, including packets spanning many <=65536-byte device reads.
+// on the heap; packets may span any number of client read chunks.
 // Oversized headers permanently invalidate the stream: guessing a new boundary
 // would turn arbitrary payload bytes into fabricated events.
 class RecordStream {

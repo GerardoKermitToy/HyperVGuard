@@ -16,7 +16,7 @@ fn fingerprint(hash: u64) -> u8 {
     (hash >> 57) as u8
 }
 
-// Cache storage has its own allocator in the driver, not the packet-record budget.
+// Cache storage has its own fallible allocator for unlocked preparation/retirement.
 #[derive(Clone, Copy)]
 pub struct CacheAllocator {
     allocate: unsafe fn(usize) -> *mut u8,

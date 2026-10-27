@@ -33,6 +33,7 @@ public:
     using Bytes = std::span<const uint8_t>;
     static constexpr size_t MaxPayloadSize = 1'048'576;
     static constexpr size_t MaxRecordSize = MaxPayloadSize + 60;
+    // Streaming buffer choice, not a driver-defined read-size limit.
     static constexpr DWORD ReadSize = 65'536;
     static constexpr std::array<uint8_t, 4> RequiredVersion{0, 3, 2, 0};
     // Four permanent caches per interface: TCP/UDP, each IPv4/IPv6; key=IP+port tuple.

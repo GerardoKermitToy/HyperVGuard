@@ -62,63 +62,19 @@ int main() {
     CHECK(HvSetMaintenanceArmed(&pending_timer, 1) == 1);
     CHECK(HvSetMaintenanceArmed(&pending_timer, 0) == -1);
 
-    CHECK(HvCopyFits(0, 0, 1));
-    CHECK(HvCopyFits(HV_MAX_NB - 1, 0, HV_MAX_COPY_BYTES));
-    CHECK(!HvCopyFits(HV_MAX_NB, 0, 1));
-    CHECK(!HvCopyFits(0, 0, 0));
-    CHECK(!HvCopyFits(0, 0, HV_MAX_COPY_BYTES + 1));
-    CHECK(!HvCopyFits(0, HV_MAX_COPY_BYTES, 1));
-    CHECK(!HvCopyFits(0, UINT_MAX, 1));
-    CHECK(!HvCopyFits(0, 1, UINT_MAX));
-    CHECK(HvCopyFits(0, HV_MAX_COPY_BYTES - 1, 1));
-    CHECK(HvCopyPoolFits(0, HV_MAX_COPY_POOL_BYTES));
-    CHECK(!HvCopyPoolFits(HV_MAX_COPY_POOL_BYTES, 1));
-    CHECK(!HvCopyPoolFits(UINT_MAX, 1));
-    CHECK(!HvCopyPoolFits(1, UINT_MAX));
-    CHECK(!HvCopyPoolFits(0, 0));
-
-    // Ownership references and byte admission have only arithmetic bounds.
+    // Ownership references have arithmetic bounds, not admission quotas.
     unsigned long long value = 99;
     CHECK(HvAddU64(2048, 1, &value) && value == 2049);
     CHECK(HvAddU64(ULLONG_MAX - 1, 1, &value) && value == ULLONG_MAX);
     CHECK(!HvAddU64(value, 1, &value) && value == ULLONG_MAX);
-    CHECK(HvReleaseBytes(&value, 1) && value == ULLONG_MAX - 1);
+    CHECK(HvSubtractU64(value, 1, &value) && value == ULLONG_MAX - 1);
     value = 99;
     CHECK(!HvMultiplyU64(ULLONG_MAX, 2, &value) && value == 99);
     CHECK(HvMultiplyU64(0, ULLONG_MAX, &value) && value == 0);
     CHECK(HvMultiplyU64(ULLONG_MAX, 1, &value) && value == ULLONG_MAX);
-    CHECK(!HvReleaseBytes(&value, 0) && value == ULLONG_MAX);
-    value = 0;
-    CHECK(!HvReleaseBytes(&value, 1) && value == 0);
-    CHECK(!HvReserveBytes(&value, 0, ULLONG_MAX) && value == 0);
-    CHECK(HvReserveBytes(&value, ULLONG_MAX, ULLONG_MAX) && value == ULLONG_MAX);
-    CHECK(!HvReserveBytes(&value, 1, ULLONG_MAX) && value == ULLONG_MAX);
-    CHECK(!HvReserveBytes(&value, 1, HV_MAX_QUEUED_READ_BYTES) && value == ULLONG_MAX);
-    CHECK(HvReleaseBytes(&value, ULLONG_MAX) && value == 0);
-
-    unsigned long long read_cost = 0;
-    CHECK(HvQueuedReadCost(1, 200, 3, 72, 64, 32, &read_cost) && read_cost == 513);
-    for (unsigned i = 0; i < 4096; ++i) CHECK(HvReserveBytes(&value, read_cost, HV_MAX_QUEUED_READ_BYTES));
-    CHECK(value == 4096 * read_cost); // More than the former 16-read admission limit.
-    for (unsigned i = 0; i < 4096; ++i) CHECK(HvReleaseBytes(&value, read_cost));
-    CHECK(value == 0);
-    CHECK(HvQueuedReadCost(1024 * 1024, 200, 3, 72, 64, 32, &read_cost));
-    CHECK(read_cost == 1024 * 1024 + 512); // Never clamp original SystemBuffer cost to 64 KiB.
-    CHECK(HvReserveBytes(&value, read_cost, HV_MAX_QUEUED_READ_BYTES));
-    CHECK(HvReleaseBytes(&value, read_cost) && value == 0); // Worker/cancel removal.
-    CHECK(HvReserveBytes(&value, read_cost, HV_MAX_QUEUED_READ_BYTES)); // Same cost on reinsertion.
-    CHECK(HvReleaseBytes(&value, read_cost) && value == 0);
-    CHECK(HvQueuedReadCost(UINT_MAX, 200, 3, 72, 64, 32, &read_cost));
-    CHECK(read_cost == static_cast<unsigned long long>(UINT_MAX) + 512);
-    CHECK(!HvReserveBytes(&value, read_cost, HV_MAX_QUEUED_READ_BYTES) && value == 0);
-    read_cost = 123;
-    CHECK(!HvQueuedReadCost(1, 1, ULLONG_MAX, 2, 0, 0, &read_cost) && read_cost == 123);
-    CHECK(!HvQueuedReadCost(ULLONG_MAX, 1, 0, 0, 0, 0, &read_cost) && read_cost == 123);
-    CHECK(!HvQueuedReadCost(0, ULLONG_MAX, 0, 0, 1, 0, &read_cost) && read_cost == 123);
-    CHECK(!HvQueuedReadCost(0, ULLONG_MAX, 0, 0, 0, 1, &read_cost) && read_cost == 123);
-    CHECK(HvReserveBytes(&value, HV_MAX_QUEUED_READ_BYTES, HV_MAX_QUEUED_READ_BYTES));
-    CHECK(!HvReserveBytes(&value, 1, HV_MAX_QUEUED_READ_BYTES));
-    CHECK(HvReleaseBytes(&value, HV_MAX_QUEUED_READ_BYTES) && value == 0);
+    CHECK(HvSubtractU64(value, 0, &value) && value == ULLONG_MAX);
+    CHECK(HvSubtractU64(value, ULLONG_MAX, &value) && value == 0);
+    CHECK(!HvSubtractU64(value, 1, &value) && value == 0);
 
     unsigned buckets[HV_TOKEN_BUCKET_COUNT]{};
     for (unsigned i = 0; i < 10000; ++i) {
@@ -136,6 +92,6 @@ int main() {
     }
     CHECK(HvFinishRoute(HV_DIRECTION_RECEIVE, 0, 0) == HvRouteReturnReceive);
     CHECK(HvFinishRoute(HV_DIRECTION_RECEIVE, 1, 0) == HvRouteFreeReceive);
-    std::puts("PASS LWF target gate, running/maintenance transitions, copy bounds and ownership routes");
+    std::puts("PASS LWF target gate, running/maintenance transitions, checked arithmetic and ownership routes");
     return 0;
 }

@@ -58,7 +58,7 @@ unsafe extern "C" {
 }
 struct NonPagedAllocator;
 // SAFETY: the shim returns nonpaged pool aligned to at least 16 bytes and uses
-// atomic accounting to bound all live allocations, including unlocked captures.
+// fallible allocation without a driver-defined aggregate byte quota.
 unsafe impl GlobalAlloc for NonPagedAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         if layout.align() > 16 {
@@ -262,14 +262,12 @@ pub extern "C" fn HvClassify(token: usize, interface_index: u32, path: u32, canc
     };
     let mut first: Option<Packet> = None;
     let mut saw_non_ip = false;
-    let mut count = 0usize;
     let mut nb = unsafe { hv_first_nb(token) };
+    if nb.is_null() {
+        with_state(|e| e.malformed());
+        return 1;
+    }
     while !nb.is_null() {
-        count += 1;
-        if count > 64 {
-            with_state(|e| e.malformed());
-            return 1;
-        }
         let mut bytes = [0u8; SNAPSHOT];
         let (mut copied, mut trusted, mut frame_len, mut offload) = (0, 0, 0, 0);
         let ok = unsafe {
@@ -302,12 +300,10 @@ pub extern "C" fn HvClassify(token: usize, interface_index: u32, path: u32, canc
                 }
                 if let Some(f) = &mut first {
                     // A single legacy request cannot describe two different flows.
-                    if f.flow != p.flow {
+                    if f.merge(&p).is_err() {
                         with_state(|e| e.malformed());
                         return 1;
                     }
-                    f.ip_len = f.ip_len.saturating_add(p.ip_len);
-                    f.cacheable = false; // no permanent decision from a batch
                 } else {
                     first = Some(p);
                 }
@@ -329,10 +325,6 @@ pub extern "C" fn HvClassify(token: usize, interface_index: u32, path: u32, canc
             }
         }
         nb = unsafe { hv_next_nb(nb) };
-    }
-    if count == 0 {
-        with_state(|e| e.malformed());
-        return 1;
     }
     let Some(mut packet) = first else {
         with_state(|e| e.non_ip());
@@ -398,14 +390,24 @@ pub unsafe extern "C" fn HvRead(out: *mut u8, len: u32) -> u32 {
     }
     // SAFETY: the shim provides the system buffer and its exact validated size.
     let out = unsafe { core::slice::from_raw_parts_mut(out, len as usize) };
-    with_state(|e| e.read(out)) as u32
+    let mut written = 0;
+    // Bound work under PolicyLock, not the read size. One completion can span
+    // as many chunks/records as fit the caller's Windows I/O buffer.
+    for chunk in out.chunks_mut(64 * 1024) {
+        let n = with_state(|e| e.read(chunk));
+        written += n;
+        if n < chunk.len() {
+            break;
+        }
+    }
+    written as u32
 }
 /// # Safety
 /// `data` is a readable nonpaged system buffer of at least `len` bytes, immutable
 /// for the call and serialized with client cleanup by the C shim's I/O mutex.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn HvWrite(data: *const u8, len: u32) -> i32 {
-    if data.is_null() || len == 0 || len > 65536 {
+    if data.is_null() || len == 0 {
         return INVALID_PARAMETER;
     }
     let bytes = unsafe { core::slice::from_raw_parts(data, len as usize) };

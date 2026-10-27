@@ -210,6 +210,7 @@ public:
     bool Open(std::string& error);
 
     // Nonzero reads wait for data and support cancellation; no idle polling.
+    // Streaming chunks are a client buffer choice, not a driver read-size cap.
     // Only complete bounded wire records are dispatched.
     // Stop() is thread-safe during Run(). Join Run() before Cleanup/destruction.
     void Run(const Handlers& handlers, unsigned poll_interval_ms = 1000);
@@ -235,7 +236,7 @@ public:
     // TCP/UDP stay separate; both directions share tuples within one table. OOM skips insertion.
     // Default TTL is 60 seconds: PermanentAccept hits refresh it; Block/Drop do not.
     // Pending verdict timeout is 8 seconds by default; missing verdicts default to drop.
-    // Missing/disconnected controller and policy queue pressure also default to drop.
+    // Missing/disconnected controller and policy allocation failure also default to drop.
     bool SendVerdict(uint64_t id, Verdict verdict, std::string& error);
     bool RequestLogs(std::string& error);
     bool RequestBandwidthStats(std::string& error);
@@ -247,6 +248,7 @@ public:
     void Cleanup();
 
 private:
+    // Validate the full nonempty batch before I/O; only native DWORD length bounds it.
     bool SendCommand(const uint8_t* data, size_t len, std::string& error);
     bool DeviceControl(uint32_t code, uint8_t* out, uint32_t out_len,
                        std::string& error, uint32_t* returned = nullptr,

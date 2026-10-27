@@ -582,10 +582,30 @@ bool TestCommands() {
     CHECK(!pmkext::wire::ValidateCommands(batch.data(), batch.size(), error));
     CHECK(!pmkext::wire::ValidateCommands(nullptr, 0, error));
     CHECK(!pmkext::wire::ValidateCommands(command.data(), 9, error));
-    Bytes maximum(pmkext::wire::kMaxCommandBatchSize, 4);
-    CHECK(pmkext::wire::ValidateCommands(maximum.data(), maximum.size(), error));
-    maximum.push_back(4);
-    CHECK(!pmkext::wire::ValidateCommands(maximum.data(), maximum.size(), error));
+
+    // A command batch is bounded by the native DWORD write length, not by the
+    // reusable 64 KiB read chunk used elsewhere by the client.
+    CHECK(pmkext::wire::kMaxCommandBatchSize ==
+          static_cast<size_t>(UINT32_MAX));
+    for (const size_t size : {size_t{65537}, size_t{1024 * 1024 + 1}}) {
+        Bytes large_batch(size, static_cast<uint8_t>(pmkext::CommandType::ClearCache));
+        CHECK(pmkext::wire::ValidateCommands(large_batch.data(), large_batch.size(), error));
+        large_batch.push_back(255); // A valid large prefix does not hide a bad suffix.
+        CHECK(!pmkext::wire::ValidateCommands(large_batch.data(), large_batch.size(), error));
+        large_batch.back() = 1; // A verdict without its remaining nine bytes.
+        CHECK(!pmkext::wire::ValidateCommands(large_batch.data(), large_batch.size(), error));
+    }
+
+    // Probe the exact DWORD boundary with an invalid first byte: validation
+    // returns immediately, so no multi-gigabyte allocation is needed.
+    const uint8_t invalid = 255;
+    CHECK(!pmkext::wire::ValidateCommands(
+        &invalid, pmkext::wire::kMaxCommandBatchSize, error));
+    if constexpr (SIZE_MAX > pmkext::wire::kMaxCommandBatchSize) {
+        const size_t too_large = pmkext::wire::kMaxCommandBatchSize + 1;
+        CHECK(!pmkext::wire::ValidateCommands(&invalid, too_large, error));
+        CHECK(error.find("command batch must") != std::string::npos);
+    }
     return true;
 }
 

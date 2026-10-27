@@ -54,7 +54,7 @@ pub struct Packet {
     pub flow: Flow,
     pub connection: Connection,
     pub cacheable: bool,
-    pub ip_len: u32,      // Total bytes for bandwidth; can aggregate same-flow NBs.
+    pub ip_len: u64,      // Total bytes for bandwidth; can aggregate same-flow NBs.
     pub payload_len: u32, // Complete IP packet in the first NB, without Ethernet padding.
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -85,6 +85,16 @@ impl Packet {
             frame_start: prefix.checked_sub(l2_len)?,
             frame_len: l2_len + payload_len,
         })
+    }
+    // One verdict covers a homogeneous NBL; only the first NB supplies payload.
+    // The chain has no count quota and can account for more than u32::MAX bytes.
+    pub fn merge(&mut self, other: &Self) -> Result<(), ParseError> {
+        if self.flow != other.flow {
+            return Err(ParseError::Malformed);
+        }
+        self.ip_len = self.ip_len.saturating_add(other.ip_len);
+        self.cacheable = false;
+        Ok(())
     }
     pub fn orient(&mut self, path: NdisPath) {
         let direction = path.direction();
@@ -256,7 +266,7 @@ pub fn parse(
         }
     }
     p.flow.protocol = proto;
-    p.ip_len = ip_len as u32;
+    p.ip_len = ip_len as u64;
     p.connection.ipv6 = p.flow.ipv6;
     p.connection.protocol = proto;
     p.connection.local_ip = p.flow.source;
@@ -291,6 +301,40 @@ mod tests {
         assert_eq!(p.flow.source_port, 1234);
         assert_eq!(p.payload_len, 28);
         assert_eq!(p.ip_len, 28);
+    }
+    #[test]
+    fn homogeneous_batch_has_no_nb_quota_and_preserves_first_payload() {
+        let b = udp();
+        let first = parse(&b, b.len(), b.len(), false).unwrap().unwrap();
+        let mut batch = first;
+        for _ in 1..4097 {
+            batch.merge(&first).unwrap();
+        }
+        assert_eq!(batch.ip_len, 4097 * first.ip_len);
+        assert_eq!(batch.payload_len, first.payload_len);
+        assert_eq!(batch.capture_layout(), first.capture_layout());
+        assert!(!batch.cacheable);
+        let original = batch;
+        let mut other = first;
+        other.flow.source_port += 1;
+        assert_eq!(batch.merge(&other), Err(ParseError::Malformed));
+        assert_eq!(batch.ip_len, original.ip_len);
+        assert_eq!(batch.payload_len, original.payload_len);
+    }
+    #[test]
+    fn large_batch_bandwidth_is_64_bit_and_saturates_without_wrapping() {
+        let b = udp();
+        let first = parse(&b, b.len(), 14 + MAX_PAYLOAD, true).unwrap().unwrap();
+        let mut batch = first;
+        for _ in 1..8193 {
+            batch.merge(&first).unwrap();
+        }
+        assert_eq!(batch.ip_len, 8193 * MAX_PAYLOAD as u64);
+        assert!(batch.ip_len > u64::from(u32::MAX));
+        assert_eq!(batch.payload_len as usize, MAX_PAYLOAD);
+        batch.ip_len = u64::MAX;
+        batch.merge(&first).unwrap();
+        assert_eq!(batch.ip_len, u64::MAX);
     }
     #[test]
     fn host_send_normalizes_guest_endpoints_without_changing_capture() {

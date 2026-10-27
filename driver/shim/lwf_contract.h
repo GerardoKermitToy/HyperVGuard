@@ -5,12 +5,6 @@
 // Internal host-vNIC ownership paths, NOT public outbound/inbound values.
 #define HV_DIRECTION_SEND 0u
 #define HV_DIRECTION_RECEIVE 1u
-#define HV_MAX_NB 64u
-#define HV_MAX_COPY_BYTES (256u * 1024u)
-#define HV_MAX_COPY_POOL_BYTES (16u * 1024u * 1024u)
-// Retained buffered-read memory is independent of packet/copy storage. Admission
-// is by bytes (including the original requested buffer), never by IRP count.
-#define HV_MAX_QUEUED_READ_BYTES (16u * 1024u * 1024u)
 // Hash buckets have unbounded chains; this is a lookup aid, not a token quota.
 #define HV_TOKEN_BUCKET_COUNT 256u
 #define HV_DEFAULT_DECISION_TIMEOUT_MS 8000
@@ -57,26 +51,10 @@ static inline int HvMultiplyU64(unsigned long long left, unsigned long long righ
     *out = left * right;
     return 1;
 }
-static inline int HvReserveBytes(unsigned long long* used, unsigned long long cost,
-    unsigned long long budget) {
-    if (cost == 0 || *used > budget || cost > budget - *used) return 0;
-    *used += cost;
-    return 1;
-}
-static inline int HvReleaseBytes(unsigned long long* used, unsigned long long cost) {
-    if (cost == 0 || cost > *used) return 0;
-    *used -= cost;
-    return 1;
-}
-static inline int HvQueuedReadCost(unsigned long long requested,
-    unsigned long long irpBytes, unsigned long long stackCount,
-    unsigned long long stackBytes, unsigned long long mdlBytes,
-    unsigned long long bookkeepingBytes, unsigned long long* out) {
-    unsigned long long cost;
-    if (!HvMultiplyU64(stackCount, stackBytes, &cost) ||
-        !HvAddU64(cost, irpBytes, &cost) || !HvAddU64(cost, mdlBytes, &cost) ||
-        !HvAddU64(cost, bookkeepingBytes, &cost) || !HvAddU64(cost, requested, &cost)) return 0;
-    *out = cost;
+static inline int HvSubtractU64(unsigned long long left, unsigned long long right,
+    unsigned long long* out) {
+    if (right > left) return 0;
+    *out = left - right;
     return 1;
 }
 static inline unsigned int HvTokenBucketIndex(unsigned long long nbl, unsigned int direction) {
@@ -84,13 +62,6 @@ static inline unsigned int HvTokenBucketIndex(unsigned long long nbl, unsigned i
     hash ^= hash >> 17;
     hash ^= hash >> 9;
     return (unsigned int)(hash ^ direction) & (HV_TOKEN_BUCKET_COUNT - 1u);
-}
-static int HvCopyFits(unsigned int count, unsigned int total, unsigned int length) {
-    return count < HV_MAX_NB && length != 0 && total <= HV_MAX_COPY_BYTES &&
-        length <= HV_MAX_COPY_BYTES - total;
-}
-static int HvCopyPoolFits(unsigned int used, unsigned int length) {
-    return length != 0 && used <= HV_MAX_COPY_POOL_BYTES && length <= HV_MAX_COPY_POOL_BYTES - used;
 }
 static HV_FINISH_ROUTE HvFinishRoute(unsigned int direction, int copied, int allow) {
     if (direction == HV_DIRECTION_SEND) return allow ? HvRouteSend : HvRouteCompleteSend;

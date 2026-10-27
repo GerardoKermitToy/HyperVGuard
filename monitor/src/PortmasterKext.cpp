@@ -332,6 +332,13 @@ bool Driver::RequestShutdown(std::string& error) {
 bool Driver::SendCommand(const uint8_t* data, size_t length, std::string& error) {
     // Do not allow a valid prefix to run before rejecting an invalid suffix.
     if (!wire::ValidateCommands(data, length, error)) return false;
+    // Validate again at the Win32 boundary so this size_t-to-DWORD conversion
+    // cannot wrap if the codec and client are ever changed independently.
+    if (length > static_cast<size_t>(MAXDWORD)) {
+        error = "command batch exceeds the native DWORD write length";
+        return false;
+    }
+    const DWORD write_length = static_cast<DWORD>(length);
     std::lock_guard<std::mutex> guard(write_mutex_);
     if (device_ == nullptr) {
         error = "device not open";
@@ -348,7 +355,7 @@ bool Driver::SendCommand(const uint8_t* data, size_t length, std::string& error)
     }
     const HANDLE device = static_cast<HANDLE>(device_);
     DWORD written = 0;
-    const BOOL ok = WriteFile(device, data, static_cast<DWORD>(length), &written, overlap.get());
+    const BOOL ok = WriteFile(device, data, write_length, &written, overlap.get());
     if (!FinishOverlapped(device, overlap.get(), ok, "WriteFile", written, error)) return false;
     if (written != length) {
         error = "WriteFile completed a short command batch";
