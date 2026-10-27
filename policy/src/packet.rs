@@ -259,7 +259,7 @@ pub fn parse(
                 }
             } else {
                 let udp_len = usize::from(be16(ip, transport + 4));
-                if udp_len < 8 || (!offload && udp_len > ip_len.saturating_sub(transport)) {
+                if !offload && (udp_len < 8 || udp_len > ip_len - transport) {
                     return Err(ParseError::Malformed);
                 }
             }
@@ -304,6 +304,39 @@ mod tests {
         assert_eq!(p.flow.source_port, 1234);
         assert_eq!(p.payload_len, 28);
         assert_eq!(p.ip_len, 28);
+    }
+    #[test]
+    fn udp_lengths_are_bounded_by_ip_not_ethernet_padding() {
+        for ipv6 in [false, true] {
+            let mut b = udp();
+            let port = if ipv6 {
+                b = [0; 64];
+                b[12..14].copy_from_slice(&0x86ddu16.to_be_bytes());
+                b[14] = 0x60;
+                b[18..20].copy_from_slice(&8u16.to_be_bytes());
+                b[20] = 17;
+                b[54..56].copy_from_slice(&1234u16.to_be_bytes());
+                b[56..58].copy_from_slice(&53u16.to_be_bytes());
+                54
+            } else {
+                34
+            };
+            b[port + 4..port + 6].copy_from_slice(&8u16.to_be_bytes());
+            let valid = parse(&b, b.len(), b.len(), false).unwrap().unwrap();
+            assert!(valid.cacheable);
+            assert_eq!(valid.flow.source_port, 1234);
+            assert_eq!(valid.flow.destination_port, 53);
+            for length in [0u16, 7, 9, 100, u16::MAX] {
+                b[port + 4..port + 6].copy_from_slice(&length.to_be_bytes());
+                assert_eq!(
+                    parse(&b, b.len(), b.len(), false).unwrap_err(),
+                    ParseError::Malformed
+                );
+                // Offload headers may have unfinished lengths, but cannot cache.
+                let offload = parse(&b, b.len(), b.len(), true).unwrap().unwrap();
+                assert!(!offload.cacheable);
+            }
+        }
     }
     #[test]
     fn homogeneous_batch_has_no_nb_quota_and_preserves_first_payload() {
