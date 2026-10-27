@@ -135,12 +135,13 @@ fn sandbox_ping_and_tcp_requests_are_outbound_replies_inbound() {
 fn guest_wire_direction_and_endpoints_survive_allow_and_drop() {
     for protocol in [1, 6] {
         for verdict in [Verdict::PermanentAccept, Verdict::PermanentDrop] {
-            let mut engine = engine();
             let request = sandbox_request(protocol);
             for (path, bytes, direction) in [
                 (NdisPath::Receive, request.clone(), 0),
                 (NdisPath::Send, reply(&request), 1),
             ] {
+                // A fresh interface cache forces an event for each wire direction.
+                let mut engine = engine();
                 let packet = parse(&bytes, path);
                 let id = submit(&mut engine, packet, path, 7, &bytes);
                 let event = record(&mut engine, 1);
@@ -171,6 +172,39 @@ fn guest_wire_direction_and_endpoints_survive_allow_and_drop() {
                 );
             }
         }
+    }
+}
+
+#[test]
+fn tcp_reply_reuses_the_same_normalized_tuple_cache_entry() {
+    for verdict in [Verdict::PermanentAccept, Verdict::PermanentDrop] {
+        let mut engine = engine();
+        let request = sandbox_request(6);
+        let outgoing = parse(&request, NdisPath::Receive);
+        let id = submit(&mut engine, outgoing, NdisPath::Receive, 1, &request);
+        let _ = record(&mut engine, 1);
+        engine.verdict(id, verdict, 101).unwrap();
+        let response = reply(&request);
+        let incoming = parse(&response, NdisPath::Send);
+        let key = Key {
+            adapter: 1,
+            epoch: engine.epoch(1).unwrap(),
+            path: NdisPath::Send,
+            vlan: 0,
+            flow: incoming.flow,
+        };
+        let action = engine.preflight(&key, &incoming, 2, 102).unwrap_err();
+        assert_eq!(action.token, 2);
+        assert_eq!(
+            action.finish,
+            if verdict.allows() {
+                Finish::Allow
+            } else {
+                Finish::Drop
+            }
+        );
+        assert_eq!(engine.stats().cache_hits, 1);
+        assert!(!engine.has_events());
     }
 }
 

@@ -220,7 +220,10 @@ int MonitorMain(int argc, wchar_t** argv) {
     std::printf("CONN: one NBL decision, direction=0 outbound/1 inbound from the guest side.\n"
                 "Local=guest endpoint, remote=peer; host receive=outbound, host send=inbound; no process/thread identity.\n"
                 "Payload is the complete layer-3 logical IP packet, up to 1 MiB without truncation.\n"
-                "Permanent cache TTL: 60 s; pending timeout: 2 s by default, fail-open by default.\n"
+                "TCP/UDP cache only: separate IPv4/IPv6 tables per host interface; key=local/remote IP+port.\n"
+                "TCP/UDP and both directions share matching normalized tuples.\n"
+                "Default cache TTL: 60 s; TCP/UDP PermanentAccept refreshes on matching cache hits; PermanentBlock/Drop use fixed TTL.\n"
+                "Pending timeout: 2 s by default, fail-open by default.\n"
                 "Bandwidth: tx/rx=admitted guest outbound/inbound IP bytes, no PID; clean-ended only sweeps TTLs.\n"
                 "No synthetic END events; UpdateV4/UpdateV6 and redirects are unsupported.\n");
     if (!opt.send_verdicts) {

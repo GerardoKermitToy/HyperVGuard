@@ -7,6 +7,7 @@
 #include "adapter_info.h"
 
 #define TAG 'gVHH'
+#define CACHE_TAG 'cVHH'
 #define MAX_TOKENS 2048
 #define MAX_EVENT_POOL_BYTES (16u * 1024u * 1024u)
 #define VERSION_IOCTL CTL_CODE(40000, 0x800, METHOD_BUFFERED, FILE_READ_DATA | FILE_WRITE_DATA)
@@ -237,6 +238,16 @@ void hv_free(void* data, SIZE_T size) {
     remaining = InterlockedAdd64(&EventPoolBytes, -(LONG64)size);
     NT_ASSERT(remaining >= 0);
     UNREFERENCED_PARAMETER(remaining);
+}
+// Cache tables are fallible and independent of the 16 MiB event/capture budget.
+// Rust prepares/zeros and retires them outside PolicyLock; no fixed cache cap.
+void* hv_cache_allocate(SIZE_T size) {
+    if (size == 0) return NULL;
+    return ExAllocatePool2(POOL_FLAG_NON_PAGED | POOL_FLAG_UNINITIALIZED, size, CACHE_TAG);
+}
+void hv_cache_free(void* data, SIZE_T size) {
+    UNREFERENCED_PARAMETER(size);
+    ExFreePoolWithTag(data, CACHE_TAG);
 }
 __declspec(noreturn) void hv_bugcheck(void) {
     KeBugCheckEx(DRIVER_VERIFIER_DETECTED_VIOLATION, 0x48565253, 0, 0, 0);

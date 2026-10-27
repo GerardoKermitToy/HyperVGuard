@@ -16,6 +16,7 @@ use core::{
     panic::PanicInfo,
 };
 use hyperv_policy::{
+    cache::{CacheAllocator, CacheWork},
     engine::{Action, Engine, Finish, Key, Submission, allocate_record},
     packet::{self, NdisPath, Packet, SNAPSHOT},
 };
@@ -37,6 +38,8 @@ unsafe extern "C" {
     fn hv_now() -> u64;
     fn hv_allocate(size: usize) -> *mut u8;
     fn hv_free(data: *mut u8, size: usize);
+    fn hv_cache_allocate(size: usize) -> *mut u8;
+    fn hv_cache_free(data: *mut u8, size: usize);
     fn hv_finish(token: usize, finish: u32);
     fn hv_first_nb(token: usize) -> Handle;
     fn hv_next_nb(nb: Handle) -> Handle;
@@ -73,7 +76,17 @@ struct State(UnsafeCell<Engine>);
 // The C shim initializes the spin lock before ANY callback or control device is
 // published. Every engine access is under it; no references escape with_state.
 unsafe impl Sync for State {}
-static STATE: State = State(UnsafeCell::new(Engine::new()));
+unsafe fn cache_allocate(size: usize) -> *mut u8 {
+    unsafe { hv_cache_allocate(size) }
+}
+unsafe fn cache_free(data: *mut u8, size: usize) {
+    unsafe { hv_cache_free(data, size) }
+}
+// SAFETY: matching fallible, nonpaged pool functions; buffers are freed unlocked.
+const CACHE_ALLOCATOR: CacheAllocator = unsafe { CacheAllocator::new(cache_allocate, cache_free) };
+static STATE: State = State(UnsafeCell::new(Engine::with_cache_allocator(
+    CACHE_ALLOCATOR,
+)));
 fn with_state<R>(f: impl FnOnce(&mut Engine) -> R) -> R {
     // SAFETY: no recursion into this lock; no NDIS forwarding/completion while held.
     unsafe {
@@ -101,6 +114,16 @@ fn finish(a: Action) {
         )
     }
 }
+// Old per-interface table pairs move out one at a time, keeping the kernel
+// stack fixed-size. No cache pool allocation/free occurs under PolicyLock.
+fn reclaim_caches() {
+    for _ in 0..hyperv_policy::engine::MAX_ADAPTERS {
+        let Some(retired) = with_state(|e| e.take_retired_caches()) else {
+            break;
+        };
+        drop(retired);
+    }
+}
 fn drain() {
     loop {
         let action = with_state(|e| e.take_due(unsafe { hv_now() }));
@@ -124,7 +147,9 @@ pub extern "C" fn HvConfigure(timeout: u32, cache_ttl: u32, fail_closed: u32) {
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn HvAttach(id: u64, interface_index: u32) -> u32 {
-    with_state(|e| e.attach(id, interface_index) as u32)
+    let result = with_state(|e| e.attach(id, interface_index) as u32);
+    reclaim_caches();
+    result
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn HvRestart(id: u64) -> u32 {
@@ -133,10 +158,12 @@ pub extern "C" fn HvRestart(id: u64) -> u32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn HvInvalidate(id: u64, pause: u32) {
     with_state(|e| e.invalidate(id, pause != 0));
+    reclaim_caches();
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn HvDetach(id: u64) {
     with_state(|e| e.detach(id));
+    reclaim_caches();
     drain();
 }
 #[unsafe(no_mangle)]
@@ -145,15 +172,21 @@ pub extern "C" fn HvDrain() {
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn HvTick() {
+    reclaim_caches();
+    let mut work = CacheWork::empty();
+    with_state(|e| e.clean_with_work(unsafe { hv_now() }, &mut work));
+    drop(work);
     drain();
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn HvConnect() {
     with_state(|e| e.connect());
+    reclaim_caches();
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn HvDisconnect() {
     with_state(|e| e.disconnect());
+    reclaim_caches();
     drain();
 }
 #[unsafe(no_mangle)]
@@ -299,7 +332,16 @@ pub extern "C" fn HvClassify(
         vlan,
         flow: packet.flow,
     };
-    let wants_event = with_state(|e| e.wants_event(&key, &packet, unsafe { hv_now() }));
+    let wants_event = match with_state(|e| e.preflight(&key, &packet, token, unsafe { hv_now() })) {
+        Ok(wants_event) => wants_event,
+        Err(action) => {
+            return match action.finish {
+                Finish::Allow => 0,
+                Finish::Drop => 1,
+                Finish::Cancel => 2,
+            };
+        }
+    };
     let record = if wants_event {
         match capture_packet(unsafe { hv_first_nb(token) }, token, &packet) {
             Ok(record) => record,
@@ -362,23 +404,38 @@ pub unsafe extern "C" fn HvWrite(data: *const u8, len: u32) -> i32 {
         match command {
             Command::Shutdown => {
                 with_state(|e| e.disconnect());
+                reclaim_caches();
                 drain();
             }
             Command::Verdict { id, verdict } => {
                 // Expiry and topology changes may win the race. A stale ID is a
                 // harmless no-op (never a cache write), as on asynchronous kext I/O.
-                let action = with_state(|e| e.verdict(id, verdict, unsafe { hv_now() }).ok());
+                let plan = with_state(|e| e.cache_plan(id, verdict, unsafe { hv_now() }));
+                let mut work = CacheWork::prepare(plan);
+                let action = with_state(|e| {
+                    e.verdict_with_work(id, verdict, unsafe { hv_now() }, &mut work)
+                        .ok()
+                });
+                drop(work);
                 if let Some(a) = action {
                     finish(a);
                 } else {
                     drain();
                 }
             }
-            Command::ClearCache => with_state(|e| e.clear_cache()),
+            Command::ClearCache => {
+                with_state(|e| e.clear_cache());
+                reclaim_caches();
+            }
             Command::GetLogs => {} // Log records are already queued.
             Command::GetBandwidth => with_state(|e| e.bandwidth()),
             Command::MemoryStats => with_state(|e| e.memory_stats()),
-            Command::CleanEnded => with_state(|e| e.clean(unsafe { hv_now() })),
+            Command::CleanEnded => {
+                reclaim_caches();
+                let mut work = CacheWork::empty();
+                with_state(|e| e.clean_with_work(unsafe { hv_now() }, &mut work));
+                drop(work);
+            }
         }
         rest = next;
     }

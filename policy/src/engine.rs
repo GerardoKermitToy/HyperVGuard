@@ -1,4 +1,7 @@
-use crate::packet::{Flow, NdisPath, Packet};
+use crate::{
+    cache::{CacheAllocator, CachePlan, CacheWork, Caches, Decision},
+    packet::{Flow, NdisPath, Packet},
+};
 use alloc::vec::Vec;
 use core::fmt::{self, Write};
 use hyperv_protocol::{
@@ -9,9 +12,7 @@ use hyperv_protocol::{
 pub const MAX_PENDING: usize = 256;
 pub const MAX_EVENTS: usize = 512;
 pub const MAX_EVENT_BYTES: usize = 16 * 1024 * 1024;
-pub const MAX_CACHE: usize = 1024;
 pub const MAX_ADAPTERS: usize = hyperv_protocol::ADAPTER_INFO_MAX_ADAPTERS;
-const WAYS: usize = 4;
 const MAX_BANDWIDTH: usize = 256;
 const NO_SLOT: u16 = u16::MAX;
 
@@ -31,26 +32,6 @@ impl Key {
         vlan: 0,
         flow: Flow::EMPTY,
     };
-    fn hash(&self) -> usize {
-        let mut h = 0xcbf29ce484222325u64;
-        for b in self
-            .adapter
-            .to_le_bytes()
-            .iter()
-            .chain(self.epoch.to_le_bytes().iter())
-            .chain([self.path as u8].iter())
-            .chain(self.vlan.to_le_bytes().iter())
-            .chain(self.flow.l2.iter())
-            .chain(self.flow.source.iter())
-            .chain(self.flow.destination.iter())
-            .chain(self.flow.source_port.to_le_bytes().iter())
-            .chain(self.flow.destination_port.to_le_bytes().iter())
-            .chain([self.flow.l2_len, self.flow.ipv6 as u8, self.flow.protocol].iter())
-        {
-            h = (h ^ u64::from(*b)).wrapping_mul(0x100000001b3);
-        }
-        h as usize
-    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Finish {
@@ -78,7 +59,24 @@ struct Adapter {
     id: u64,
     interface_index: u32,
     epoch: u64,
+    cache_slot: usize,
     running: bool,
+}
+struct InterfaceCache {
+    interface_index: u32,
+    users: usize,
+    dirty: bool,
+    caches: Caches,
+}
+impl InterfaceCache {
+    const fn empty() -> Self {
+        Self {
+            interface_index: 0,
+            users: 0,
+            dirty: false,
+            caches: Caches::global(),
+        }
+    }
 }
 #[derive(Clone, Copy)]
 struct Pending {
@@ -97,21 +95,6 @@ impl Pending {
         deadline: 0,
         key: Key::EMPTY,
         packet: Packet::EMPTY,
-    };
-}
-#[derive(Clone, Copy)]
-struct Cached {
-    valid: bool,
-    key: Key,
-    allow: bool,
-    expires: u64,
-}
-impl Cached {
-    const EMPTY: Self = Self {
-        valid: false,
-        key: Key::EMPTY,
-        allow: false,
-        expires: 0,
     };
 }
 struct Event {
@@ -162,6 +145,7 @@ pub struct Stats {
     pub dropped: u64,
     pub queued: u64,
     pub cache_hits: u64,
+    pub cache_allocation_failures: u64,
     pub timeouts: u64,
     pub overflow: u64,
     pub cancelled: u64,
@@ -176,6 +160,7 @@ impl Stats {
         dropped: 0,
         queued: 0,
         cache_hits: 0,
+        cache_allocation_failures: 0,
         timeouts: 0,
         overflow: 0,
         cancelled: 0,
@@ -185,12 +170,14 @@ impl Stats {
     };
 }
 
-// Metadata is fixed-size; queued records own bounded nonpaged allocations.
-// Parsing and full packet copies happen OUTSIDE the policy spin lock.
+// Packet metadata is fixed-size; records have a separate bounded allocator.
+// Cache growth/zeroing and retired-table frees happen OUTSIDE the policy lock.
 pub struct Engine {
     adapters: [Adapter; MAX_ADAPTERS],
     pending: [Pending; MAX_PENDING],
-    cache: [Cached; MAX_CACHE],
+    interfaces: [InterfaceCache; MAX_ADAPTERS],
+    cache_allocator: CacheAllocator,
+    cache_cursor: usize,
     events: [Event; MAX_EVENTS],
     bandwidth: [Bandwidth; MAX_BANDWIDTH],
     head: usize,
@@ -210,15 +197,21 @@ impl Default for Engine {
 }
 impl Engine {
     pub const fn new() -> Self {
+        Self::with_cache_allocator(CacheAllocator::GLOBAL)
+    }
+    pub const fn with_cache_allocator(allocator: CacheAllocator) -> Self {
         Self {
             adapters: [Adapter {
                 id: 0,
                 interface_index: 0,
                 epoch: 0,
+                cache_slot: 0,
                 running: false,
             }; MAX_ADAPTERS],
             pending: [Pending::EMPTY; MAX_PENDING],
-            cache: [Cached::EMPTY; MAX_CACHE],
+            interfaces: [const { InterfaceCache::empty() }; MAX_ADAPTERS],
+            cache_allocator: allocator,
+            cache_cursor: 0,
             events: [const { Event::EMPTY }; MAX_EVENTS],
             bandwidth: [Bandwidth::EMPTY; MAX_BANDWIDTH],
             head: 0,
@@ -298,20 +291,37 @@ impl Engine {
         self.bandwidth.fill(Bandwidth::EMPTY);
     }
     pub fn attach(&mut self, id: u64, interface_index: u32) -> bool {
-        if id == 0 || self.adapters.iter().any(|s| s.id == id) {
+        if id == 0 || self.adapters.iter().any(|a| a.id == id) {
             return false;
         }
-        if let Some(s) = self.adapters.iter_mut().find(|s| s.id == 0) {
-            *s = Adapter {
-                id,
-                interface_index,
-                epoch: 1,
-                running: false,
-            };
-            true
-        } else {
-            false
+        let Some(adapter_slot) = self.adapters.iter().position(|a| a.id == 0) else {
+            return false;
+        };
+        let cache_slot = self
+            .interfaces
+            .iter()
+            .position(|c| c.users != 0 && c.interface_index == interface_index)
+            .or_else(|| self.interfaces.iter().position(|c| c.users == 0));
+        let Some(cache_slot) = cache_slot else {
+            return false;
+        };
+        let cache = &mut self.interfaces[cache_slot];
+        if cache.users == 0 {
+            cache.interface_index = interface_index;
+            cache.dirty = cache.caches.bytes() != 0;
+            if !cache.dirty {
+                cache.caches = Caches::new(self.cache_allocator);
+            }
         }
+        cache.users += 1;
+        self.adapters[adapter_slot] = Adapter {
+            id,
+            interface_index,
+            epoch: 1,
+            cache_slot,
+            running: false,
+        };
+        true
     }
     pub fn restart(&mut self, id: u64) -> bool {
         if let Some(s) = self.adapters.iter_mut().find(|s| s.id == id) {
@@ -327,19 +337,16 @@ impl Engine {
     pub fn invalidate(&mut self, id: u64, pause: bool) {
         if let Some(s) = self.adapters.iter_mut().find(|s| s.id == id) {
             s.epoch = s.epoch.saturating_add(1);
+            self.interfaces[s.cache_slot].dirty = true;
             if pause || s.epoch == u64::MAX {
                 s.running = false;
-            }
-        }
-        for c in &mut self.cache {
-            if c.key.adapter == id {
-                c.valid = false;
             }
         }
     }
     pub fn detach(&mut self, id: u64) {
         self.invalidate(id, true);
         if let Some(s) = self.adapters.iter_mut().find(|s| s.id == id) {
+            self.interfaces[s.cache_slot].users -= 1;
             s.id = 0;
         }
     }
@@ -352,45 +359,72 @@ impl Engine {
     fn live(&self, key: &Key) -> bool {
         self.epoch(key.adapter) == Some(key.epoch)
     }
+    // Immediately disable all old tables; retire one pair at a time outside the
+    // driver lock rather than returning a large per-interface array on its stack.
     pub fn clear_cache(&mut self) {
-        for c in &mut self.cache {
-            c.valid = false;
+        for interface in &mut self.interfaces {
+            interface.dirty = interface.caches.bytes() != 0;
         }
     }
-    pub fn clean(&mut self, now: u64) {
-        for c in &mut self.cache {
-            if c.expires <= now {
-                c.valid = false;
+    pub fn take_retired_caches(&mut self) -> Option<Caches> {
+        let interface = self.interfaces.iter_mut().find(|c| c.dirty)?;
+        interface.dirty = false;
+        Some(interface.caches.clear())
+    }
+    pub fn clean_with_work(&mut self, now: u64, work: &mut CacheWork) {
+        // One interface per pass. Insertions also migrate/sweep their own table.
+        for _ in 0..MAX_ADAPTERS {
+            let slot = self.cache_cursor;
+            self.cache_cursor = (slot + 1) % MAX_ADAPTERS;
+            let interface = &mut self.interfaces[slot];
+            if !interface.dirty && interface.caches.bytes() != 0 {
+                interface.caches.maintain(now, work);
+                break;
             }
         }
     }
-    fn cache_lookup(&self, key: &Key, now: u64) -> Option<bool> {
-        let start = key.hash() % (MAX_CACHE / WAYS) * WAYS;
-        self.cache[start..start + WAYS]
-            .iter()
-            .find(|c| c.valid && c.expires > now && c.key == *key)
-            .map(|c| c.allow)
+    pub fn clean(&mut self, now: u64) {
+        while let Some(retired) = self.take_retired_caches() {
+            drop(retired);
+        }
+        self.clean_with_work(now, &mut CacheWork::empty());
     }
-    fn cache_insert(&mut self, key: Key, allow: bool, now: u64) {
-        let start = key.hash() % (MAX_CACHE / WAYS) * WAYS;
-        let slots = &mut self.cache[start..start + WAYS];
-        let index = slots
+    fn cache_bank(&self, key: &Key, packet: &Packet) -> Option<usize> {
+        if !packet.cacheable
+            || !matches!(packet.connection.protocol, 6 | 17)
+            || key.flow.protocol != packet.connection.protocol
+            || key.flow.ipv6 != packet.connection.ipv6
+        {
+            return None;
+        }
+        let adapter = self
+            .adapters
             .iter()
-            .position(|c| !c.valid || c.expires <= now || c.key == key)
-            .unwrap_or_else(|| {
-                slots
-                    .iter()
-                    .enumerate()
-                    .min_by_key(|(_, c)| c.expires)
-                    .map(|(i, _)| i)
-                    .unwrap_or(0)
-            });
-        slots[index] = Cached {
-            valid: true,
-            key,
-            allow,
-            expires: now.saturating_add(self.cache_ttl),
-        };
+            .find(|a| a.id == key.adapter && a.running && a.epoch == key.epoch)?;
+        (!self.interfaces[adapter.cache_slot].dirty).then_some(adapter.cache_slot)
+    }
+    pub fn cache_plan(&self, id: u64, verdict: Verdict, now: u64) -> Option<CachePlan> {
+        if !verdict.permanent() || !self.online {
+            return None;
+        }
+        let p = self
+            .pending
+            .iter()
+            .find(|p| p.id == id && id != 0 && p.deadline > now)?;
+        let bank = self.cache_bank(&p.key, &p.packet)?;
+        self.interfaces[bank].caches.plan(&p.packet.connection)
+    }
+    fn cache_counts(&self) -> (usize, usize) {
+        self.interfaces
+            .iter()
+            .filter(|c| !c.dirty)
+            .fold((0, 0), |(v4, v6), c| {
+                let counts = c.caches.counts();
+                (v4 + counts.0, v6 + counts.1)
+            })
+    }
+    fn cache_bytes(&self) -> usize {
+        self.interfaces.iter().map(|c| c.caches.bytes()).sum()
     }
     fn account(&mut self, packet: &Packet, allow: bool) {
         if allow {
@@ -417,16 +451,58 @@ impl Engine {
         self.stats.overflow = self.stats.overflow.saturating_add(1);
         self.stats.dropped = self.stats.dropped.saturating_add(1);
     }
-    // This is only an allocation/copy optimization, not a reservation. submit()
-    // rechecks session, epoch, cache and capacity after the unlocked packet copy.
+    fn event_room(&self, packet: &Packet) -> bool {
+        self.has_room(connection_header_len(&packet.connection) + packet.payload_len as usize)
+            && self.pending_count() < MAX_PENDING
+            && self.next_id != u64::MAX
+    }
+    // Read-only allocation hint: this cannot refresh idle expiry or admit traffic.
     pub fn wants_event(&self, key: &Key, packet: &Packet, now: u64) -> bool {
         self.live(key)
             && self.online
-            && (!packet.cacheable || self.cache_lookup(key, now).is_none())
-            && self
-                .has_room(connection_header_len(&packet.connection) + packet.payload_len as usize)
-            && self.pending_count() < MAX_PENDING
-            && self.next_id != u64::MAX
+            && self.cache_bank(key, packet).is_none_or(|bank| {
+                self.interfaces[bank]
+                    .caches
+                    .get(&packet.connection, now)
+                    .is_none()
+            })
+            && self.event_room(packet)
+    }
+    fn immediate(&mut self, key: &Key, packet: &Packet, token: usize, now: u64) -> Option<Action> {
+        let allow = if !self.live(key) {
+            false
+        } else if !self.online {
+            self.fallback() == Finish::Allow
+        } else {
+            let bank = self.cache_bank(key, packet)?;
+            let allow =
+                self.interfaces[bank]
+                    .caches
+                    .apply(&packet.connection, now, self.cache_ttl)?;
+            self.stats.cache_hits = self.stats.cache_hits.saturating_add(1);
+            allow
+        };
+        self.stats.received = self.stats.received.saturating_add(1);
+        self.account(packet, allow);
+        Some(Action {
+            token,
+            finish: if allow { Finish::Allow } else { Finish::Drop },
+        })
+    }
+    // The driver returns cache hits here: one lookup, no packet capture or second
+    // policy-lock acquisition. Only misses proceed to the unlocked event copy.
+    pub fn preflight(
+        &mut self,
+        key: &Key,
+        packet: &Packet,
+        token: usize,
+        now: u64,
+    ) -> Result<bool, Action> {
+        if let Some(action) = self.immediate(key, packet, token, now) {
+            Err(action)
+        } else {
+            Ok(self.event_room(packet))
+        }
     }
     pub fn submit(
         &mut self,
@@ -437,37 +513,17 @@ impl Engine {
         now: u64,
         record: Option<Vec<u8>>,
     ) -> Submission {
+        if let Some(action) = self.immediate(&key, &packet, token, now) {
+            return Submission::Finish(action);
+        }
         self.stats.received = self.stats.received.saturating_add(1);
-        let Some(interface_index) = self
+        // immediate() already rejected paused/stale module identities.
+        let interface_index = self
             .adapters
             .iter()
-            .find(|a| a.id == key.adapter && a.running && a.epoch == key.epoch)
-            .map(|a| a.interface_index)
-        else {
-            self.account(&packet, false);
-            return Submission::Finish(Action {
-                token,
-                finish: Finish::Drop,
-            });
-        };
-        let immediate = if !self.online {
-            Some(self.fallback() == Finish::Allow)
-        } else if packet.cacheable {
-            let c = self.cache_lookup(&key, now);
-            if c.is_some() {
-                self.stats.cache_hits = self.stats.cache_hits.saturating_add(1);
-            }
-            c
-        } else {
-            None
-        };
-        if let Some(allow) = immediate {
-            self.account(&packet, allow);
-            return Submission::Finish(Action {
-                token,
-                finish: if allow { Finish::Allow } else { Finish::Drop },
-            });
-        }
+            .find(|a| a.id == key.adapter)
+            .unwrap()
+            .interface_index;
         let payload_len = packet.payload_len as usize;
         let expected = connection_header_len(&packet.connection) + payload_len;
         if payload_len > MAX_PAYLOAD || record.as_ref().is_some_and(|data| data.len() != expected) {
@@ -531,6 +587,19 @@ impl Engine {
         }
     }
     pub fn verdict(&mut self, id: u64, verdict: Verdict, now: u64) -> Result<Action, VerdictError> {
+        while let Some(retired) = self.take_retired_caches() {
+            drop(retired);
+        }
+        let mut work = CacheWork::prepare(self.cache_plan(id, verdict, now));
+        self.verdict_with_work(id, verdict, now, &mut work)
+    }
+    pub fn verdict_with_work(
+        &mut self,
+        id: u64,
+        verdict: Verdict,
+        now: u64,
+        work: &mut CacheWork,
+    ) -> Result<Action, VerdictError> {
         let slot = self
             .pending
             .iter()
@@ -540,8 +609,20 @@ impl Engine {
         if p.deadline <= now || !self.online || !self.live(&p.key) {
             return Err(VerdictError::NotFound);
         }
-        if verdict.permanent() && p.packet.cacheable {
-            self.cache_insert(p.key, verdict.allows(), now);
+        if verdict.permanent()
+            && let Some(bank) = self.cache_bank(&p.key, &p.packet)
+            && !self.interfaces[bank].caches.insert(
+                &p.packet.connection,
+                Decision {
+                    allow: verdict.allows(),
+                    expires: now.saturating_add(self.cache_ttl),
+                },
+                now,
+                work,
+            )
+        {
+            self.stats.cache_allocation_failures =
+                self.stats.cache_allocation_failures.saturating_add(1);
         }
         Ok(self.claim(
             slot,
@@ -682,13 +763,16 @@ impl Engine {
         let s = self.stats;
         let _ = write!(
             text,
-            "HyperVXNdisFilter: fixed_bytes={} event_bytes={}/{} pending={}/{} cached={} rx={} allow={} drop={} queued={} cache_hits={} timeout={} overflow={} cancel={} invalidated={} malformed={} non_ip={}",
+            "HyperVXNdisFilter: fixed_bytes={} event_bytes={}/{} pending={}/{} cached_v4={} cached_v6={} cache_bytes={} cache_alloc_fail={} rx={} allow={} drop={} queued={} cache_hits={} timeout={} overflow={} cancel={} invalidated={} malformed={} non_ip={}",
             core::mem::size_of::<Self>(),
             self.queued_bytes,
             MAX_EVENT_BYTES,
             self.pending_count(),
             MAX_PENDING,
-            self.cache.iter().filter(|c| c.valid).count(),
+            self.cache_counts().0,
+            self.cache_counts().1,
+            self.cache_bytes(),
+            s.cache_allocation_failures,
             s.received,
             s.allowed,
             s.dropped,
@@ -752,6 +836,7 @@ mod tests {
             adapter: 1,
             epoch: e.epoch(1).unwrap(),
             vlan,
+            flow: packet().flow,
             ..Key::EMPTY
         }
     }
@@ -822,42 +907,78 @@ mod tests {
         }
     }
     #[test]
-    fn permanent_scoped_to_adapter_path_vlan_epoch() {
-        let mut e = engine();
-        let k = key(&e, 1);
-        let id = submit(&mut e, k, 11);
-        assert_eq!(
-            e.verdict(id, Verdict::PermanentAccept, 101).unwrap(),
-            Action {
-                token: 11,
-                finish: Finish::Allow
+    fn permanent_cache_identity_is_tuple_only_inside_each_interface() {
+        for ipv6 in [false, true] {
+            let mut e = engine();
+            let mut p = packet();
+            p.flow.ipv6 = ipv6;
+            p.connection.ipv6 = ipv6;
+            p.flow.source[0] = 10;
+            p.flow.destination[0] = 20;
+            p.flow.source_port = 12345;
+            p.flow.destination_port = 443;
+            p.orient(NdisPath::Receive);
+            let k = Key {
+                flow: p.flow,
+                ..key(&e, 1)
+            };
+            let Submission::Pending(id) = e.submit(k, p, 11, 0, 100, record(&p)) else {
+                panic!();
+            };
+            e.verdict(id, Verdict::PermanentAccept, 101).unwrap();
+            assert!(e.attach(2, 101));
+            assert!(e.restart(2));
+            assert!(e.attach(3, 102));
+            assert!(e.restart(3));
+            for (protocol, path, vlan, adapter) in [
+                (17, NdisPath::Receive, 1, 1),
+                (6, NdisPath::Receive, 1, 1),
+                (17, NdisPath::Send, 1, 1),
+                (17, NdisPath::Receive, 2, 1),
+                (17, NdisPath::Receive, 1, 2),
+            ] {
+                let mut other = p;
+                other.flow.protocol = protocol;
+                other.connection.protocol = protocol;
+                if path == NdisPath::Send {
+                    core::mem::swap(&mut other.flow.source, &mut other.flow.destination);
+                    core::mem::swap(
+                        &mut other.flow.source_port,
+                        &mut other.flow.destination_port,
+                    );
+                }
+                other.orient(path);
+                assert_eq!(other.connection.local_ip, p.connection.local_ip);
+                assert_eq!(other.connection.remote_ip, p.connection.remote_ip);
+                let other_key = Key {
+                    adapter,
+                    epoch: e.epoch(adapter).unwrap(),
+                    path,
+                    vlan,
+                    flow: other.flow,
+                };
+                assert_eq!(
+                    e.preflight(&other_key, &other, 12, 102),
+                    Err(Action {
+                        token: 12,
+                        finish: Finish::Allow
+                    })
+                );
             }
-        );
-        assert!(matches!(
-            e.submit(k, packet(), 12, 42, 102, record(&packet())),
-            Submission::Finish(Action {
-                finish: Finish::Allow,
-                ..
-            })
-        ));
-        for changed in [
-            Key {
-                path: NdisPath::Send,
+            assert_eq!(e.cache_counts(), if ipv6 { (0, 1) } else { (1, 0) });
+            let other_interface = Key {
+                adapter: 3,
+                epoch: e.epoch(3).unwrap(),
                 ..k
-            },
-            Key { vlan: 2, ..k },
-        ] {
-            let _ = submit(&mut e, changed, 13);
+            };
+            assert_eq!(e.preflight(&other_interface, &p, 13, 102), Ok(true));
+            assert!(matches!(
+                e.submit(other_interface, p, 13, 0, 102, record(&p)),
+                Submission::Pending(_)
+            ));
         }
-        assert!(e.attach(2, 101));
-        e.restart(2);
-        let other = Key {
-            adapter: 2,
-            epoch: e.epoch(2).unwrap(),
-            ..k
-        };
-        let _ = submit(&mut e, other, 14);
     }
+
     #[test]
     fn temporary_verdict_never_caches_and_duplicate_rejected() {
         let mut e = engine();
@@ -1231,22 +1352,479 @@ mod tests {
         ));
     }
     #[test]
+    fn permanent_accept_tcp_udp_ttl_tracks_last_cache_hit() {
+        for protocol in [6, 17] {
+            for ipv6 in [false, true] {
+                for path in [NdisPath::Send, NdisPath::Receive] {
+                    let mut e = engine();
+                    e.configure(2000, 1000, false);
+                    let mut p = packet();
+                    p.flow.protocol = protocol;
+                    p.connection.protocol = protocol;
+                    p.flow.ipv6 = ipv6;
+                    p.connection.ipv6 = ipv6;
+                    p.orient(path);
+                    let k = Key {
+                        path,
+                        flow: p.flow,
+                        ..key(&e, 1)
+                    };
+                    let Submission::Pending(id) = e.submit(k, p, 1, 0, 100, record(&p)) else {
+                        panic!("expected initial decision");
+                    };
+                    e.verdict(id, Verdict::PermanentAccept, 101).unwrap();
+                    e.read(&mut [0; 512]);
+                    for (token, now) in [(2, 1100), (3, 2099), (4, 3098)] {
+                        e.clean(now);
+                        assert!(!e.wants_event(&k, &p, now));
+                        assert_eq!(
+                            e.submit(k, p, token, 0, now, None),
+                            Submission::Finish(Action {
+                                token,
+                                finish: Finish::Allow
+                            })
+                        );
+                    }
+                    assert_eq!(e.stats().cache_hits, 3);
+                    assert_eq!(e.stats().queued, 1);
+                    assert_eq!(e.pending_count(), 0);
+                    assert!(!e.has_events());
+                    assert!(!e.wants_event(&k, &p, 4097));
+                    e.clean(4098);
+                    assert!(e.wants_event(&k, &p, 4098));
+                    assert!(matches!(
+                        e.submit(k, p, 5, 0, 4098, record(&p)),
+                        Submission::Pending(_)
+                    ));
+                }
+            }
+        }
+    }
+    #[test]
+    fn preflight_and_uncacheable_packets_do_not_refresh_accept_ttl() {
+        let mut e = engine();
+        e.configure(2000, 1000, false);
+        let p = packet();
+        let k = Key {
+            flow: p.flow,
+            ..key(&e, 1)
+        };
+        let Submission::Pending(id) = e.submit(k, p, 1, 0, 100, record(&p)) else {
+            panic!();
+        };
+        e.verdict(id, Verdict::PermanentAccept, 101).unwrap();
+        assert!(!e.wants_event(&k, &p, 1100));
+        assert_eq!(e.stats().cache_hits, 0);
+        let mut uncacheable = p;
+        uncacheable.cacheable = false;
+        assert!(e.wants_event(&k, &uncacheable, 1100));
+        let Submission::Pending(id) = e.submit(k, uncacheable, 2, 0, 1100, record(&uncacheable))
+        else {
+            panic!("uncacheable traffic must still request a verdict");
+        };
+        e.verdict(id, Verdict::PermanentAccept, 1100).unwrap();
+        assert_eq!(e.stats().cache_hits, 0);
+        assert!(e.wants_event(&k, &p, 1101));
+        assert!(matches!(
+            e.submit(k, p, 3, 0, 1101, record(&p)),
+            Submission::Pending(_)
+        ));
+    }
+    #[test]
+    fn cache_activity_refreshes_only_the_matching_tuple_and_interface() {
+        let mut e = engine();
+        e.configure(2000, 1000, false);
+        assert!(e.attach(2, 102));
+        assert!(e.restart(2));
+        let p = packet();
+        let k = Key {
+            flow: p.flow,
+            ..key(&e, 1)
+        };
+        for other in [
+            Key {
+                adapter: 2,
+                epoch: e.epoch(2).unwrap(),
+                ..k
+            },
+            Key {
+                flow: Flow {
+                    source_port: 1234,
+                    ..k.flow
+                },
+                ..k
+            },
+            Key {
+                flow: Flow {
+                    destination_port: 53,
+                    ..k.flow
+                },
+                ..k
+            },
+            Key {
+                flow: Flow {
+                    source: [1; 16],
+                    ..k.flow
+                },
+                ..k
+            },
+            Key {
+                flow: Flow {
+                    destination: [2; 16],
+                    ..k.flow
+                },
+                ..k
+            },
+        ] {
+            e.clear_cache();
+            let mut other_packet = p;
+            other_packet.flow = other.flow;
+            other_packet.orient(other.path);
+            for (key, packet) in [(k, p), (other, other_packet)] {
+                let Submission::Pending(id) = e.submit(key, packet, 1, 0, 100, record(&packet))
+                else {
+                    panic!();
+                };
+                e.verdict(id, Verdict::PermanentAccept, 101).unwrap();
+            }
+            e.read(&mut [0; 512]);
+            assert_eq!(
+                e.submit(k, p, 2, 0, 1100, None),
+                Submission::Finish(Action {
+                    token: 2,
+                    finish: Finish::Allow
+                })
+            );
+            e.clean(1101);
+            assert!(!e.wants_event(&k, &p, 1101));
+            assert!(e.wants_event(&other, &other_packet, 1101));
+        }
+    }
+
+    #[test]
+    fn expired_accept_is_not_revived_by_new_traffic() {
+        for sweep in [false, true] {
+            let mut e = engine();
+            e.configure(2000, 1000, false);
+            let p = packet();
+            let k = Key {
+                flow: p.flow,
+                ..key(&e, 1)
+            };
+            let Submission::Pending(id) = e.submit(k, p, 1, 0, 100, record(&p)) else {
+                panic!();
+            };
+            e.verdict(id, Verdict::PermanentAccept, 101).unwrap();
+            if sweep {
+                e.clean(1101);
+            }
+            assert!(e.wants_event(&k, &p, 1101));
+            let Submission::Pending(id) = e.submit(k, p, 2, 0, 1101, record(&p)) else {
+                panic!("expired cache entry must require a new verdict");
+            };
+            assert_eq!(e.stats().cache_hits, 0);
+            e.verdict(id, Verdict::PermanentAccept, 1102).unwrap();
+            assert!(!e.wants_event(&k, &p, 2101));
+            assert!(e.wants_event(&k, &p, 2102));
+        }
+    }
+    #[test]
+    fn accept_ttl_refresh_saturates_instead_of_wrapping() {
+        let mut e = engine();
+        e.configure(2000, 1000, false);
+        let p = packet();
+        let k = Key {
+            flow: p.flow,
+            ..key(&e, 1)
+        };
+        let now = u64::MAX - 1500;
+        let Submission::Pending(id) = e.submit(k, p, 1, 0, now, record(&p)) else {
+            panic!();
+        };
+        e.verdict(id, Verdict::PermanentAccept, now + 1).unwrap();
+        assert!(matches!(
+            e.submit(k, p, 2, 0, u64::MAX - 600, None),
+            Submission::Finish(Action {
+                finish: Finish::Allow,
+                ..
+            })
+        ));
+        assert!(!e.wants_event(&k, &p, u64::MAX - 1));
+        assert!(e.wants_event(&k, &p, u64::MAX));
+    }
+    #[test]
     fn ttl_expiry_requires_a_new_decision() {
+        for verdict in [Verdict::PermanentBlock, Verdict::PermanentDrop] {
+            for protocol in [6, 17] {
+                let mut e = engine();
+                let mut p = packet();
+                p.flow.protocol = protocol;
+                p.connection.protocol = protocol;
+                let k = Key {
+                    flow: p.flow,
+                    ..key(&e, 1)
+                };
+                let Submission::Pending(id) = e.submit(k, p, 1, 0, 100, record(&p)) else {
+                    panic!();
+                };
+                e.verdict(id, verdict, 101).unwrap();
+                assert!(matches!(
+                    e.submit(k, p, 2, 0, 60100, None),
+                    Submission::Finish(Action {
+                        finish: Finish::Drop,
+                        ..
+                    })
+                ));
+                assert!(matches!(
+                    e.submit(k, p, 3, 0, 60101, record(&p)),
+                    Submission::Pending(_)
+                ));
+            }
+        }
+    }
+    #[test]
+    fn invalidation_clears_only_that_interface_pair_and_reclaims_unlocked() {
+        let mut e = engine();
+        assert!(e.attach(2, 102));
+        assert!(e.restart(2));
+        let mut keys = [Key::EMPTY; 2];
+        for (slot, adapter) in [1, 2].into_iter().enumerate() {
+            for ipv6 in [false, true] {
+                let mut p = packet();
+                p.flow.ipv6 = ipv6;
+                p.connection.ipv6 = ipv6;
+                let k = Key {
+                    adapter,
+                    epoch: e.epoch(adapter).unwrap(),
+                    flow: p.flow,
+                    ..Key::EMPTY
+                };
+                let Submission::Pending(id) = e.submit(k, p, 1, 0, 100, record(&p)) else {
+                    panic!();
+                };
+                e.verdict(
+                    id,
+                    if adapter == 1 {
+                        Verdict::PermanentAccept
+                    } else {
+                        Verdict::PermanentDrop
+                    },
+                    101,
+                )
+                .unwrap();
+                if !ipv6 {
+                    keys[slot] = k;
+                }
+            }
+        }
+        assert_eq!(e.cache_counts(), (2, 2));
+        e.invalidate(1, false);
+        let first = Key {
+            epoch: e.epoch(1).unwrap(),
+            ..keys[0]
+        };
+        assert_eq!(e.preflight(&first, &packet(), 2, 102), Ok(true));
+        assert_eq!(
+            e.preflight(&keys[1], &packet(), 3, 102),
+            Err(Action {
+                token: 3,
+                finish: Finish::Drop
+            })
+        );
+        assert_eq!(e.cache_counts(), (1, 1));
+        let retired = e.take_retired_caches().unwrap();
+        assert_eq!(retired.counts(), (1, 1));
+        assert!(retired.bytes() > 0);
+        drop(retired);
+        assert!(e.take_retired_caches().is_none());
+        assert_eq!(e.preflight(&first, &packet(), 4, 102), Ok(true));
+        assert_eq!(
+            e.preflight(&keys[1], &packet(), 5, 102),
+            Err(Action {
+                token: 5,
+                finish: Finish::Drop
+            })
+        );
+    }
+    #[test]
+    fn only_tcp_udp_can_create_or_consume_permanent_cache() {
+        for ipv6 in [false, true] {
+            for protocol in [0, 1, 2, 47, 50, 58, 255] {
+                for verdict in [
+                    Verdict::PermanentAccept,
+                    Verdict::PermanentBlock,
+                    Verdict::PermanentDrop,
+                ] {
+                    let mut e = engine();
+                    let mut p = packet();
+                    p.flow.ipv6 = ipv6;
+                    p.connection.ipv6 = ipv6;
+                    p.flow.protocol = protocol;
+                    p.connection.protocol = protocol;
+                    // Deliberately set cacheable: the engine enforces TCP/UDP too.
+                    let k = Key {
+                        flow: p.flow,
+                        ..key(&e, 1)
+                    };
+                    let Submission::Pending(id) = e.submit(k, p, 1, 0, 100, record(&p)) else {
+                        panic!();
+                    };
+                    assert!(e.cache_plan(id, verdict, 101).is_none());
+                    e.verdict(id, verdict, 101).unwrap();
+                    assert_eq!(e.cache_counts(), (0, 0));
+                    assert_eq!(e.cache_bytes(), 0);
+                    assert_eq!(e.preflight(&k, &p, 2, 102), Ok(true));
+                    assert!(matches!(
+                        e.submit(k, p, 2, 0, 102, record(&p)),
+                        Submission::Pending(_)
+                    ));
+                    assert_eq!(e.stats().cache_hits, 0);
+                }
+            }
+        }
+    }
+    #[test]
+    fn dynamic_cache_keeps_more_than_1024_verdicts_per_family() {
+        let mut e = engine();
+        e.read(&mut [0; 512]);
+        for ipv6 in [false, true] {
+            for n in 0..1536u32 {
+                let mut p = packet();
+                p.flow.ipv6 = ipv6;
+                p.connection.ipv6 = ipv6;
+                p.flow.source[..4].copy_from_slice(&n.to_le_bytes());
+                p.orient(NdisPath::Receive);
+                let k = Key {
+                    flow: p.flow,
+                    ..key(&e, 1)
+                };
+                let Submission::Pending(id) = e.submit(k, p, 1, 0, 100, record(&p)) else {
+                    panic!();
+                };
+                e.verdict(id, Verdict::PermanentAccept, 101).unwrap();
+                e.read(&mut [0; 256]);
+            }
+        }
+        assert_eq!(e.cache_counts(), (1536, 1536));
+        for ipv6 in [false, true] {
+            for n in 0..1536u32 {
+                let mut p = packet();
+                p.flow.ipv6 = ipv6;
+                p.connection.ipv6 = ipv6;
+                p.flow.source[..4].copy_from_slice(&n.to_le_bytes());
+                p.orient(NdisPath::Receive);
+                let k = Key {
+                    flow: p.flow,
+                    ..key(&e, 1)
+                };
+                assert_eq!(
+                    e.preflight(&k, &p, 2, 102),
+                    Err(Action {
+                        token: 2,
+                        finish: Finish::Allow
+                    })
+                );
+            }
+        }
+        assert_eq!(e.stats().cache_hits, 3072);
+        assert_eq!(e.stats().received, 6144);
+        assert_eq!(e.stats().cache_allocation_failures, 0);
+    }
+    #[test]
+    fn reused_interface_index_and_module_id_start_with_empty_caches() {
         let mut e = engine();
         let k = key(&e, 1);
         let id = submit(&mut e, k, 1);
         e.verdict(id, Verdict::PermanentDrop, 101).unwrap();
-        assert!(matches!(
-            e.submit(k, packet(), 2, 0, 60100, record(&packet())),
-            Submission::Finish(Action {
-                finish: Finish::Drop,
-                ..
+        e.invalidate(1, false);
+        let k = key(&e, 1);
+        let id = submit(&mut e, k, 2);
+        e.verdict(id, Verdict::PermanentAccept, 101).unwrap();
+        assert_eq!(
+            e.preflight(&k, &packet(), 3, 102),
+            Err(Action {
+                token: 3,
+                finish: Finish::Allow
             })
-        ));
-        assert!(matches!(
-            e.submit(k, packet(), 3, 0, 60101, record(&packet())),
-            Submission::Pending(_)
-        ));
+        );
+        e.detach(1);
+        assert!(e.attach(1, 101));
+        assert!(e.restart(1));
+        let k = key(&e, 1);
+        assert_eq!(e.preflight(&k, &packet(), 4, 102), Ok(true));
+        e.clear_cache();
+        e.clean(102);
+        assert_eq!(e.cache_bytes(), 0);
+    }
+    #[test]
+    fn cache_allocation_failure_does_not_change_current_packet_verdict() {
+        unsafe fn fail(_: usize) -> *mut u8 {
+            core::ptr::null_mut()
+        }
+        unsafe fn free(_: *mut u8, _: usize) {
+            panic!("no allocation should exist");
+        }
+        for verdict in [
+            Verdict::PermanentAccept,
+            Verdict::PermanentBlock,
+            Verdict::PermanentDrop,
+        ] {
+            let allocator = unsafe { CacheAllocator::new(fail, free) };
+            let mut e = Box::new(Engine::with_cache_allocator(allocator));
+            assert!(e.attach(1, 101));
+            assert!(e.restart(1));
+            e.connect();
+            let k = key(&e, 1);
+            let id = submit(&mut e, k, 1);
+            let action = e.verdict(id, verdict, 101).unwrap();
+            assert_eq!(
+                action.finish,
+                if verdict.allows() {
+                    Finish::Allow
+                } else {
+                    Finish::Drop
+                }
+            );
+            assert_eq!(e.cache_bytes(), 0);
+            assert_eq!(e.stats().cache_allocation_failures, 1);
+            assert_eq!(e.preflight(&k, &packet(), 2, 102), Ok(true));
+        }
+    }
+    #[test]
+    fn cache_key_ignores_ethernet_addresses_and_protocol_but_not_interface() {
+        let mut e = engine();
+        let k = key(&e, 1);
+        let id = submit(&mut e, k, 1);
+        e.verdict(id, Verdict::PermanentAccept, 101).unwrap();
+        let mut p = packet();
+        p.flow.l2 = [42; 22];
+        p.flow.l2_len = 14;
+        let changed = Key { flow: p.flow, ..k };
+        assert_eq!(
+            e.preflight(&changed, &p, 2, 102),
+            Err(Action {
+                token: 2,
+                finish: Finish::Allow
+            })
+        );
+        p.flow.protocol = 6;
+        p.connection.protocol = 6;
+        let changed = Key { flow: p.flow, ..k };
+        assert_eq!(
+            e.preflight(&changed, &p, 3, 102),
+            Err(Action {
+                token: 3,
+                finish: Finish::Allow
+            })
+        );
+        assert!(e.attach(2, 102));
+        assert!(e.restart(2));
+        let changed = Key {
+            adapter: 2,
+            epoch: e.epoch(2).unwrap(),
+            ..k
+        };
+        assert_eq!(e.preflight(&changed, &packet(), 4, 102), Ok(true));
     }
     #[test]
     fn bandwidth_combines_guest_normalized_tx_and_rx() {

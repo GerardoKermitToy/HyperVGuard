@@ -22,6 +22,8 @@ All product identities use the new name: service `HyperVXNdisFilter`, device `\\
 
 The default build is unsigned. For signing, pass `-PfxPath` and `-RootCertificate` to the build script. The local test-PFX password defaults to `1`; a nonempty process environment variable `HYPERVXNDISFILTER_PFX_PASSWORD` overrides that default, and an explicit `-PfxPassword` overrides both (including an explicitly empty password). The script does not import certificates or change security policy. Installation requires trusted package signatures.
 
+The separate [offline cache lookup benchmark](policy/examples/README.md) compares the actual driver cache with standard Rust `HashMap`/`BTreeMap` variants on generated IPv4/IPv6 TCP/UDP tuples. Its signed user-mode runner does not build/install/open the driver or change the production cache.
+
 ## Install
 
 Use an **elevated Administrator/SYSTEM console**, stop the monitor, and have local recovery access: network reconfiguration may interrupt connectivity. If already installed, use `Uninstall.exe` first; the installer does not replace a live driver.
@@ -284,17 +286,27 @@ IP arrays contain network-order address bytes. IPv4 uses the first four bytes; t
 | `Verdict` | Byte | Effect |
 |---|---:|---|
 | `Accept` | 2 | Allow this NBL. |
-| `PermanentAccept` | 3 | Allow and cache the directional decision when the packet is cacheable. |
+| `PermanentAccept` | 3 | Allow and cache the TCP/UDP tuple decision when cacheable; matching cache hits refresh its idle TTL. |
 | `Block` | 4 | Silently discard this NBL. |
-| `PermanentBlock` | 5 | Discard and cache the directional decision when cacheable. |
+| `PermanentBlock` | 5 | Discard and cache the TCP/UDP tuple decision when cacheable. |
 | `Drop` | 6 | Silently discard this NBL; same data-path action as Block. |
-| `PermanentDrop` | 7 | Discard and cache the directional decision when cacheable. |
+| `PermanentDrop` | 7 | Discard and cache the TCP/UDP tuple decision when cacheable. |
 
 No TCP RST or ICMP rejection is generated. `Undecided=0`, `Undeterminable=1`, `RedirectNameServer=8`, `RedirectTunnel=9`, `Failed=10`, and `RedirectSplitTunnel=11` are not accepted as verdicts.
 
 Pending decisions time out after **2000 ms by default**, measured from classification, not from when an application reads the event. The default fallback is **fail-open** on missing controller, disconnect/shutdown, timeout, or policy queue pressure. Pause/invalidated attachments, malformed packets, unsupported copy metadata, and unsafe ownership/copy-allocation cases can still be dropped regardless of fail-open.
 
-A permanent decision is a **directional TTL cache entry**, not lifetime socket permission. The default TTL is **60000 ms**; the key includes the internal module/epoch, NDIS send/receive path, VLAN, and flow. It does not authorize the reverse direction. Fragments, offloaded/incomplete transport headers, and multi-NB batches cannot seed permanent entries. Clear-cache, a new/disconnected controller session, and attachment invalidation discard cached decisions.
+A permanent decision is a **TTL cache entry for TCP/UDP only**, not lifetime socket permission. **Every host `interface_index` has its own independent pair of dynamically growing IPv4 and IPv6 hash tables.** There is no configured maximum entry count and no capacity-driven eviction of live decisions. Other IP protocols (including ICMP/ICMPv6) never create or use permanent entries: a permanent verdict applies only to that NBL, and the next packet still needs a decision.
+
+Within each table, the 64-bit lookup hash and full entry identity depend **exclusively on normalized `local_ip, local_port, remote_ip, remote_port`**. IPv4 uses four address bytes and IPv6 all sixteen. Full-tuple comparison resolves hash collisions. `interface_index` selects the table pair and is **not** part of the hash or stored tuple. Protocol, NDIS path/direction, VLAN, module/epoch and Ethernet MAC addresses are **not additional key fields or equality guards**. Consequently, TCP and UDP with identical endpoints on the same interface share one verdict; packets in both directions and different VLANs also share it when their normalized guest/peer tuples match. Different interface indices and IP families never share entries.
+
+Tables use a `no_std` SwissTable-style lookup: separate control bytes, 16-byte SSE2 groups on x64 with seven-bit hash fingerprints, triangular group probing, and a fast rotate/XOR/multiply word hash. Fingerprints only select candidates; full tuples still determine equality. The deterministic hash is not keyed protection against adversarial collisions. No standard-library map, AVX, or x87 is used in the driver. Baseline integer SSE2 follows Windows x64 compiler/ABI state preservation; no explicit extended-state save/restore is needed.
+
+Table storage uses fallible nonpaged allocations **separate from the 16 MiB packet-event allocation budget**. Allocation/control-byte initialization and retired-table frees occur outside the policy spin lock; rehash and expiry cleanup are incremental (32 slots per table/pass). Growth/compaction is requested at 75% live/used load, preserving empty slots without evicting live entries. A cache hit performs one cache lookup on the normal driver path (also checking the old table while migration is active) and needs no event capture/allocation. Expired entries stop matching immediately; physical reclamation is incremental. Memory is not infinite: if table allocation/growth fails, the current packet still receives its requested verdict, but no new cache entry is retained and later traffic requires another decision. Existing live entries remain intact; `PrintMemoryStats` reports aggregate `cached_v4`, `cached_v6`, `cache_bytes` and `cache_alloc_fail` across interfaces.
+
+The default TTL is **60000 ms**. `PermanentAccept` uses a **sliding idle timeout**: the initial deadline is set when the verdict is applied, and each cacheable TCP/UDP packet actually admitted by that still-valid entry resets the deadline to its classification time plus `CacheTtlMs`. Either direction (and either TCP or UDP) refreshes the same matching tuple. Preliminary cache checks and uncacheable packets do not refresh it. At or after the deadline, a packet needs a new decision rather than reviving the expired entry. `PermanentBlock` and `PermanentDrop` retain a **fixed TTL from verdict application**; matching traffic does not extend them.
+
+Fragments, offloaded/incomplete transport headers, and multi-NB batches cannot seed or refresh permanent entries. Clear-cache and a new/disconnected controller session reset every interface's pair of tables. Pause/attachment invalidation or detach immediately disables and discards the affected interface's entire pair, not individual generation-tagged entries; table storage is freed outside the policy lock. Other interfaces retain their entries. A recreated/reused interface starts without the prior cache. Internal module/epoch/path metadata is still used for pending NBL ownership, stale-verdict rejection and cancellation, but not cache identity.
 
 Optional service `Parameters` values, all `REG_DWORD`, are read when the SYS loads: `DecisionTimeoutMs=2000` (clamped to 100–60000), `CacheTtlMs=60000` (1000–300000), and `FailClosed=0` (nonzero changes the controller/timeout/queue fallback to drop). These are driver configuration, not protocol commands.
 
