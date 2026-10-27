@@ -102,7 +102,8 @@ static IO_CSQ ReadCsq;
 static LIST_ENTRY ReadIrps;
 static KSPIN_LOCK ReadLock;
 static PFILE_OBJECT ReadClient;
-static EX_RUNDOWN_REF ReadRundown, CacheRundown;
+static EX_RUNDOWN_REF ClassificationRundown, ReadRundown, CacheRundown;
+static UCHAR ClassificationClosed;
 static PIO_WORKITEM ReadWorkItem, CacheWorkItem;
 static volatile LONG ReadPending, ReadReady, ReadOnline, ReadScheduled; // ReadPending is a boolean.
 static volatile LONG CacheScheduled;
@@ -162,6 +163,20 @@ static void ReadCancelled(PIO_CSQ csq, PIRP irp) {
 static void SetReadClient(PFILE_OBJECT file) {
     KIRQL irql;
     KeAcquireSpinLock(&ReadLock, &irql); ReadClient = file; KeReleaseSpinLock(&ReadLock, irql);
+}
+// Device cleanup/shutdown closes admission before waiting for classifiers. The
+// rundown cycle is reopened only by the next exclusive device create.
+static void CloseClassificationSession(void) {
+    if (!HvSessionGateClose(&ClassificationClosed)) return;
+    ExWaitForRundownProtectionRelease(&ClassificationRundown);
+    HvDisconnect();
+}
+static void OpenClassificationSession(void) {
+    if (ClassificationClosed) {
+        ExReInitializeRundownProtection(&ClassificationRundown);
+        (void)HvSessionGateReopen(&ClassificationClosed);
+    }
+    HvConnect();
 }
 static void CancelReads(PFILE_OBJECT file) {
     PIRP irp;
@@ -303,13 +318,21 @@ static void SetFilterRunning(HV_ADAPTER* a, BOOLEAN running) {
     UNREFERENCED_PARAMETER(count);
     NdisReleaseSpinLock(&a->Lock);
 }
-static BOOLEAN BeginIo(HV_ADAPTER* a) {
+static BOOLEAN BeginIo(HV_ADAPTER* a, BOOLEAN* session) {
     BOOLEAN running;
+    // Acquire before taking the per-adapter lock so cleanup can close this
+    // session and wait for every admitted classifier before disconnecting.
+    *session = ExAcquireRundownProtection(&ClassificationRundown);
     NdisAcquireSpinLock(&a->Lock);
     running = a->Running;
     RetainActiveLocked(a); // Callback guard also protects rejects while pausing.
     NdisReleaseSpinLock(&a->Lock);
     return running;
+}
+
+static void EndIo(HV_ADAPTER* a, BOOLEAN session) {
+    if (session) ExReleaseRundownProtection(&ClassificationRundown);
+    ReleaseActive(a, 1);
 }
 static void FreeReceiveCopy(PNET_BUFFER_LIST nbl) {
     PNET_BUFFER nb = NET_BUFFER_LIST_FIRST_NB(nbl);
@@ -494,7 +517,7 @@ static HV_TOKEN* TakeForwarded(HV_ADAPTER* a, PNET_BUFFER_LIST nbl, ULONG direct
     return t;
 }
 static void ClassifyChain(HV_ADAPTER* a, PNET_BUFFER_LIST chain, NDIS_PORT_NUMBER port,
-    ULONG flags, ULONG direction, BOOLEAN resources, BOOLEAN admitted) {
+    ULONG flags, ULONG direction, BOOLEAN resources, BOOLEAN admitted, BOOLEAN session) {
     while (chain != NULL) {
         PNET_BUFFER_LIST nbl = chain;
         HV_TOKEN* t = NULL;
@@ -503,7 +526,7 @@ static void ClassifyChain(HV_ADAPTER* a, PNET_BUFFER_LIST chain, NDIS_PORT_NUMBE
         chain = NET_BUFFER_LIST_NEXT_NBL(nbl);
         // RESOURCES originals and their chain must be unchanged at callback exit.
         if (!resources) NET_BUFFER_LIST_NEXT_NBL(nbl) = NULL;
-        if (admitted) {
+        if (admitted && session) {
             NdisAcquireRWLockRead(a->ClassificationLock, &state, 0);
             t = CreateToken(a, nbl, port, flags, direction, resources);
             if (t != NULL) {
@@ -525,9 +548,10 @@ static void ClassifyChain(HV_ADAPTER* a, PNET_BUFFER_LIST chain, NDIS_PORT_NUMBE
 _Use_decl_annotations_
 void HvSend(NDIS_HANDLE context, PNET_BUFFER_LIST chain, NDIS_PORT_NUMBER port, ULONG flags) {
     HV_ADAPTER* a = context;
-    BOOLEAN admitted = BeginIo(a);
-    ClassifyChain(a, chain, port, flags, HV_DIRECTION_SEND, FALSE, admitted);
-    ReleaseActive(a, 1);
+    BOOLEAN session;
+    BOOLEAN admitted = BeginIo(a, &session);
+    ClassifyChain(a, chain, port, flags, HV_DIRECTION_SEND, FALSE, admitted, session);
+    EndIo(a, session);
 }
 _Use_decl_annotations_
 void HvSendComplete(NDIS_HANDLE context, PNET_BUFFER_LIST chain, ULONG flags) {
@@ -554,11 +578,12 @@ void HvCancelSend(NDIS_HANDLE context, PVOID cancel) {
 _Use_decl_annotations_
 void HvReceive(NDIS_HANDLE context, PNET_BUFFER_LIST chain, NDIS_PORT_NUMBER port, ULONG count, ULONG flags) {
     HV_ADAPTER* a = context;
-    BOOLEAN admitted = BeginIo(a);
+    BOOLEAN session;
+    BOOLEAN admitted = BeginIo(a, &session);
     UNREFERENCED_PARAMETER(count);
     ClassifyChain(a, chain, port, flags, HV_DIRECTION_RECEIVE,
-        (flags & NDIS_RECEIVE_FLAGS_RESOURCES) != 0, admitted);
-    ReleaseActive(a, 1);
+        (flags & NDIS_RECEIVE_FLAGS_RESOURCES) != 0, admitted, session);
+    EndIo(a, session);
 }
 _Use_decl_annotations_
 void HvReturn(NDIS_HANDLE context, PNET_BUFFER_LIST chain, ULONG flags) {
@@ -910,10 +935,10 @@ NTSTATUS HvDispatch(PDEVICE_OBJECT device, PIRP irp) {
     case IRP_MJ_CREATE:
         if (Stopping) status = STATUS_DELETE_PENDING;
         else if (Client != NULL) status = STATUS_SHARING_VIOLATION;
-        else {Client = stack->FileObject; SetReadClient(Client); HvConnect();}
+        else {Client = stack->FileObject; SetReadClient(Client); OpenClassificationSession();}
         break;
     case IRP_MJ_CLEANUP:
-        if (Client == stack->FileObject) {SetReadClient(NULL); HvDisconnect(); Client = NULL;}
+        if (Client == stack->FileObject) {SetReadClient(NULL); CloseClassificationSession(); Client = NULL;}
         cancelReads = TRUE;
         break;
     case IRP_MJ_CLOSE: break;
@@ -938,7 +963,7 @@ NTSTATUS HvDispatch(PDEVICE_OBJECT device, PIRP irp) {
                 else {RtlCopyMemory(irp->AssociatedIrp.SystemBuffer, HV_API_VERSION, sizeof(HV_API_VERSION)); transferred = sizeof(HV_API_VERSION);}
             } else if (code == SHUTDOWN_IOCTL) {
                 if (!HvIoctlInputEmpty(stack->Parameters.DeviceIoControl.InputBufferLength)) status = STATUS_INVALID_PARAMETER;
-                else {HvDisconnect(); cancelReads = TRUE;}
+                else {CloseClassificationSession(); cancelReads = TRUE;}
             }
             else if (code == FILTERED_DEVICE_COUNT_IOCTL) {
                 if (!HvIoctlInputEmpty(stack->Parameters.DeviceIoControl.InputBufferLength)) status = STATUS_INVALID_PARAMETER;
@@ -1097,6 +1122,7 @@ NTSTATUS hv_initialize(PDRIVER_OBJECT driver, PUNICODE_STRING registry) {
     KeInitializeTimer(&CacheTimer); KeInitializeDpc(&CacheTimerDpc, CacheDpc, NULL);
     KeInitializeSpinLock(&AdapterInfoLock); InitializeListHead(&Adapters);
     KeInitializeSpinLock(&ReadLock); InitializeListHead(&ReadIrps);
+    ExInitializeRundownProtection(&ClassificationRundown);
     ExInitializeRundownProtection(&ReadRundown);
     ExInitializeRundownProtection(&CacheRundown);
     status = IoCsqInitializeEx(&ReadCsq, ReadInsert, ReadRemove, ReadPeek,
@@ -1149,7 +1175,7 @@ void HvUnload(PDRIVER_OBJECT driver) {
     UNREFERENCED_PARAMETER(driver);
     if (ReadyEvent != NULL) KeClearEvent(ReadyEvent);
     ExAcquireFastMutex(&IoMutex); InterlockedExchange(&Stopping, TRUE);
-    SetReadClient(NULL); HvDisconnect(); Client = NULL; ExReleaseFastMutex(&IoMutex);
+    SetReadClient(NULL); CloseClassificationSession(); Client = NULL; ExReleaseFastMutex(&IoMutex);
     CancelReads(NULL);
     KeCancelTimer(&PendingTimer); KeCancelTimer(&CacheTimer); KeFlushQueuedDpcs();
     ExWaitForRundownProtectionRelease(&ReadRundown);

@@ -26,6 +26,18 @@ static int HvTargetMatches(unsigned long long target, unsigned long long actual)
 static int HvIoctlInputEmpty(unsigned long inputLength) {
     return inputLength == 0;
 }
+// Caller serializes these transitions with the device I/O mutex. The kernel
+// wraps each close/open transition with rundown wait/reinitialization.
+static int HvSessionGateClose(unsigned char* closed) {
+    if (*closed != 0) return 0;
+    *closed = 1;
+    return 1;
+}
+static int HvSessionGateReopen(unsigned char* closed) {
+    if (*closed == 0) return 0;
+    *closed = 0;
+    return 1;
+}
 // Caller holds the adapter lock and adds the returned delta to the global count.
 static int HvSetFilterRunning(unsigned char* state, int running) {
     int previous = *state != 0;

@@ -11,6 +11,13 @@ int main() {
     CHECK(!HvIoctlInputEmpty(1));
     CHECK(!HvIoctlInputEmpty(~0ul));
 
+    unsigned char session_closed = 0;
+    CHECK(HvSessionGateClose(&session_closed) == 1 && session_closed == 1);
+    // Cleanup and shutdown share one rundown close; only a new create reopens it.
+    CHECK(HvSessionGateClose(&session_closed) == 0 && session_closed == 1);
+    CHECK(HvSessionGateReopen(&session_closed) == 1 && session_closed == 0);
+    CHECK(HvSessionGateReopen(&session_closed) == 0 && session_closed == 0);
+
     CHECK(!HvTargetMatches(0, 0));
     CHECK(!HvTargetMatches(0, 123));
     CHECK(!HvTargetMatches(123, 0));
