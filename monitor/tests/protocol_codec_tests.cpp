@@ -147,6 +147,19 @@ Bytes ConnectionRecord(bool v6, const Bytes& packet) {
     FixBodySize(b);
     return b;
 }
+Bytes BandwidthRecord(bool v6, uint32_t interface_index, uint32_t count = 1) {
+    const auto fixture = ConnectionFixture(v6);
+    const size_t addr_size = v6 ? 16 : 4;
+    Bytes body{17}; U32(body, interface_index); U32(body, count);
+    for (uint32_t i = 0; i < count; ++i) {
+        body.insert(body.end(), fixture.begin() + 19, fixture.begin() + 19 + addr_size);
+        U16(body, static_cast<uint16_t>(0x1234 + i));
+        body.insert(body.end(), fixture.begin() + 19 + addr_size, fixture.begin() + 19 + addr_size * 2);
+        U16(body, static_cast<uint16_t>(53 + i));
+        U64(body, 123 + i); U64(body, 456 + i);
+    }
+    return Record(v6 ? 6 : 5, body);
+}
 
 bool TestConnectionAbi() {
     std::string error;
@@ -200,9 +213,11 @@ bool TestConnectionAbi() {
 }
 
 bool TestRequiredVersion() {
-    const std::array<uint8_t, 4> expected = {0, 3, 2, 0};
+    const std::array<uint8_t, 4> expected = {0, 3, 3, 0};
     CHECK(pmkext::wire::kRequiredDeviceVersion == expected);
     CHECK(pmkext::wire::IsCompatibleVersion(expected.data()));
+    const std::array<uint8_t, 4> previous = {0, 3, 2, 0};
+    CHECK(!pmkext::wire::IsCompatibleVersion(previous.data()));
     CHECK(!pmkext::wire::IsCompatibleVersion(nullptr));
     for (const auto version : std::array<std::array<uint8_t, 4>, 8>{{
             {0, 3, 1, 0}, {0, 2, 1, 0}, {0, 2, 0, 0}, {0, 0, 0, 0}, {0, 3, 0, 1},
@@ -395,22 +410,41 @@ bool TestLogsAndBandwidth() {
     for (bool v6 : {false, true}) {
         const auto fixture = ConnectionFixture(v6);
         const size_t addr_size = v6 ? 16 : 4;
-        Bytes stats{17}; U32(stats, 1);
+        Bytes stats{17}; U32(stats, 0xfeedbeefu); U32(stats, 1);
         stats.insert(stats.end(), fixture.begin() + 19, fixture.begin() + 19 + addr_size);
         U16(stats, 0x1234);
         stats.insert(stats.end(), fixture.begin() + 19 + addr_size, fixture.begin() + 19 + addr_size * 2);
         U16(stats, 53);
-        U64(stats, 123); U64(stats, 456);
+        U64(stats, 0x0000000187654321ull); U64(stats, 0xfedcba9876543210ull);
         const auto bytes = Record(v6 ? 6 : 5, stats);
+        CHECK(stats.size() == (v6 ? 61u : 37u));
+        CHECK(bytes.size() == (v6 ? 66u : 42u));
         CHECK(pmkext::wire::DispatchRecord(bytes.data(), bytes.size(), handlers, error));
-        CHECK(observed_stats.protocol == 17 && observed_stats.entries.size() == 1);
+        CHECK(observed_stats.protocol == 17 && observed_stats.interface_index == 0xfeedbeefu &&
+              observed_stats.entries.size() == 1);
         const auto& entry = observed_stats.entries.front();
         CHECK(entry.ipv6 == v6 && entry.local_port == 0x1234 && entry.remote_port == 53);
-        CHECK(entry.transmitted_bytes == 123 && entry.received_bytes == 456);
+        CHECK(entry.transmitted_bytes == 0x0000000187654321ull &&
+              entry.received_bytes == 0xfedcba9876543210ull);
         CHECK(entry.LocalIpString() == (v6 ? "2001:0db8:0000:0000:0000:0000:0000:0001" : "10.0.0.1"));
         CHECK(entry.RemoteIpString() == (v6 ? "2001:0db8:0000:0000:0000:0000:0000:0002" : "10.0.0.2"));
+
+        // A group can carry multiple tuples, all sharing the header index.
+        Bytes multi{6}; U32(multi, 0x01020304u); U32(multi, 2);
+        for (unsigned i = 0; i < 2; ++i) {
+            multi.insert(multi.end(), fixture.begin() + 19, fixture.begin() + 19 + addr_size);
+            U16(multi, static_cast<uint16_t>(1000 + i));
+            multi.insert(multi.end(), fixture.begin() + 19 + addr_size, fixture.begin() + 19 + addr_size * 2);
+            U16(multi, static_cast<uint16_t>(2000 + i));
+            U64(multi, 0x100000000ull + i); U64(multi, 0x200000000ull + i);
+        }
+        const auto multi_record = Record(v6 ? 6 : 5, multi);
+        CHECK(pmkext::wire::DispatchRecord(multi_record.data(), multi_record.size(), handlers, error));
+        CHECK(observed_stats.interface_index == 0x01020304u && observed_stats.entries.size() == 2);
+        CHECK(observed_stats.entries[0].local_port == 1000 && observed_stats.entries[1].local_port == 1001);
+        CHECK(observed_stats.entries[0].received_bytes == 0x200000000ull + 0);
     }
-    CHECK(ends == 0 && bandwidth == 2); // No END is fabricated from other records.
+    CHECK(ends == 0 && bandwidth == 4); // No END is fabricated from other records.
     return true;
 }
 
@@ -419,8 +453,10 @@ bool TestStreaming() {
     const auto v6 = ConnectionFixture(true);
     const auto end = EndFixture(false);
     const auto log = Record(0, {3, 'o', 'k'});
+    const auto bandwidth = BandwidthRecord(false, 0x87654321u, 2);
     Bytes combined = v4;
     combined.insert(combined.end(), log.begin(), log.end());
+    combined.insert(combined.end(), bandwidth.begin(), bandwidth.end());
     combined.insert(combined.end(), v6.begin(), v6.end());
     combined.insert(combined.end(), end.begin(), end.end());
     for (size_t chunk = 1; chunk <= combined.size(); ++chunk) {
@@ -436,8 +472,63 @@ bool TestStreaming() {
             CHECK(stream.Feed(nullptr, 0, collect, error));
             CHECK(stream.PendingBytes() == before);
         }
-        CHECK(stream.PendingBytes() == 0 && observed.size() == 4);
-        CHECK(observed[0] == v4 && observed[1] == log && observed[2] == v6 && observed[3] == end);
+        CHECK(stream.PendingBytes() == 0 && observed.size() == 5);
+        CHECK(observed[0] == v4 && observed[1] == log && observed[2] == bandwidth && observed[3] == v6 && observed[4] == end);
+    }
+    return true;
+}
+
+bool TestLargeBandwidthGroups() {
+    for (bool v6 : {false, true}) {
+        const auto large = BandwidthRecord(v6, 0x87654321u, 40000);
+        const auto other = BandwidthRecord(v6, UINT32_MAX, 2);
+        CHECK(large.size() > pmkext::wire::kMaxRecordSize);
+        Bytes combined = large;
+        combined.insert(combined.end(), other.begin(), other.end());
+        combined.insert(combined.end(), large.begin(), large.end());
+        for (size_t chunk : {size_t{4093}, size_t{65536}}) {
+            pmkext::wire::RecordStream stream;
+            std::string error;
+            unsigned calls = 0;
+            bool good = true;
+            pmkext::Handlers handlers;
+            handlers.on_bandwidth = [&](const pmkext::BandwidthStats& stats) {
+                const uint32_t expected = calls == 1 ? 2 : 40000;
+                good &= stats.protocol == 17 && stats.interface_index == (calls == 1 ? UINT32_MAX : 0x87654321u) &&
+                    stats.entries.size() == expected;
+                for (size_t i = 0; i < stats.entries.size(); ++i) {
+                    const auto& entry = stats.entries[i];
+                    good &= entry.ipv6 == v6 && entry.local_port == static_cast<uint16_t>(0x1234 + i) &&
+                        entry.remote_port == static_cast<uint16_t>(53 + i) &&
+                        entry.transmitted_bytes == 123 + i && entry.received_bytes == 456 + i;
+                }
+                ++calls;
+            };
+            const auto decode = [&](const uint8_t* bytes, size_t size) {
+                std::string decode_error;
+                good &= pmkext::wire::DispatchRecord(bytes, size, handlers, decode_error);
+            };
+            CHECK(stream.Feed(combined.data(), 1, decode, error));
+            CHECK(stream.Feed(combined.data() + 1, 2, decode, error));
+            CHECK(calls == 0 && stream.PendingBytes() == 3);
+            for (size_t offset = 3; offset < combined.size(); offset += chunk)
+                CHECK(stream.Feed(combined.data() + offset, (std::min)(chunk, combined.size() - offset), decode, error));
+            CHECK(good && calls == 3 && stream.PendingBytes() == 0);
+        }
+        auto malformed = other;
+        for (unsigned i = 0; i < 4; ++i) malformed[10 + i] = 0xff;
+        unsigned calls = 0;
+        pmkext::Handlers handlers;
+        handlers.on_bandwidth = [&](const auto&) { ++calls; };
+        std::string error;
+        CHECK(!pmkext::wire::DispatchRecord(malformed.data(), malformed.size(), handlers, error));
+        malformed = other;
+        malformed.erase(malformed.begin() + 6, malformed.begin() + 10);
+        FixBodySize(malformed);
+        CHECK(!pmkext::wire::DispatchRecord(malformed.data(), malformed.size(), handlers, error));
+        malformed = other; malformed.pop_back(); FixBodySize(malformed);
+        CHECK(!pmkext::wire::DispatchRecord(malformed.data(), malformed.size(), handlers, error));
+        CHECK(calls == 0);
     }
     return true;
 }
@@ -644,13 +735,14 @@ bool TestDeviceOnlySession() {
 int main() {
     const struct { const char* name; bool (*run)(); } tests[] = {
         {"IPv4/IPv6 exact PID-less wire fixtures and complete IP packets", TestConnectionAbi},
-        {"only adapter-index wire version 0.3.2.0 is compatible", TestRequiredVersion},
+        {"only grouped-bandwidth wire version 0.3.3.0 is compatible", TestRequiredVersion},
         {"filtered-device count exact little-endian reply and malformed lengths", TestFilteredDeviceCount},
         {"full packets above 256/65536 bytes and at the 1 MiB maximum", TestLargeConnections},
         {"malformed records, metadata and oversized payloads rejected before callbacks", TestInvalidRecords},
         {"legacy ConnectionEnd IPv4/IPv6 layout and zero PID unchanged", TestConnectionEndAbi},
-        {"512-byte log bound and unchanged bandwidth layouts", TestLogsAndBandwidth},
+        {"512-byte log bound and interface-grouped bandwidth arrays", TestLogsAndBandwidth},
         {"fragmented/coalesced records and idle reads", TestStreaming},
+        {"complete bandwidth groups above 1 MiB across arbitrary reads", TestLargeBandwidthGroups},
         {"maximum IPv4/IPv6 records across many bounded reads", TestStreamingMaximumRecords},
         {"oversized headers poison the stream; partial/failed streams reset safely", TestStreamFailureAndReset},
         {"unframed commands, verdict bytes 2..7, updates rejected, bounded batches", TestCommands},

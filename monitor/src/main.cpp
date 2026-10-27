@@ -204,7 +204,7 @@ int MonitorMain(int argc, wchar_t** argv) {
     }
     std::printf("Driver version: %u.%u.%u.%u\n", version[0], version[1], version[2], version[3]);
     if (!pmkext::wire::IsCompatibleVersion(version)) {
-        std::fprintf(stderr, "ERROR: incompatible HyperVXNdisFilter driver version (expected 0.3.2.0); "
+        std::fprintf(stderr, "ERROR: incompatible HyperVXNdisFilter driver version (expected 0.3.3.0); "
                              "installed SYS uses a different wire layout\n");
         return 1;
     }
@@ -225,7 +225,8 @@ int MonitorMain(int argc, wchar_t** argv) {
                 "Default cache TTL: 60 s; TCP/UDP PermanentAccept refreshes on matching cache hits; PermanentBlock/Drop use fixed TTL.\n"
                 "Pending timeout: 8 s by default, checked every 1 s while pending; fail-closed by default.\n"
                 "Driver cache cleanup: full pass every 10 s while entries exist; no monitor cleanup polling.\n"
-                "Bandwidth: tx/rx=admitted guest outbound/inbound IP bytes, no PID; clean-ended only sweeps TTLs.\n"
+                "Bandwidth: each record is one host-interface/protocol/address-family group; interface_index is BaseMiniportIfIndex.\n"
+                "           tx/rx=admitted guest outbound/inbound IP bytes, no PID; clean-ended only sweeps TTLs.\n"
                 "No synthetic END events; UpdateV4/UpdateV6 and redirects are unsupported.\n");
     if (!opt.send_verdicts) {
         std::printf("NOT answering events (--no-verdicts); pending packets are dropped on timeout by default.\n");
@@ -373,7 +374,8 @@ int MonitorMain(int argc, wchar_t** argv) {
         const size_t shown = static_cast<size_t>(std::count_if(stats.entries.begin(), stats.entries.end(), keep));
         if (opt.filter.present && shown == 0) return;
         pmkext::RecordOutput record(g_out, g_print_mutex);
-        record.Write("%s[BANDWIDTH] proto=%u(%s) entries=%zu\n", TimePrefix(opt.timestamps).c_str(),
+        record.Write("%s[BANDWIDTH] interface_index=%u proto=%u(%s) entries=%zu\n",
+                     TimePrefix(opt.timestamps).c_str(), stats.interface_index,
                      static_cast<unsigned>(stats.protocol), pmkext::ProtocolToString(stats.protocol), shown);
         for (const auto& entry : stats.entries) {
             if (!keep(entry)) continue;

@@ -1,10 +1,11 @@
 #![no_std]
 
 // Explicit byte protocol, deliberately independent of Rust/C structure layout.
-pub const VERSION: [u8; 4] = [0, 3, 2, 0];
+pub const VERSION: [u8; 4] = [0, 3, 3, 0];
 pub const MAX_PAYLOAD: usize = 1024 * 1024;
 pub const CONNECTION_V4_HEADER: usize = 36;
 pub const CONNECTION_V6_HEADER: usize = 60;
+// Connection frame bound only; bandwidth has checked u32 wire lengths.
 pub const MAX_RECORD: usize = CONNECTION_V6_HEADER + MAX_PAYLOAD;
 pub const MAX_LOG_RECORD: usize = 512;
 pub const IOCTL_VERSION: u32 = ctl_code(0x800);
@@ -272,20 +273,92 @@ pub fn encode_log(out: &mut [u8], severity: u8, message: &str) -> Result<usize, 
     w.bytes(message.as_bytes())?;
     Ok(w.len())
 }
-pub fn encode_bandwidth(out: &mut [u8], c: &Connection, tx: u64, rx: u64) -> Result<usize, Error> {
-    let n = if c.ipv6 { 16 } else { 4 };
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BandwidthEntry {
+    pub local_ip: [u8; 16],
+    pub local_port: u16,
+    pub remote_ip: [u8; 16],
+    pub remote_port: u16,
+    pub transmitted_bytes: u64,
+    pub received_bytes: u64,
+}
+impl BandwidthEntry {
+    pub const EMPTY: Self = Self {
+        local_ip: [0; 16],
+        local_port: 0,
+        remote_ip: [0; 16],
+        remote_port: 0,
+        transmitted_bytes: 0,
+        received_bytes: 0,
+    };
+}
+
+pub const BANDWIDTH_HEADER: usize = 14;
+
+pub const fn bandwidth_entry_len(ipv6: bool) -> usize {
+    if ipv6 { 52 } else { 28 }
+}
+
+pub fn bandwidth_record_len(ipv6: bool, count: usize) -> Option<usize> {
+    let len = BANDWIDTH_HEADER.checked_add(bandwidth_entry_len(ipv6).checked_mul(count)?)?;
+    u32::try_from(len.checked_sub(5)?).ok()?;
+    u32::try_from(count).ok()?;
+    Some(len)
+}
+
+pub fn encode_bandwidth_header(
+    out: &mut [u8],
+    interface_index: u32,
+    ipv6: bool,
+    protocol: u8,
+    count: usize,
+) -> Result<usize, Error> {
+    let len = bandwidth_record_len(ipv6, count).ok_or(Error::Malformed)?;
     let mut w = Writer::new(out);
-    w.u8(if c.ipv6 { 6 } else { 5 })?;
-    w.u32((5 + n * 2 + 4 + 16) as u32)?;
-    w.u8(c.protocol)?;
-    w.u32(1)?;
-    w.bytes(&c.local_ip[..n])?;
-    w.u16(c.local_port)?;
-    w.bytes(&c.remote_ip[..n])?;
-    w.u16(c.remote_port)?;
-    w.u64(tx)?;
-    w.u64(rx)?;
+    w.u8(if ipv6 { 6 } else { 5 })?;
+    w.u32((len - 5) as u32)?;
+    w.u8(protocol)?;
+    w.u32(interface_index)?;
+    w.u32(count as u32)?;
     Ok(w.len())
+}
+
+pub fn encode_bandwidth_entry(
+    out: &mut [u8],
+    ipv6: bool,
+    entry: &BandwidthEntry,
+) -> Result<usize, Error> {
+    let n = if ipv6 { 16 } else { 4 };
+    let mut w = Writer::new(out);
+    w.bytes(&entry.local_ip[..n])?;
+    w.u16(entry.local_port)?;
+    w.bytes(&entry.remote_ip[..n])?;
+    w.u16(entry.remote_port)?;
+    w.u64(entry.transmitted_bytes)?;
+    w.u64(entry.received_bytes)?;
+    Ok(w.len())
+}
+
+pub fn encode_bandwidth(
+    out: &mut [u8],
+    interface_index: u32,
+    ipv6: bool,
+    protocol: u8,
+    entries: &[BandwidthEntry],
+) -> Result<usize, Error> {
+    let len = bandwidth_record_len(ipv6, entries.len()).ok_or(Error::Malformed)?;
+    if out.len() < len {
+        return Err(Error::BufferTooSmall);
+    }
+    encode_bandwidth_header(out, interface_index, ipv6, protocol, entries.len())?;
+    for (bytes, entry) in out[BANDWIDTH_HEADER..len]
+        .chunks_exact_mut(bandwidth_entry_len(ipv6))
+        .zip(entries)
+    {
+        encode_bandwidth_entry(bytes, ipv6, entry)?;
+    }
+    Ok(len)
 }
 
 #[cfg(test)]
@@ -351,7 +424,7 @@ mod tests {
         assert_eq!(connection_header_len(&c), CONNECTION_V4_HEADER);
     }
     #[test]
-    fn exact_v6_and_bandwidth_sizes() {
+    fn exact_v6_connection_size() {
         let mut c = Connection::EMPTY;
         c.ipv6 = true;
         let mut b = [0; 128];
@@ -364,12 +437,124 @@ mod tests {
         assert_eq!(b[17], 1);
         assert_eq!(b[55], 3);
         assert_eq!(&b[56..60], &[0; 4]);
-        assert_eq!(encode_bandwidth(&mut b, &c, 123, 456), Ok(62));
-        assert_eq!(&b[..10], &[6, 57, 0, 0, 0, 0, 1, 0, 0, 0]);
-        assert_eq!(u64::from_le_bytes(b[46..54].try_into().unwrap()), 123);
-        assert_eq!(u64::from_le_bytes(b[54..62].try_into().unwrap()), 456);
         assert_eq!(Direction::decode(2), None);
     }
+    #[test]
+    fn bandwidth_groups_share_one_interface_index_and_encode_full_u64_counters() {
+        for ipv6 in [false, true] {
+            let mut c = Connection::EMPTY;
+            c.ipv6 = ipv6;
+            c.protocol = 17;
+            let first = BandwidthEntry {
+                local_ip: core::array::from_fn(|i| i as u8),
+                local_port: 0x1234,
+                remote_ip: core::array::from_fn(|i| 0x80 + i as u8),
+                remote_port: 0x5678,
+                transmitted_bytes: 0x0102_0304_0506_0708,
+                received_bytes: u64::MAX,
+            };
+            let second = BandwidthEntry {
+                local_ip: core::array::from_fn(|i| 0xa0 + i as u8),
+                local_port: 0x2345,
+                remote_ip: core::array::from_fn(|i| 0xb0 + i as u8),
+                remote_port: 0x6789,
+                transmitted_bytes: u64::from(u32::MAX) + 1,
+                received_bytes: 456,
+            };
+            let address_size = if ipv6 { 16 } else { 4 };
+            let entry_size = bandwidth_entry_len(ipv6);
+            let size = 5 + 9 + entry_size * 2;
+            let mut expected = vec![
+                if ipv6 { 6 } else { 5 },
+                (size - 5) as u8,
+                0,
+                0,
+                0,
+                17,
+                0x78,
+                0x56,
+                0x34,
+                0x12,
+                2,
+                0,
+                0,
+                0,
+            ];
+            for entry in [first, second] {
+                expected.extend_from_slice(&entry.local_ip[..address_size]);
+                expected.extend_from_slice(&entry.local_port.to_le_bytes());
+                expected.extend_from_slice(&entry.remote_ip[..address_size]);
+                expected.extend_from_slice(&entry.remote_port.to_le_bytes());
+                expected.extend_from_slice(&entry.transmitted_bytes.to_le_bytes());
+                expected.extend_from_slice(&entry.received_bytes.to_le_bytes());
+            }
+            assert_eq!(expected.len(), size);
+            let mut out = [0xa5; 160];
+            assert_eq!(
+                encode_bandwidth(&mut out, 0x1234_5678, c.ipv6, c.protocol, &[first, second]),
+                Ok(size)
+            );
+            assert_eq!(&out[..size], expected);
+            assert!(out[size..].iter().all(|b| *b == 0xa5));
+            assert_eq!(
+                encode_bandwidth(
+                    &mut out[..size - 1],
+                    0x1234_5678,
+                    c.ipv6,
+                    c.protocol,
+                    &[first, second]
+                ),
+                Err(Error::BufferTooSmall)
+            );
+            assert_eq!(bandwidth_record_len(ipv6, 2), Some(size));
+        }
+    }
+
+    #[test]
+    fn bandwidth_size_is_bounded_only_by_native_wire_lengths() {
+        for ipv6 in [false, true] {
+            let entry_size = bandwidth_entry_len(ipv6);
+            let max_count = (u32::MAX as usize - 9) / entry_size;
+            let max_len = BANDWIDTH_HEADER + max_count * entry_size;
+            assert_eq!(bandwidth_record_len(ipv6, max_count), Some(max_len));
+            assert_eq!(bandwidth_record_len(ipv6, max_count + 1), None);
+            assert_eq!(bandwidth_record_len(ipv6, usize::MAX), None);
+            let mut header = [0xa5; BANDWIDTH_HEADER + 8];
+            assert_eq!(
+                encode_bandwidth_header(&mut header, u32::MAX, ipv6, 6, max_count),
+                Ok(BANDWIDTH_HEADER)
+            );
+            assert_eq!(
+                u32::from_le_bytes(header[1..5].try_into().unwrap()) as usize,
+                max_len - 5
+            );
+            assert_eq!(
+                u32::from_le_bytes(header[6..10].try_into().unwrap()),
+                u32::MAX
+            );
+            assert_eq!(
+                u32::from_le_bytes(header[10..14].try_into().unwrap()) as usize,
+                max_count
+            );
+            assert!(header[BANDWIDTH_HEADER..].iter().all(|b| *b == 0xa5));
+            assert_eq!(
+                encode_bandwidth_header(&mut header, 101, ipv6, 6, max_count + 1),
+                Err(Error::Malformed)
+            );
+            let count = MAX_RECORD / entry_size + 1;
+            let entries = vec![BandwidthEntry::EMPTY; count];
+            let len = bandwidth_record_len(ipv6, count).unwrap();
+            assert!(len > MAX_RECORD);
+            let mut out = vec![0; len];
+            assert_eq!(encode_bandwidth(&mut out, 101, ipv6, 6, &entries), Ok(len));
+            assert_eq!(
+                u32::from_le_bytes(out[10..14].try_into().unwrap()) as usize,
+                count
+            );
+            assert_eq!(MAX_PAYLOAD, 1024 * 1024);
+        }
+    }
+
     #[test]
     fn full_payloads_are_not_truncated_at_256_or_65536_bytes() {
         for ipv6 in [false, true] {
@@ -429,7 +614,7 @@ mod tests {
             Err(Error::BufferTooSmall)
         );
         assert_eq!(out, [0xa5; 64]);
-        assert_eq!(VERSION, [0, 3, 2, 0]);
+        assert_eq!(VERSION, [0, 3, 3, 0]);
     }
     #[test]
     fn verdicts_are_identical_but_redirects_not_supported() {

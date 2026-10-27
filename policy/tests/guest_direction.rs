@@ -219,11 +219,84 @@ fn guest_bandwidth_uses_receive_for_tx_send_for_rx() {
     }
     engine.bandwidth();
     let event = record(&mut engine, 5);
-    assert_eq!(u32::from_le_bytes(event[6..10].try_into().unwrap()), 1);
-    assert_eq!(&event[10..14], &[172, 28, 192, 8]);
-    assert_eq!(u16::from_le_bytes(event[14..16].try_into().unwrap()), 49714);
-    assert_eq!(&event[16..20], &[192, 168, 3, 2]);
-    assert_eq!(u16::from_le_bytes(event[20..22].try_into().unwrap()), 1234);
-    assert_eq!(u64::from_le_bytes(event[22..30].try_into().unwrap()), 52);
-    assert_eq!(u64::from_le_bytes(event[30..38].try_into().unwrap()), 40);
+    assert_eq!(u32::from_le_bytes(event[10..14].try_into().unwrap()), 1);
+    assert_eq!(event.len(), 42);
+    assert_eq!(u32::from_le_bytes(event[6..10].try_into().unwrap()), 101);
+    assert_eq!(&event[14..18], &[172, 28, 192, 8]);
+    assert_eq!(u16::from_le_bytes(event[18..20].try_into().unwrap()), 49714);
+    assert_eq!(&event[20..24], &[192, 168, 3, 2]);
+    assert_eq!(u16::from_le_bytes(event[24..26].try_into().unwrap()), 1234);
+    assert_eq!(u64::from_le_bytes(event[26..34].try_into().unwrap()), 52);
+    assert_eq!(u64::from_le_bytes(event[34..42].try_into().unwrap()), 40);
+}
+
+#[test]
+fn guest_bandwidth_keeps_identical_tuples_on_different_host_interfaces_separate() {
+    let mut engine = engine();
+    assert!(engine.attach(102));
+    assert!(engine.restart(102));
+    for (interface_index, extra) in [(101, 0), (102, 4)] {
+        let mut request = sandbox_request(6);
+        request.resize(request.len() + extra, 0);
+        request[16..18].copy_from_slice(&(52u16 + extra as u16).to_be_bytes());
+        let outgoing = parse(&request, NdisPath::Receive);
+        let Submission::Pending(id) = engine.submit(
+            interface_index,
+            outgoing,
+            1,
+            None,
+            100,
+            Some(capture(&outgoing, &request)),
+        ) else {
+            panic!("expected an interface-local cache miss")
+        };
+        let _ = record(&mut engine, 1);
+        assert_eq!(
+            engine
+                .verdict(id, Verdict::PermanentAccept, 101)
+                .unwrap()
+                .finish,
+            Finish::Allow
+        );
+        let mut response = reply(&request);
+        response.truncate(14 + 40 + extra);
+        response[16..18].copy_from_slice(&(40u16 + extra as u16).to_be_bytes());
+        response[46] = 0x50;
+        let incoming = parse(&response, NdisPath::Send);
+        assert_eq!(
+            engine
+                .preflight(interface_index, &incoming, 2, 102)
+                .unwrap_err()
+                .finish,
+            Finish::Allow
+        );
+    }
+    assert_eq!(engine.stats().cache_hits, 2);
+    engine.bandwidth();
+    let mut bytes = [0; 128];
+    assert_eq!(engine.read(&mut bytes), 84);
+    let mut indices = [0; 2];
+    for (i, event) in bytes[..84].as_chunks::<42>().0.iter().enumerate() {
+        assert_eq!(event[0], 5);
+        let index = u32::from_le_bytes(event[6..10].try_into().unwrap());
+        indices[i] = index;
+        let extra = if index == 101 {
+            0
+        } else {
+            assert_eq!(index, 102);
+            4
+        };
+        assert_eq!(&event[14..18], &[172, 28, 192, 8]);
+        assert_eq!(&event[20..24], &[192, 168, 3, 2]);
+        assert_eq!(
+            u64::from_le_bytes(event[26..34].try_into().unwrap()),
+            52 + extra
+        );
+        assert_eq!(
+            u64::from_le_bytes(event[34..42].try_into().unwrap()),
+            40 + extra
+        );
+    }
+    indices.sort_unstable();
+    assert_eq!(indices, [101, 102]);
 }

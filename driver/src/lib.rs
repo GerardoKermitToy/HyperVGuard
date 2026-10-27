@@ -449,7 +449,10 @@ pub unsafe extern "C" fn HvWrite(data: *const u8, len: u32) -> i32 {
                 reclaim_retired();
             }
             Command::GetLogs => {} // Log records are already queued.
-            Command::GetBandwidth => with_state(|e| e.bandwidth()),
+            Command::GetBandwidth => {
+                with_state(|e| e.bandwidth());
+                reclaim_retired();
+            }
             Command::MemoryStats => with_state(|e| e.memory_stats()),
             Command::CleanEnded => {
                 reclaim_retired();

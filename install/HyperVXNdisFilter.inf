@@ -5,7 +5,7 @@ Class=NetService
 ClassGUID={4D36E974-E325-11CE-BFC1-08002BE10318}
 Provider=%Provider%
 CatalogFile=HyperVXNdisFilter.cat
-DriverVer=10/27/2026,0.3.2.0
+DriverVer=10/27/2026,0.3.3.0
 PnpLockdown=1
 
 [Manufacturer]

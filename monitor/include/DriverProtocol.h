@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <new>
 #include <string>
 
 namespace pmkext::wire {
@@ -18,13 +19,14 @@ constexpr size_t kRecordHeaderSize = 5;
 constexpr size_t kConnectionIpv4PrefixSize = 36;
 constexpr size_t kConnectionIpv6PrefixSize = 60;
 constexpr size_t kMaxPayloadSize = 1024 * 1024;
+// Connection frame bound only; bandwidth groups use checked u32 wire lengths.
 constexpr size_t kMaxRecordSize = kConnectionIpv6PrefixSize + kMaxPayloadSize;
 constexpr size_t kMaxLogRecordSize = 512;
 // Commands are unframed; this is the native Windows DWORD/u32 write length,
 // not a driver-defined or protocol-level 64 KiB cap.
 constexpr size_t kMaxCommandBatchSize = UINT32_MAX;
 constexpr size_t kVerdictCommandSize = 10;
-constexpr std::array<uint8_t, 4> kRequiredDeviceVersion = {0, 3, 2, 0};
+constexpr std::array<uint8_t, 4> kRequiredDeviceVersion = {0, 3, 3, 0};
 
 bool IsCompatibleVersion(const uint8_t version[4]) noexcept;
 
@@ -65,10 +67,9 @@ bool EncodeVerdict(uint64_t id, Verdict verdict,
 bool DispatchRecord(const uint8_t* bytes, size_t length, const Handlers& handlers,
                     std::string& error);
 
-// Accept arbitrary read boundaries while keeping at most one bounded record
-// on the heap; packets may span any number of client read chunks.
-// Oversized headers permanently invalidate the stream: guessing a new boundary
-// would turn arbitrary payload bytes into fabricated events.
+// Assemble one frame across arbitrary reads. Storage grows fallibly for full
+// bandwidth groups and is reused; connection/log bounds remain type-specific.
+// Invalid headers poison the stream until Reset; never guess a new boundary.
 class RecordStream {
 public:
     using Callback = std::function<void(const uint8_t*, size_t)>;
@@ -78,8 +79,8 @@ public:
     size_t PendingBytes() const noexcept { return used_; }
 
 private:
-    // A fixed bound, not a peer-selected allocation or a megabyte stack object.
-    std::unique_ptr<uint8_t[]> record_ = std::make_unique<uint8_t[]>(kMaxRecordSize);
+    std::unique_ptr<uint8_t[]> record_{new (std::nothrow) uint8_t[kMaxRecordSize]};
+    size_t capacity_ = kMaxRecordSize;
     size_t used_ = 0;
     size_t wanted_ = kRecordHeaderSize;
     bool failed_ = false;

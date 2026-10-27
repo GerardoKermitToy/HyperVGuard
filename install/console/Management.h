@@ -12,8 +12,8 @@ namespace hyperv_xndis_filter::setup {
 
 inline constexpr GUID kDefaultSwitchId = {0xc08cb7b8, 0x9b3c, 0x408e, {0x8e, 0x30, 0x5e, 0x16, 0xa3, 0xae, 0xb4, 0x44}};
 inline constexpr int kRebootRequired = ERROR_SUCCESS_REBOOT_REQUIRED;
-// Coherent driver-store package for the PID-free, full-packet, blocking-read 0.3.2.0 API.
-inline constexpr wchar_t kPackageVersion[] = L"0.3.2.0";
+// Coherent driver-store package for the PID-free, full-packet, blocking-read 0.3.3.0 API.
+inline constexpr wchar_t kPackageVersion[] = L"0.3.3.0";
 inline constexpr wchar_t kDriverFileName[] = L"HyperVXNdisFilter.sys";
 inline constexpr wchar_t kServiceName[] = L"HyperVXNdisFilter";
 

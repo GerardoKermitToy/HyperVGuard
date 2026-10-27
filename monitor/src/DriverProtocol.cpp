@@ -24,6 +24,21 @@ uint64_t ReadU64(const uint8_t* p) noexcept {
     return value;
 }
 
+bool ValidBodySize(uint8_t type, size_t size) noexcept {
+    switch (static_cast<InfoType>(type)) {
+        case InfoType::LogLine: return size >= 1 && size <= kMaxLogRecordSize - kRecordHeaderSize;
+        case InfoType::ConnectionIpv4:
+            return size >= kConnectionIpv4PrefixSize - kRecordHeaderSize &&
+                   size <= kConnectionIpv4PrefixSize - kRecordHeaderSize + kMaxPayloadSize;
+        case InfoType::ConnectionIpv6:
+            return size >= kConnectionIpv6PrefixSize - kRecordHeaderSize &&
+                   size <= kConnectionIpv6PrefixSize - kRecordHeaderSize + kMaxPayloadSize;
+        case InfoType::BandwidthStatsV4: return size >= 9 && (size - 9) % 28 == 0;
+        case InfoType::BandwidthStatsV6: return size >= 9 && (size - 9) % 52 == 0;
+        default: return size <= kMaxRecordSize - kRecordHeaderSize;
+    }
+}
+
 } // namespace
 
 bool IsCompatibleVersion(const uint8_t version[4]) noexcept {
@@ -203,8 +218,8 @@ bool EncodeVerdict(uint64_t id, Verdict verdict,
 
 bool DispatchRecord(const uint8_t* bytes, size_t length, const Handlers& handlers,
                     std::string& error) {
-    if (bytes == nullptr || length < kRecordHeaderSize || length > kMaxRecordSize) {
-        error = "record length is outside the 5..1048632 byte limit";
+    if (bytes == nullptr || length < kRecordHeaderSize) {
+        error = "record is shorter than its five-byte header";
         return false;
     }
     const size_t size = ReadU32(bytes + 1);
@@ -298,20 +313,27 @@ bool DispatchRecord(const uint8_t* bytes, size_t length, const Handlers& handler
             const bool v6 = type == InfoType::BandwidthStatsV6;
             const size_t addr_size = v6 ? 16 : 4;
             const size_t entry_size = addr_size * 2 + 2 + 2 + 8 + 8;
-            if (size < 5) {
+            if (size < 9) {
                 error = "Bandwidth record too short";
                 return false;
             }
-            const uint32_t count = ReadU32(p + 1);
+            const uint32_t interface_index = ReadU32(p + 1);
+            const uint32_t count = ReadU32(p + 5);
             // Divide before multiplying: a hostile count must not overflow size_t.
-            if (count != (size - 5) / entry_size || (size - 5) % entry_size != 0) {
+            if (count != (size - 9) / entry_size || (size - 9) % entry_size != 0) {
                 error = "Bandwidth entry count disagrees with payload";
                 return false;
             }
             BandwidthStats stats;
             stats.protocol = p[0];
-            stats.entries.reserve(count);
-            size_t offset = 5;
+            stats.interface_index = interface_index;
+            try {
+                stats.entries.reserve(count);
+            } catch (const std::bad_alloc&) {
+                error = "not enough memory for bandwidth entries";
+                return false;
+            }
+            size_t offset = 9;
             for (uint32_t i = 0; i < count; ++i) {
                 BandwidthEntry e;
                 e.ipv6 = v6;
@@ -337,11 +359,15 @@ bool DispatchRecord(const uint8_t* bytes, size_t length, const Handlers& handler
 bool RecordStream::Feed(const uint8_t* bytes, size_t length, const Callback& callback,
                         std::string& error) {
     if (failed_) {
-        error = "record stream is invalid after an oversized header";
+        error = "record stream is invalid after a malformed or oversized header";
         return false;
     }
     if (bytes == nullptr && length != 0) {
         error = "null record input";
+        return false;
+    }
+    if (!record_) {
+        error = "not enough memory for record stream";
         return false;
     }
     while (length != 0) {
@@ -353,12 +379,23 @@ bool RecordStream::Feed(const uint8_t* bytes, size_t length, const Callback& cal
         if (used_ < wanted_) continue;
         if (wanted_ == kRecordHeaderSize) {
             const uint32_t payload_size = ReadU32(record_.get() + 1);
-            if (payload_size > kMaxRecordSize - kRecordHeaderSize) {
+            if (!ValidBodySize(record_[0], payload_size)) {
                 failed_ = true;
-                error = "driver record exceeds the 1048632-byte protocol limit";
+                error = "driver record has an invalid type-specific length";
                 return false;
             }
-            wanted_ = kRecordHeaderSize + payload_size;
+            wanted_ = kRecordHeaderSize + static_cast<size_t>(payload_size);
+            if (wanted_ > capacity_) {
+                std::unique_ptr<uint8_t[]> grown{new (std::nothrow) uint8_t[wanted_]};
+                if (!grown) {
+                    failed_ = true;
+                    error = "not enough memory for bandwidth record";
+                    return false;
+                }
+                std::memcpy(grown.get(), record_.get(), used_);
+                record_ = std::move(grown);
+                capacity_ = wanted_;
+            }
             if (used_ < wanted_) continue;
         }
         const size_t complete = wanted_;

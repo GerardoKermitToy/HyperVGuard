@@ -32,10 +32,11 @@ public:
     static_assert(std::endian::native == std::endian::little, "The device wire API is little-endian");
     using Bytes = std::span<const uint8_t>;
     static constexpr size_t MaxPayloadSize = 1'048'576;
+    // Connection frame bound only; bandwidth groups use native u32 wire lengths.
     static constexpr size_t MaxRecordSize = MaxPayloadSize + 60;
     // Streaming buffer choice, not a driver-defined read-size limit.
     static constexpr DWORD ReadSize = 65'536;
-    static constexpr std::array<uint8_t, 4> RequiredVersion{0, 3, 2, 0};
+    static constexpr std::array<uint8_t, 4> RequiredVersion{0, 3, 3, 0};
     // Four permanent caches per interface: TCP/UDP, each IPv4/IPv6; key=IP+port tuple.
     // TCP/UDP stay separate; both directions share normalized tuples within one table.
     // PermanentAccept hits refresh idle TTL; PermanentBlock/Drop keep fixed TTL.
@@ -126,6 +127,7 @@ public:
     static_assert(offsetof(ConnectionV4, local_port) == 22 && offsetof(ConnectionV6, local_port) == 46);
     static_assert(offsetof(ConnectionV4, remote_port) == 24 && offsetof(ConnectionV6, remote_port) == 48);
     static_assert(offsetof(ConnectionV4, payload_layer) == 26 && offsetof(ConnectionV6, payload_layer) == 50);
+    // Entry bytes exclude the group header's protocol/index/count fields.
     static_assert(sizeof(BandwidthV4) == 28 && sizeof(BandwidthV6) == 52);
     static_assert(alignof(BandwidthV4) == 1 && alignof(BandwidthV6) == 1);
     static_assert(offsetof(BandwidthV4, local_ip) == 0 && offsetof(BandwidthV6, local_ip) == 0);
@@ -136,7 +138,8 @@ public:
     static_assert(offsetof(BandwidthV4, received_bytes) == 20 && offsetof(BandwidthV6, received_bytes) == 44);
 
     template <class T> using ConnectionCallback = void (*)(void*, const T*, const uint8_t* payload, uint32_t size);
-    template <class T> using BandwidthCallback = void (*)(void*, uint8_t protocol, const T*, uint32_t count);
+    template <class T> using BandwidthCallback =
+        void (*)(void*, uint8_t protocol, uint32_t interface_index, const T*, uint32_t count);
     struct Callbacks {
         void* context = nullptr;
         ConnectionCallback<ConnectionV4> on_connection_v4 = nullptr;
@@ -350,10 +353,10 @@ public:
         }
     }
 
-    // Device-independent, borrowed packed views. Exactly one complete bounded record.
+    // Device-independent, borrowed packed views. Exactly one complete record.
     static DWORD DispatchRecord(Bytes record, const Callbacks& cb) {
-        if (record.size() < 5 || record.size() > MaxRecordSize || ReadLe<uint32_t>(record.data() + 1) != record.size() - 5)
-            return ERROR_INVALID_DATA;
+        if (record.size() < 5 || ReadLe<uint32_t>(record.data() + 1) != record.size() - 5 ||
+            !ValidBodySize(record[0], record.size() - 5)) return ERROR_INVALID_DATA;
         return DispatchBody(record[0], record.subspan(5), cb);
     }
 
@@ -363,27 +366,39 @@ public:
     public:
         std::span<uint8_t> Buffer() noexcept {
             if (!data_ || failed_) return {};
-            if (MaxRecordSize - tail_ < ReadSize && head_) {
+            if (capacity_ - tail_ < ReadSize && head_) {
                 const size_t pending = PendingBytes();
                 std::memmove(data_.get(), data_.get() + head_, pending);
                 head_ = 0;
                 tail_ = pending;
             }
-            const size_t available = MaxRecordSize - tail_;
+            const size_t available = capacity_ - tail_;
             return {data_.get() + tail_, available < ReadSize ? available : ReadSize};
         }
         DWORD Commit(size_t count, const Callbacks& cb, const std::atomic<bool>* stop = nullptr) {
             if (!data_) return ERROR_NOT_ENOUGH_MEMORY;
-            if (failed_ || count > ReadSize || count > MaxRecordSize - tail_) {
+            if (failed_ || count > ReadSize || count > capacity_ - tail_) {
                 failed_ = true; return ERROR_INVALID_DATA;
             }
             tail_ += count;
             while (PendingBytes() >= 5 && (!stop || !stop->load())) {
                 const uint8_t* p = data_.get() + head_;
                 const uint32_t body = ReadLe<uint32_t>(p + 1);
-                if (body > MaxRecordSize - 5) { failed_ = true; return ERROR_INVALID_DATA; }
+                if (!ValidBodySize(p[0], body)) { failed_ = true; return ERROR_INVALID_DATA; }
                 const size_t length = 5 + static_cast<size_t>(body);
-                if (PendingBytes() < length) break;
+                if (PendingBytes() < length) {
+                    if (length > capacity_) {
+                        std::unique_ptr<uint8_t[]> grown{new (std::nothrow) uint8_t[length]};
+                        if (!grown) { failed_ = true; return ERROR_NOT_ENOUGH_MEMORY; }
+                        const size_t pending = PendingBytes();
+                        std::memcpy(grown.get(), p, pending);
+                        data_ = std::move(grown);
+                        capacity_ = length;
+                        head_ = 0;
+                        tail_ = pending;
+                    }
+                    break;
+                }
                 const DWORD error = DispatchBody(p[0], {p + 5, body}, cb);
                 if (error) { failed_ = true; return error; }
                 head_ += length;
@@ -395,11 +410,21 @@ public:
         size_t PendingBytes() const noexcept { return tail_ - head_; }
     private:
         std::unique_ptr<uint8_t[]> data_{new (std::nothrow) uint8_t[MaxRecordSize]};
-        size_t head_ = 0, tail_ = 0;
+        size_t capacity_ = MaxRecordSize, head_ = 0, tail_ = 0;
         bool failed_ = false;
     };
 
 private:
+    static bool ValidBodySize(uint8_t type, size_t size) noexcept {
+        switch (type) {
+        case 0: return size >= 1 && size <= 507;
+        case 1: return size >= 31 && size <= 31 + MaxPayloadSize;
+        case 2: return size >= 55 && size <= 55 + MaxPayloadSize;
+        case 5: return size >= 9 && (size - 9) % sizeof(BandwidthV4) == 0;
+        case 6: return size >= 9 && (size - 9) % sizeof(BandwidthV6) == 0;
+        default: return size <= MaxRecordSize - 5;
+        }
+    }
     static bool DecodeAdapterInfoHeader(Bytes bytes, DWORD& required) noexcept {
         if (!bytes.data() || bytes.size() < AdapterInfoHeaderSize ||
             ReadLe<uint32_t>(bytes.data()) != AdapterInfoVersion ||
@@ -428,10 +453,12 @@ private:
         return ERROR_SUCCESS;
     }
     template <class T> static DWORD DispatchBandwidth(Bytes body, void* context, BandwidthCallback<T> callback) {
-        if (body.size() < 5) return ERROR_INVALID_DATA;
-        const uint32_t count = ReadLe<uint32_t>(body.data() + 1);
-        if ((body.size() - 5) % sizeof(T) || count != (body.size() - 5) / sizeof(T)) return ERROR_INVALID_DATA;
-        if (callback && count) callback(context, body[0], reinterpret_cast<const T*>(body.data() + 5), count);
+        if (body.size() < 9) return ERROR_INVALID_DATA;
+        const uint32_t interface_index = ReadLe<uint32_t>(body.data() + 1);
+        const uint32_t count = ReadLe<uint32_t>(body.data() + 5);
+        if ((body.size() - 9) % sizeof(T) || count != (body.size() - 9) / sizeof(T)) return ERROR_INVALID_DATA;
+        if (callback && count)
+            callback(context, body[0], interface_index, reinterpret_cast<const T*>(body.data() + 9), count);
         return ERROR_SUCCESS;
     }
     static DWORD DispatchBody(uint8_t type, Bytes body, const Callbacks& cb) {

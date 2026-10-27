@@ -104,8 +104,10 @@ struct Connection {
 };
 
 // Retained API/wire types. This LWF does not manufacture connection-end
-// events. Bandwidth counts admitted guest outbound/inbound IP bytes in tx/rx, with no PID.
-// CleanEndedConnections only sweeps expired cache entries, never fabricates END.
+// events. CleanEndedConnections only sweeps expired cache entries, never
+// fabricates END. Bandwidth counts admitted guest outbound/inbound IP bytes in
+// tx/rx, with no PID. Each record is one host-interface/protocol/address-family
+// group; its interface_index is the BaseMiniportIfIndex, not a guest interface.
 struct ConnectionEnd {
     bool     ipv6 = false;
     uint64_t process_id = 0;
@@ -140,6 +142,7 @@ struct BandwidthEntry {
 
 struct BandwidthStats {
     uint8_t                     protocol = 0;
+    uint32_t                    interface_index = 0;
     std::vector<BandwidthEntry> entries;
 };
 

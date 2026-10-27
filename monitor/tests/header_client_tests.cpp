@@ -449,7 +449,7 @@ bool TestAdapterInfoCodec() {
     static_assert(Client::AdapterFilterNameTruncated == HV_ADAPTER_FILTER_NAME_TRUNCATED);
     static_assert(Client::AdapterLinkStateValid == HV_ADAPTER_LINK_STATE_VALID && Client::AdapterPauseValid == HV_ADAPTER_PAUSE_VALID);
     static_assert(Client::AdapterKnownFlags == HV_ADAPTER_INFO_KNOWN_FLAGS);
-    static_assert(Client::RequiredVersion == std::array<uint8_t, 4>{0, 3, 2, 0}); // Additive, not an event-wire change.
+    static_assert(Client::RequiredVersion == std::array<uint8_t, 4>{0, 3, 3, 0}); // Additive, not an event-wire change.
     std::vector<HV_ADAPTER_INFO> fixtures{
         AdapterFixture(1, HV_ADAPTER_INFO_KNOWN_FLAGS),
         AdapterFixture(2, HV_ADAPTER_INFO_KNOWN_FLAGS & ~HV_ADAPTER_RUNNING),
@@ -777,7 +777,7 @@ bool TestAdapterIndices() {
 }
 bool TestCodecAndStream() {
     static_assert(sizeof(Client) < 1024 && sizeof(Client::Stream) < 1024);
-    static_assert(Client::RequiredVersion == std::array<uint8_t, 4>{0, 3, 2, 0});
+    static_assert(Client::RequiredVersion == std::array<uint8_t, 4>{0, 3, 3, 0});
     for (bool v6 : {false, true}) for (size_t size : {size_t{0}, size_t{28}, size_t{65537}, size_t{1048576}}) {
         auto record = Connection(v6, size);
         Observed observed;
@@ -865,10 +865,28 @@ bool TestUnalignedViewsAndDeferredCompaction() {
     CHECK(!stream.Buffer().empty());
     return true;
 }
+Bytes BandwidthRecord(bool ipv6, uint32_t interface_index, uint32_t count) {
+    const size_t addr = ipv6 ? 16 : 4, entry = addr * 2 + 20;
+    Bytes stats(14 + static_cast<size_t>(count) * entry);
+    stats[0] = ipv6 ? 6 : 5;
+    Put(stats, 1, stats.size() - 5, 4);
+    stats[5] = 6;
+    Put(stats, 6, interface_index, 4);
+    Put(stats, 10, count, 4);
+    for (uint32_t i = 0; i < count; ++i) {
+        const size_t offset = 14 + static_cast<size_t>(i) * entry;
+        stats[offset] = 1; Put(stats, offset + addr, 12345, 2);
+        stats[offset + addr + 2] = 2; Put(stats, offset + addr * 2 + 2, 443, 2);
+        Put(stats, offset + addr * 2 + 4, 0x0123456789abcdefull + i, 8);
+        Put(stats, offset + addr * 2 + 12, 0xfedcba9876543210ull - i, 8);
+    }
+    return stats;
+}
 bool TestLogAndBandwidth() {
     struct State {
         unsigned logs = 0, batches = 0, entries = 0;
         bool good = true, ipv6 = false;
+        uint32_t index = 0, count = 2;
         const void* pointer = nullptr;
     } state;
     Client::Callbacks cb;
@@ -877,10 +895,12 @@ bool TestLogAndBandwidth() {
         auto& s = *static_cast<State*>(context); ++s.logs;
         s.good &= level == 3 && text == "abc" && text.data() == s.pointer;
     };
-    const auto bandwidth = []<class T>(void* context, uint8_t protocol, const T* entries, uint32_t count) {
+    const auto bandwidth = []<class T>(void* context, uint8_t protocol, uint32_t interface_index,
+                                      const T* entries, uint32_t count) {
         auto& s = *static_cast<State*>(context); ++s.batches; s.entries += count;
-        s.good &= protocol == 6 && (sizeof(entries->local_ip) == 16) == s.ipv6 &&
-            entries == s.pointer && count == 2;
+        s.good &= protocol == 6 && interface_index == s.index &&
+            (sizeof(entries->local_ip) == 16) == s.ipv6 &&
+            (!s.pointer || entries == s.pointer) && count == s.count;
         for (uint32_t i = 0; i < count; ++i) {
             const auto& b = entries[i];
             s.good &= b.local_ip[0] == 1 && b.remote_ip[0] == 2 &&
@@ -897,39 +917,66 @@ bool TestLogAndBandwidth() {
         log[5] = severity; CHECK(Client::DispatchRecord(log, cb) == ERROR_INVALID_DATA);
     }
     for (bool v6 : {false, true}) {
-        const size_t addr = v6 ? 16 : 4, entry = addr * 2 + 20;
-        Bytes stats(10 + 2 * entry);
-        stats[0] = v6 ? 6 : 5; Put(stats, 1, stats.size() - 5, 4); stats[5] = 6; Put(stats, 6, 2, 4);
-        for (size_t i = 0; i < 2; ++i) {
-            const size_t offset = 10 + i * entry;
-            stats[offset] = 1; Put(stats, offset + addr, 12345, 2);
-            stats[offset + addr + 2] = 2; Put(stats, offset + addr * 2 + 2, 443, 2);
-            Put(stats, offset + addr * 2 + 4, 0x0123456789abcdefull + i, 8);
-            Put(stats, offset + addr * 2 + 12, 0xfedcba9876543210ull - i, 8);
-        }
         state.ipv6 = v6;
+        state.index = v6 ? UINT32_MAX : 0x12345678u;
+        auto stats = BandwidthRecord(v6, state.index, 2);
+        CHECK(stats.size() == 14 + 2 * (v6 ? sizeof(Client::BandwidthV6) : sizeof(Client::BandwidthV4)));
         for (size_t shift = 0; shift < 8; ++shift) {
             Bytes storage(shift + stats.size());
             std::memcpy(storage.data() + shift, stats.data(), stats.size());
-            state.pointer = storage.data() + shift + 10;
+            state.pointer = storage.data() + shift + 14;
             const unsigned batches = state.batches;
             CHECK(Client::DispatchRecord(Client::Bytes(storage).subspan(shift), cb) == ERROR_SUCCESS);
-            CHECK(state.good && state.batches == batches + 1); // One borrowed array, not two temporary entries.
+            CHECK(state.good && state.batches == batches + 1);
         }
         const unsigned batches = state.batches;
         auto invalid = stats;
-        Put(invalid, 6, 0xffffffff, 4);
+        Put(invalid, 10, UINT32_MAX, 4);
         CHECK(Client::DispatchRecord(invalid, cb) == ERROR_INVALID_DATA);
         CHECK(Client::DispatchRecord(invalid, {}) == ERROR_INVALID_DATA);
         invalid = stats; invalid.pop_back(); Put(invalid, 1, invalid.size() - 5, 4);
         CHECK(Client::DispatchRecord(invalid, cb) == ERROR_INVALID_DATA);
+        invalid = stats; invalid.erase(invalid.begin() + 6, invalid.begin() + 10);
+        Put(invalid, 1, invalid.size() - 5, 4); // Previous wire layout has no group index.
+        CHECK(Client::DispatchRecord(invalid, cb) == ERROR_INVALID_DATA);
         for (size_t n = 0; n < stats.size(); ++n)
             CHECK(Client::DispatchRecord(Client::Bytes(stats).first(n), cb) != ERROR_SUCCESS);
-        Bytes empty{static_cast<uint8_t>(v6 ? 6 : 5), 5, 0, 0, 0, 6, 0, 0, 0, 0};
-        CHECK(Client::DispatchRecord(empty, cb) == ERROR_SUCCESS);
+        CHECK(Client::DispatchRecord(BandwidthRecord(v6, state.index, 0), cb) == ERROR_SUCCESS);
         CHECK(state.batches == batches);
     }
     CHECK(state.good && state.logs == 1 && state.batches == 16 && state.entries == 32);
+    for (bool v6 : {false, true}) {
+        state.ipv6 = v6; state.index = 0x87654321u; state.count = 40000;
+        const auto stats = BandwidthRecord(v6, state.index, state.count);
+        CHECK(stats.size() > Client::MaxRecordSize);
+        state.pointer = stats.data() + 14;
+        CHECK(Client::DispatchRecord(stats, cb) == ERROR_SUCCESS);
+        Client::Stream stream;
+        state.pointer = nullptr;
+        CHECK(Feed(stream, stats, 4093, cb));
+        CHECK(state.good && stream.PendingBytes() == 0);
+        state.pointer = stream.Buffer().data() + 14;
+        {
+            allocation::FailAfter fail(0);
+            CHECK(Feed(stream, stats, Client::ReadSize, cb));
+            CHECK(!fail.Triggered()); // Reuse the grown buffer; dispatch/entries allocate nothing.
+        }
+        CHECK(state.good && stream.PendingBytes() == 0);
+        Client::Stream limited;
+        std::memcpy(limited.Buffer().data(), stats.data(), 14);
+        const unsigned batches = state.batches;
+        DWORD result = ERROR_SUCCESS;
+        {
+            allocation::FailAfter fail(0);
+            result = limited.Commit(14, cb);
+            CHECK(fail.Triggered());
+        }
+        CHECK(result == ERROR_NOT_ENOUGH_MEMORY && state.batches == batches && limited.Buffer().empty());
+        limited.Reset();
+        state.pointer = nullptr;
+        CHECK(Feed(limited, stats, Client::ReadSize, cb));
+        CHECK(state.good && limited.PendingBytes() == 0);
+    }
     return true;
 }
 bool TestIdleAndStop() {

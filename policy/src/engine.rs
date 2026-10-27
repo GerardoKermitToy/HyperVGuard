@@ -6,8 +6,9 @@ use crate::{
 use alloc::vec::Vec;
 use core::fmt::{self, Write};
 use hyperv_protocol::{
-    Connection, Direction, MAX_LOG_RECORD, MAX_PAYLOAD, MAX_RECORD, Verdict, connection_header_len,
-    encode_bandwidth, encode_connection_header, encode_log,
+    BANDWIDTH_HEADER, BandwidthEntry, Connection, Direction, MAX_LOG_RECORD, MAX_PAYLOAD,
+    MAX_RECORD, Verdict, bandwidth_entry_len, bandwidth_record_len, connection_header_len,
+    encode_bandwidth_entry, encode_bandwidth_header, encode_connection_header, encode_log,
 };
 
 // Bucket count affects lookup work, never admission: every chain grows fallibly.
@@ -64,6 +65,9 @@ pub fn allocate_record(len: usize) -> Option<Vec<u8>> {
     if len > MAX_RECORD {
         return None;
     }
+    allocate_event(len)
+}
+fn allocate_event(len: usize) -> Option<Vec<u8>> {
     let mut data = Vec::new();
     data.try_reserve_exact(len).ok()?;
     data.resize(len, 0);
@@ -71,9 +75,29 @@ pub fn allocate_record(len: usize) -> Option<Vec<u8>> {
 }
 #[derive(Clone, Copy)]
 struct Bandwidth {
+    interface_index: u32,
     connection: Connection,
     tx: u64,
     rx: u64,
+}
+impl Bandwidth {
+    fn report_group(&self) -> (u32, u8, bool) {
+        (
+            self.interface_index,
+            self.connection.protocol,
+            self.connection.ipv6,
+        )
+    }
+    fn entry(&self) -> BandwidthEntry {
+        BandwidthEntry {
+            local_ip: self.connection.local_ip,
+            local_port: self.connection.local_port,
+            remote_ip: self.connection.remote_ip,
+            remote_port: self.connection.remote_port,
+            transmitted_bytes: self.tx,
+            received_bytes: self.rx,
+        }
+    }
 }
 // Opaque ownership returned to the driver for destruction outside PolicyLock.
 pub struct RetiredStorage {
@@ -490,11 +514,11 @@ impl Engine {
     fn cache_bytes(&self) -> usize {
         self.interfaces.iter().map(|c| c.caches.bytes()).sum()
     }
-    fn account(&mut self, packet: &Packet, allow: bool) {
+    fn account(&mut self, interface_index: u32, packet: &Packet, allow: bool) {
         if allow {
             self.stats.allowed = self.stats.allowed.saturating_add(1);
             if self.online && matches!(packet.connection.protocol, 6 | 17) {
-                self.bandwidth_add(packet);
+                self.bandwidth_add(interface_index, packet);
             }
         } else {
             self.stats.dropped = self.stats.dropped.saturating_add(1);
@@ -555,7 +579,7 @@ impl Engine {
             allow
         };
         self.stats.received = self.stats.received.saturating_add(1);
-        self.account(packet, allow);
+        self.account(interface_index, packet, allow);
         Some(Action {
             token,
             finish: if allow { Finish::Allow } else { Finish::Drop },
@@ -576,10 +600,10 @@ impl Engine {
             Ok(self.event_room(packet))
         }
     }
-    fn overflow(&mut self, packet: &Packet, token: usize) -> Submission {
+    fn overflow(&mut self, interface_index: u32, packet: &Packet, token: usize) -> Submission {
         self.stats.overflow = self.stats.overflow.saturating_add(1);
         let finish = self.fallback();
-        self.account(packet, finish == Finish::Allow);
+        self.account(interface_index, packet, finish == Finish::Allow);
         Submission::Finish(Action { token, finish })
     }
     pub fn submit(
@@ -599,14 +623,14 @@ impl Engine {
         let expected = connection_header_len(&packet.connection) + payload_len;
         if payload_len > MAX_PAYLOAD || record.as_ref().is_some_and(|data| data.len() != expected) {
             self.stats.malformed = self.stats.malformed.saturating_add(1);
-            self.account(&packet, false);
+            self.account(interface_index, &packet, false);
             return Submission::Finish(Action {
                 token,
                 finish: Finish::Drop,
             });
         }
         if !self.has_room(expected) || self.next_id == u64::MAX || record.is_none() {
-            return self.overflow(&packet, token);
+            return self.overflow(interface_index, &packet, token);
         }
         let id = self.next_id;
         let mut data = record.unwrap_or_default();
@@ -620,7 +644,7 @@ impl Engine {
         .is_err()
         {
             self.stats.malformed = self.stats.malformed.saturating_add(1);
-            self.account(&packet, false);
+            self.account(interface_index, &packet, false);
             return Submission::Finish(Action {
                 token,
                 finish: Finish::Drop,
@@ -636,12 +660,12 @@ impl Engine {
             event: None,
             packet,
         }) else {
-            return self.overflow(&packet, token);
+            return self.overflow(interface_index, &packet, token);
         };
         let Some(event) = self.push_event(data, Some(handle)) else {
             // SAFETY: the event was not published, so only this new handle exists.
             unsafe { self.pending.remove(handle) };
-            return self.overflow(&packet, token);
+            return self.overflow(interface_index, &packet, token);
         };
         // SAFETY: both nodes are live and no handles escape the locked engine.
         unsafe { self.pending.get_mut(handle) }.event = Some(event);
@@ -673,7 +697,7 @@ impl Engine {
             unsafe { self.pending.remove(handle) };
         }
         self.pending_count -= 1;
-        self.account(&p.packet, finish == Finish::Allow);
+        self.account(p.interface_index, &p.packet, finish == Finish::Allow);
         Action {
             token: p.token,
             finish,
@@ -805,13 +829,16 @@ impl Engine {
         }
         self.bandwidth_count = 0;
     }
-    fn bandwidth_add(&mut self, p: &Packet) {
-        let hash = tuple_hash(&p.connection).rotate_left(5) ^ u64::from(p.connection.protocol);
+    fn bandwidth_add(&mut self, interface_index: u32, p: &Packet) {
+        let hash = tuple_hash(&p.connection).rotate_left(5)
+            ^ u64::from(p.connection.protocol)
+            ^ u64::from(interface_index).wrapping_mul(0x9e37_79b9);
         let bucket = &mut self.bandwidth[hash as usize & (BANDWIDTH_BUCKETS - 1)];
         let same = |b: &&mut Bandwidth| {
             let a = &b.connection;
             let c = &p.connection;
-            a.ipv6 == c.ipv6
+            b.interface_index == interface_index
+                && a.ipv6 == c.ipv6
                 && a.protocol == c.protocol
                 && a.local_ip == c.local_ip
                 && a.remote_ip == c.remote_ip
@@ -827,6 +854,7 @@ impl Engine {
             let bytes = p.ip_len;
             if bucket
                 .try_push_back(Bandwidth {
+                    interface_index,
                     connection: p.connection,
                     tx: if p.connection.direction == Direction::Outbound {
                         bytes
@@ -848,28 +876,67 @@ impl Engine {
         }
     }
     pub fn bandwidth(&mut self) {
-        for bucket in 0..BANDWIDTH_BUCKETS {
-            let mut next = self.bandwidth[bucket].first_handle();
-            while let Some(handle) = next {
-                // SAFETY: each iteration visits one live node; save its successor
-                // before removing it. Enqueue cannot remove bandwidth nodes.
-                let b = *unsafe { self.bandwidth[bucket].get(handle) };
-                next = unsafe { self.bandwidth[bucket].next_handle(handle) };
-                let mut bytes = [0; MAX_LOG_RECORD];
-                let Ok(len) = encode_bandwidth(&mut bytes, &b.connection, b.tx, b.rx) else {
-                    continue;
-                };
-                if !self.has_room(len) {
-                    continue;
+        let mut after: Option<(u32, u8, bool)> = None;
+        'groups: loop {
+            let group = self
+                .bandwidth
+                .iter()
+                .flat_map(List::iter)
+                .map(Bandwidth::report_group)
+                .filter(|key| after.is_none_or(|after| *key > after))
+                .min();
+            let Some(group) = group else { break };
+            after = Some(group);
+            let (interface_index, protocol, ipv6) = group;
+            let count = self
+                .bandwidth
+                .iter()
+                .flat_map(List::iter)
+                .filter(|b| b.report_group() == group)
+                .count();
+            let Some(len) = bandwidth_record_len(ipv6, count) else {
+                continue;
+            };
+            if !self.has_room(len) {
+                continue;
+            }
+            let Some(mut data) = allocate_event(len) else {
+                continue;
+            };
+            if encode_bandwidth_header(&mut data, interface_index, ipv6, protocol, count).is_err() {
+                continue;
+            }
+            // Encode the entire group directly into final fallible storage.
+            // No entry-count cap, packet-record cap or temporary entry array.
+            for (out, b) in data[BANDWIDTH_HEADER..]
+                .chunks_exact_mut(bandwidth_entry_len(ipv6))
+                .zip(
+                    self.bandwidth
+                        .iter()
+                        .flat_map(List::iter)
+                        .filter(|b| b.report_group() == group),
+                )
+            {
+                if encode_bandwidth_entry(out, ipv6, &b.entry()).is_err() {
+                    continue 'groups;
                 }
-                if let Some(mut data) = allocate_record(len) {
-                    data.copy_from_slice(&bytes[..len]);
-                    if self.push_event(data, None).is_some() {
-                        unsafe { self.bandwidth[bucket].remove(handle) };
-                        self.bandwidth_count -= 1;
+            }
+            if self.push_event(data, None).is_none() {
+                continue;
+            }
+            // Retire only this successfully queued group without freeing its
+            // nodes under PolicyLock; failed groups keep all deltas.
+            for (bucket, retired) in self.bandwidth.iter_mut().zip(&mut self.retired_bandwidth) {
+                let mut next = bucket.first_handle();
+                while let Some(handle) = next {
+                    // SAFETY: handles and successors belong to this live list.
+                    next = unsafe { bucket.next_handle(handle) };
+                    if unsafe { bucket.get(handle) }.report_group() == group {
+                        unsafe { bucket.move_to(handle, retired) };
                     }
                 }
             }
+            self.bandwidth_count -= count;
         }
     }
     pub fn memory_stats(&mut self) {
@@ -1109,32 +1176,113 @@ mod tests {
         assert!(!e.has_events());
         e.events.fail_allocations = false;
         e.bandwidth();
-        assert!(e.bandwidth_count == 0);
-        assert_eq!(e.events.len(), COUNT);
-        let mut bytes = vec![0; COUNT * 62];
+        assert_eq!(e.bandwidth_count, 0);
+        assert_eq!(e.events.len(), 2);
+        let mut bytes = vec![0; COUNT * 66];
         let n = e.read(&mut bytes);
         let mut offset = 0;
-        let mut seen = 0;
+        let mut records = 0;
+        let mut seen = vec![false; COUNT];
         while offset < n {
             let event = &bytes[offset..];
             let size = 5 + u32::from_le_bytes(event[1..5].try_into().unwrap()) as usize;
             assert!(matches!(event[0], 5 | 6));
-            assert_eq!(u32::from_le_bytes(event[6..10].try_into().unwrap()), 1);
-            let tx = if event[0] == 5 { 22 } else { 46 };
-            assert_eq!(
-                u64::from_le_bytes(event[tx..tx + 8].try_into().unwrap()),
-                100
-            );
-            assert_eq!(
-                u64::from_le_bytes(event[tx + 8..tx + 16].try_into().unwrap()),
-                0
-            );
+            let ipv6 = event[0] == 6;
+            let count = u32::from_le_bytes(event[10..14].try_into().unwrap()) as usize;
+            assert_eq!(count, if ipv6 { COUNT / 2 } else { COUNT.div_ceil(2) });
+            assert_eq!(u32::from_le_bytes(event[6..10].try_into().unwrap()), 101);
+            assert_eq!(event[5], 17);
+            let entry_size = bandwidth_entry_len(ipv6);
+            let address_size = if ipv6 { 16 } else { 4 };
+            assert_eq!(size, BANDWIDTH_HEADER + count * entry_size);
+            for entry in event[BANDWIDTH_HEADER..size].chunks_exact(entry_size) {
+                let port =
+                    u16::from_le_bytes(entry[address_size..address_size + 2].try_into().unwrap())
+                        as usize;
+                assert!((1..=COUNT).contains(&port));
+                assert_eq!(port.is_multiple_of(2), ipv6);
+                assert!(!seen[port - 1]);
+                seen[port - 1] = true;
+                assert_eq!(
+                    u64::from_le_bytes(entry[entry_size - 16..entry_size - 8].try_into().unwrap()),
+                    100
+                );
+                assert_eq!(
+                    u64::from_le_bytes(entry[entry_size - 8..].try_into().unwrap()),
+                    0
+                );
+            }
             offset += size;
-            seen += 1;
+            records += 1;
         }
         assert_eq!(offset, n);
-        assert_eq!(seen, COUNT);
+        assert_eq!(records, 2);
+        assert!(seen.into_iter().all(|seen| seen));
         assert!(e.events.is_empty());
+    }
+
+    #[test]
+    fn bandwidth_queues_the_entire_large_group_without_count_caps_or_splitting() {
+        const COUNT: usize = 40000;
+        for ipv6 in [false, true] {
+            let mut e = engine();
+            e.read(&mut [0; MAX_LOG_RECORD]);
+            for port in 1..=COUNT {
+                let mut p = packet();
+                p.connection.ipv6 = ipv6;
+                p.connection.local_port = port as u16;
+                e.bandwidth_add(101, &p);
+            }
+            assert_eq!(e.bandwidth_count, COUNT);
+            e.bandwidth();
+            assert_eq!(e.bandwidth_count, 0);
+            assert_eq!(e.events.len(), 1);
+            assert_eq!(
+                e.retired_bandwidth.iter().map(List::len).sum::<usize>(),
+                COUNT
+            );
+            while let Some(retired) = e.take_retired_storage() {
+                drop(retired); // The driver reclaims the group after releasing PolicyLock.
+            }
+            assert!(e.retired_bandwidth.iter().all(List::is_empty));
+            let len = bandwidth_record_len(ipv6, COUNT).unwrap();
+            assert!(len > MAX_RECORD);
+            let mut out = vec![0; len];
+            assert_eq!(e.read(&mut out), len);
+            assert_eq!(out[0], if ipv6 { 6 } else { 5 });
+            assert_eq!(
+                u32::from_le_bytes(out[1..5].try_into().unwrap()) as usize,
+                len - 5
+            );
+            assert_eq!(out[5], 17);
+            assert_eq!(u32::from_le_bytes(out[6..10].try_into().unwrap()), 101);
+            assert_eq!(
+                u32::from_le_bytes(out[10..14].try_into().unwrap()) as usize,
+                COUNT
+            );
+            let entry_size = bandwidth_entry_len(ipv6);
+            let address_size = if ipv6 { 16 } else { 4 };
+            let mut seen = vec![false; COUNT];
+            for entry in out[BANDWIDTH_HEADER..].chunks_exact(entry_size) {
+                let port =
+                    u16::from_le_bytes(entry[address_size..address_size + 2].try_into().unwrap())
+                        as usize;
+                assert!((1..=COUNT).contains(&port));
+                assert!(!seen[port - 1]);
+                seen[port - 1] = true;
+                assert_eq!(
+                    u64::from_le_bytes(entry[entry_size - 16..entry_size - 8].try_into().unwrap()),
+                    100
+                );
+                assert_eq!(
+                    u64::from_le_bytes(entry[entry_size - 8..].try_into().unwrap()),
+                    0
+                );
+            }
+            assert!(seen.into_iter().all(|seen| seen));
+            e.bandwidth();
+            assert!(!e.has_events());
+        }
     }
 
     #[test]
@@ -1173,6 +1321,154 @@ mod tests {
                 assert!(e.pending.is_empty());
             }
         }
+    }
+
+    #[test]
+    fn bandwidth_separates_interfaces_protocols_and_families_but_not_directions() {
+        let mut e = engine();
+        e.read(&mut [0; MAX_LOG_RECORD]);
+        // 101 and 357 also exercise identical low hash bits for the same tuple.
+        for index in [357, u32::MAX] {
+            assert!(e.attach(index));
+            assert!(e.restart(index));
+        }
+        let mut expected = Vec::new();
+        for (ordinal, interface_index) in [101, 357, u32::MAX].into_iter().enumerate() {
+            for protocol in [6, 17] {
+                for ipv6 in [false, true] {
+                    let tx = ((ordinal as u64 + 1) << 32) + 123;
+                    let rx = tx + 456;
+                    for (direction, bytes) in [(Direction::Outbound, tx), (Direction::Inbound, rx)]
+                    {
+                        let mut p = packet();
+                        p.connection.protocol = protocol;
+                        p.flow.protocol = protocol;
+                        p.connection.ipv6 = ipv6;
+                        p.flow.ipv6 = ipv6;
+                        p.connection.direction = direction;
+                        p.ip_len = bytes;
+                        let Submission::Pending(id) =
+                            e.submit(interface_index, p, 1, None, 100, record(&p))
+                        else {
+                            panic!("expected an uncached packet");
+                        };
+                        assert_eq!(
+                            e.verdict(id, Verdict::Accept, 101).unwrap().finish,
+                            Finish::Allow
+                        );
+                    }
+                    expected.push((interface_index, protocol, ipv6, tx, rx));
+                }
+            }
+        }
+        assert_eq!(e.bandwidth_count, expected.len());
+        e.bandwidth();
+        assert_eq!(e.bandwidth_count, 0);
+        let mut out = vec![0; expected.len() * 66];
+        let n = e.read(&mut out);
+        let mut offset = 0;
+        let mut seen = vec![false; expected.len()];
+        while offset < n {
+            let event = &out[offset..];
+            let ipv6 = event[0] == 6;
+            assert!(matches!(event[0], 5 | 6));
+            let len = if ipv6 { 66 } else { 42 };
+            assert_eq!(
+                u32::from_le_bytes(event[1..5].try_into().unwrap()) as usize,
+                len - 5
+            );
+            assert_eq!(u32::from_le_bytes(event[10..14].try_into().unwrap()), 1);
+            let index = u32::from_le_bytes(event[6..10].try_into().unwrap());
+            let i = expected
+                .iter()
+                .position(|&(iface, protocol, family, _, _)| {
+                    (iface, protocol, family) == (index, event[5], ipv6)
+                })
+                .expect("unexpected bandwidth key");
+            assert!(!seen[i]);
+            seen[i] = true;
+            assert_eq!(
+                u64::from_le_bytes(event[len - 16..len - 8].try_into().unwrap()),
+                expected[i].3
+            );
+            assert_eq!(
+                u64::from_le_bytes(event[len - 8..len].try_into().unwrap()),
+                expected[i].4
+            );
+            offset += len;
+        }
+        assert_eq!(offset, n);
+        assert!(seen.into_iter().all(|seen| seen));
+        e.bandwidth();
+        assert!(!e.has_events());
+        // Successfully queued reports reset only their deltas.
+        let mut p = packet();
+        p.ip_len = 33;
+        let Submission::Pending(id) = e.submit(357, p, 1, None, 100, record(&p)) else {
+            panic!()
+        };
+        e.verdict(id, Verdict::Accept, 101).unwrap();
+        e.bandwidth();
+        assert_eq!(e.read(&mut out), 42);
+        assert_eq!(u32::from_le_bytes(out[6..10].try_into().unwrap()), 357);
+        assert_eq!(u64::from_le_bytes(out[26..34].try_into().unwrap()), 33);
+        assert_eq!(u64::from_le_bytes(out[34..42].try_into().unwrap()), 0);
+    }
+
+    #[test]
+    fn bandwidth_keeps_the_interface_on_cached_allows_and_fail_open_fallbacks() {
+        let mut e = engine();
+        e.read(&mut [0; MAX_LOG_RECORD]);
+        assert!(e.attach(357));
+        assert!(e.restart(357));
+        for interface_index in [101, 357] {
+            let id = submit(&mut e, interface_index, 1);
+            e.verdict(id, Verdict::PermanentAccept, 101).unwrap();
+            let mut p = packet();
+            p.connection.direction = Direction::Inbound;
+            p.ip_len = 75;
+            assert_eq!(
+                e.preflight(interface_index, &p, 2, 102).unwrap_err().finish,
+                Finish::Allow
+            );
+            p.connection.direction = Direction::Outbound;
+            p.cacheable = false;
+            p.ip_len = 125;
+            assert_eq!(
+                e.submit(interface_index, p, 3, None, 103, None),
+                Submission::Finish(Action {
+                    token: 3,
+                    finish: Finish::Allow
+                })
+            );
+            p.ip_len = 150;
+            assert!(matches!(
+                e.submit(interface_index, p, 4, None, 104, record(&p)),
+                Submission::Pending(_)
+            ));
+            assert_eq!(
+                e.take_due(2104),
+                Some(Action {
+                    token: 4,
+                    finish: Finish::Allow
+                })
+            );
+        }
+        assert_eq!(e.stats().cache_hits, 2);
+        assert_eq!(e.stats().overflow, 2);
+        assert_eq!(e.stats().timeouts, 2);
+        assert_eq!(e.bandwidth_count, 2);
+        e.bandwidth();
+        let mut out = [0; 128];
+        assert_eq!(e.read(&mut out), 84);
+        let mut indices = [0; 2];
+        for (i, event) in out[..84].as_chunks::<42>().0.iter().enumerate() {
+            indices[i] = u32::from_le_bytes(event[6..10].try_into().unwrap());
+            assert_eq!(u64::from_le_bytes(event[26..34].try_into().unwrap()), 375);
+            assert_eq!(u64::from_le_bytes(event[34..42].try_into().unwrap()), 75);
+        }
+        indices.sort_unstable();
+        assert_eq!(indices, [101, 357]);
     }
 
     #[test]
@@ -2078,7 +2374,7 @@ mod tests {
         e.read(&mut [0; MAX_LOG_RECORD]);
         let mut p = packet();
         p.ip_len = u64::from(u32::MAX) + 123;
-        e.bandwidth_add(&p);
+        e.bandwidth_add(101, &p);
         e.bandwidth();
         let mut out = [0; 128];
         let len = e.read(&mut out);
@@ -2665,11 +2961,11 @@ mod tests {
             let len = u32::from_le_bytes(b[i + 1..i + 5].try_into().unwrap()) as usize;
             if b[i] == 5 {
                 assert_eq!(
-                    u64::from_le_bytes(b[i + 22..i + 30].try_into().unwrap()),
+                    u64::from_le_bytes(b[i + 26..i + 34].try_into().unwrap()),
                     100
                 );
                 assert_eq!(
-                    u64::from_le_bytes(b[i + 30..i + 38].try_into().unwrap()),
+                    u64::from_le_bytes(b[i + 34..i + 42].try_into().unwrap()),
                     75
                 );
                 seen += 1;
@@ -2679,7 +2975,7 @@ mod tests {
         assert_eq!(seen, 1);
     }
     #[test]
-    fn bandwidth_counts_admitted_bytes_and_uses_existing_wire() {
+    fn bandwidth_counts_admitted_bytes_and_reports_the_interface_index() {
         let mut e = engine();
         let k = 101;
         let id = submit(&mut e, k, 1);
@@ -2692,10 +2988,11 @@ mod tests {
         while i < n {
             let len = u32::from_le_bytes(b[i + 1..i + 5].try_into().unwrap()) as usize;
             if b[i] == 5 {
-                assert_eq!(len, 33);
+                assert_eq!(len, 37);
+                assert_eq!(u32::from_le_bytes(b[i + 6..i + 10].try_into().unwrap()), k);
                 seen = true;
                 assert_eq!(
-                    u64::from_le_bytes(b[i + 22..i + 30].try_into().unwrap()),
+                    u64::from_le_bytes(b[i + 26..i + 34].try_into().unwrap()),
                     100
                 );
             }

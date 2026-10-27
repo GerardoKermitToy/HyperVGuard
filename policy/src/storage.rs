@@ -8,7 +8,7 @@ struct Node<T> {
 }
 
 // Handles never escape the policy engine or survive removal of their node.
-// Linking a node into another list is not supported.
+// A moved node's handle must only be used with its new owning list.
 pub(crate) struct Handle<T>(NonNull<Node<T>>);
 impl<T> Copy for Handle<T> {}
 impl<T> Clone for Handle<T> {
@@ -163,6 +163,36 @@ impl<T> List<T> {
         self.len -= 1;
         node.value
     }
+    /// # Safety
+    /// The handle must name a live node in this list, with no outstanding
+    /// references to its value. Ownership transfers without allocation or free.
+    pub(crate) unsafe fn move_to(&mut self, handle: Handle<T>, other: &mut Self) {
+        let node = handle.0.as_ptr();
+        unsafe {
+            let previous = (*node).previous;
+            let next = (*node).next;
+            if let Some(previous) = previous {
+                (*previous.0.as_ptr()).next = next;
+            } else {
+                self.head = next;
+            }
+            if let Some(next) = next {
+                (*next.0.as_ptr()).previous = previous;
+            } else {
+                self.tail = previous;
+            }
+            (*node).previous = other.tail;
+            (*node).next = None;
+            if let Some(tail) = other.tail {
+                (*tail.0.as_ptr()).next = Some(handle);
+            } else {
+                other.head = Some(handle);
+            }
+        }
+        self.len -= 1;
+        other.tail = Some(handle);
+        other.len += 1;
+    }
     pub(crate) fn iter(&self) -> Iter<'_, T> {
         Iter {
             next: self.head,
@@ -237,6 +267,59 @@ mod tests {
         assert!(list.is_empty());
         assert_eq!(list.try_push_back(7).map(|_| ()), Ok(()));
         assert_eq!(list.pop_front(), Some(7));
+    }
+
+    #[test]
+    fn moving_nodes_preserves_addresses_and_defers_destruction_without_allocation() {
+        struct Value {
+            id: usize,
+            drops: Rc<Cell<usize>>,
+        }
+        impl Drop for Value {
+            fn drop(&mut self) {
+                self.drops.set(self.drops.get() + 1);
+            }
+        }
+        let drops = Rc::new(Cell::new(0));
+        let mut source = List::new();
+        let mut retired = List::new();
+        let handles: Vec<_> = (0..4097)
+            .map(|id| {
+                source
+                    .try_push_back(Value {
+                        id,
+                        drops: drops.clone(),
+                    })
+                    .unwrap_or_else(|_| panic!())
+            })
+            .collect();
+        let addresses: Vec<_> = handles
+            .iter()
+            .map(|&h| unsafe { source.get(h) } as *const Value)
+            .collect();
+        retired.fail_allocations = true;
+        for i in (0..handles.len()).step_by(2) {
+            unsafe { source.move_to(handles[i], &mut retired) };
+        }
+        assert_eq!(source.len(), 2048);
+        assert_eq!(retired.len(), 2049);
+        assert_eq!(drops.get(), 0);
+        for (i, &handle) in handles.iter().enumerate() {
+            let owner = if i.is_multiple_of(2) {
+                &retired
+            } else {
+                &source
+            };
+            let value = unsafe { owner.get(handle) };
+            assert_eq!(value.id, i);
+            assert_eq!(value as *const Value, addresses[i]);
+        }
+        assert!(source.iter().map(|v| v.id).eq((1..4097).step_by(2)));
+        assert!(retired.iter().map(|v| v.id).eq((0..4097).step_by(2)));
+        source.clear();
+        assert_eq!(drops.get(), 2048);
+        retired.clear();
+        assert_eq!(drops.get(), 4097);
     }
 
     #[test]
