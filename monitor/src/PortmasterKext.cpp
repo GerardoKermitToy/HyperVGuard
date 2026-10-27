@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <new>
 #include <string>
 #include <thread>
 #include <utility>
@@ -280,6 +281,22 @@ bool Driver::GetFilteredDeviceCount(uint32_t& out, std::string& error) {
     uint32_t returned = 0;
     if (!DeviceControl(wire::kIoctlFilteredDeviceCount, bytes, sizeof(bytes), error, &returned)) return false;
     return wire::DecodeFilteredDeviceCount(bytes, returned, out, error);
+}
+
+bool Driver::GetAdapterInfo(AdapterSnapshot& out, std::string& error) {
+    if (device_ == nullptr) {
+        error = "device not open";
+        return false;
+    }
+    std::unique_ptr<uint8_t[]> bytes(new (std::nothrow) uint8_t[wire::kMaxAdapterInfoSize]);
+    if (!bytes) {
+        error = "cannot allocate adapter information buffer";
+        return false;
+    }
+    uint32_t returned = 0;
+    if (!DeviceControl(wire::kIoctlAdapterInfo, bytes.get(),
+                       static_cast<uint32_t>(wire::kMaxAdapterInfoSize), error, &returned)) return false;
+    return wire::DecodeAdapterInfo(bytes.get(), returned, out, error);
 }
 
 bool Driver::RequestShutdown(std::string& error) {

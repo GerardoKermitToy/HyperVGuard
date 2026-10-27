@@ -17,7 +17,9 @@
 #include <mutex>
 #include <new>
 #include <span>
+#include <string>
 #include <string_view>
+#include <vector>
 
 namespace hypervxndisfilter {
 
@@ -35,6 +37,52 @@ public:
     static constexpr std::array<uint8_t, 4> RequiredVersion{0, 3, 2, 0};
     enum class Verdict : uint8_t { Accept = 2, PermanentAccept, Block, PermanentBlock, Drop, PermanentDrop };
     enum class Command : uint8_t { ClearCache = 4, GetLogs, GetBandwidthStats, PrintMemoryStats, CleanEndedConnections };
+
+    // Adapter diagnostics use a separate, unframed IOCTL format, not event records.
+    static constexpr uint32_t AdapterInfoVersion = 1;
+    static constexpr size_t AdapterInfoHeaderSize = 16, AdapterInfoEntrySize = 1760;
+    static constexpr uint32_t MaxAdapters = 32;
+    static constexpr size_t AdapterNameCapacity = 256, AdapterMacCapacity = 32;
+    static constexpr size_t MaxAdapterInfoSize = AdapterInfoHeaderSize + MaxAdapters * AdapterInfoEntrySize;
+    static constexpr uint32_t AdapterRunning = 0x01, AdapterGeneralValid = 0x02, AdapterConnectorValid = 0x04;
+    static constexpr uint32_t AdapterInstanceNameTruncated = 0x08, AdapterBaseNameTruncated = 0x10;
+    static constexpr uint32_t AdapterFilterNameTruncated = 0x20, AdapterLinkStateValid = 0x40, AdapterPauseValid = 0x80;
+    static constexpr uint32_t AdapterKnownFlags = 0xff;
+
+    // Owning values, never a native NDIS/wire structure. Includes paused and
+    // initially attached modules; AdapterRunning means packet admission is open.
+    // Validity/truncation bits describe the corresponding captured attributes.
+    struct AdapterInfo {
+        static constexpr uint32_t Running = AdapterRunning;
+        static constexpr uint32_t GeneralAttributesValid = AdapterGeneralValid;
+        static constexpr uint32_t ConnectorPresentValid = AdapterConnectorValid;
+        static constexpr uint32_t InstanceNameTruncated = AdapterInstanceNameTruncated;
+        static constexpr uint32_t BaseNameTruncated = AdapterBaseNameTruncated;
+        static constexpr uint32_t FilterModuleNameTruncated = AdapterFilterNameTruncated;
+        static constexpr uint32_t LinkStateValid = AdapterLinkStateValid;
+        static constexpr uint32_t PauseValid = AdapterPauseValid;
+
+        uint64_t module_id = 0;
+        uint32_t interface_index = 0, filter_interface_index = 0, lower_interface_index = 0, flags = 0;
+        uint64_t interface_luid = 0, filter_interface_luid = 0, lower_interface_luid = 0;
+        // Windows GUID field byte order: Data1/2/3 LE, then the eight Data4 bytes.
+        std::array<uint8_t, 16> interface_guid{};
+        uint32_t media_type = 0, physical_medium = 0, media_connect_state = 0, media_duplex_state = 0;
+        uint64_t xmit_link_speed = 0, rcv_link_speed = 0;
+        uint32_t mtu = 0, mac_options = 0, supported_packet_filters = 0, max_multicast_list_size = 0;
+        uint64_t max_xmit_link_speed = 0, max_rcv_link_speed = 0;
+        uint32_t lookahead_size = 0, access_type = 0, connection_type = 0, supported_statistics = 0;
+        uint32_t data_backfill_size = 0, context_backfill_size = 0, restart_flags = 0, attach_flags = 0;
+        uint32_t connector_present = 0, mac_address_length = 0;
+        std::array<uint8_t, AdapterMacCapacity> mac_address{};
+        uint32_t instance_name_length = 0, base_name_length = 0, filter_module_name_length = 0; // UTF-16 code units.
+        uint32_t auto_negotiation_flags = 0, pause_reason = 0, pause_flags = 0;
+        std::wstring instance_name, base_name, filter_module_name;
+    };
+    struct AdapterSnapshot {
+        uint32_t running_count = 0;
+        std::vector<AdapterInfo> adapters;
+    };
 
     // Borrowed wire views, not normalized copies. Packing applies only to these
     // fixed layouts; never take an aligned scalar pointer/reference to a field.
@@ -150,6 +198,16 @@ public:
         if (!error) out = ReadLe<uint32_t>(bytes);
         return error;
     }
+    // Safe alongside Run's pending read. Failure always leaves out unchanged.
+    DWORD GetAdapterInfo(AdapterSnapshot& out) {
+        std::unique_ptr<uint8_t[]> bytes{new (std::nothrow) uint8_t[MaxAdapterInfoSize]};
+        if (!bytes) return ERROR_NOT_ENOUGH_MEMORY;
+        DWORD size = 0;
+        const DWORD error = Control(0x803, bytes.get(), static_cast<DWORD>(MaxAdapterInfoSize), size);
+        if (error) return error;
+        if (size > MaxAdapterInfoSize) return ERROR_INVALID_DATA;
+        return DecodeAdapterInfo({bytes.get(), size}, out);
+    }
     DWORD Shutdown() {
         Stop();
         DWORD size = 0;
@@ -199,6 +257,80 @@ public:
             if (error) return error;
         }
         return ERROR_SUCCESS;
+    }
+
+    // Device-independent owning decoder. Malformed responses return INVALID_DATA;
+    // allocation failures return NOT_ENOUGH_MEMORY. Neither changes out.
+    static DWORD DecodeAdapterInfo(Bytes bytes, AdapterSnapshot& out) {
+        if (!bytes.data() || bytes.size() < AdapterInfoHeaderSize || bytes.size() > MaxAdapterInfoSize)
+            return ERROR_INVALID_DATA;
+        if (ReadLe<uint32_t>(bytes.data()) != AdapterInfoVersion ||
+            ReadLe<uint32_t>(bytes.data() + 4) != AdapterInfoEntrySize) return ERROR_INVALID_DATA;
+        const uint32_t count = ReadLe<uint32_t>(bytes.data() + 8);
+        const uint32_t running_count = ReadLe<uint32_t>(bytes.data() + 12);
+        if (count > MaxAdapters || running_count > count ||
+            bytes.size() != AdapterInfoHeaderSize + static_cast<size_t>(count) * AdapterInfoEntrySize)
+            return ERROR_INVALID_DATA;
+        try {
+            AdapterSnapshot snapshot;
+            snapshot.running_count = running_count;
+            snapshot.adapters.reserve(count);
+            uint32_t running = 0;
+            for (uint32_t i = 0; i < count; ++i) {
+                const uint8_t* p = bytes.data() + AdapterInfoHeaderSize + static_cast<size_t>(i) * AdapterInfoEntrySize;
+                auto& a = snapshot.adapters.emplace_back();
+                a.module_id = ReadLe<uint64_t>(p);
+                a.interface_index = ReadLe<uint32_t>(p + 8);
+                a.filter_interface_index = ReadLe<uint32_t>(p + 12);
+                a.lower_interface_index = ReadLe<uint32_t>(p + 16);
+                a.flags = ReadLe<uint32_t>(p + 20);
+                a.interface_luid = ReadLe<uint64_t>(p + 24);
+                a.filter_interface_luid = ReadLe<uint64_t>(p + 32);
+                a.lower_interface_luid = ReadLe<uint64_t>(p + 40);
+                std::memcpy(a.interface_guid.data(), p + 48, a.interface_guid.size());
+                a.media_type = ReadLe<uint32_t>(p + 64);
+                a.physical_medium = ReadLe<uint32_t>(p + 68);
+                a.media_connect_state = ReadLe<uint32_t>(p + 72);
+                a.media_duplex_state = ReadLe<uint32_t>(p + 76);
+                a.xmit_link_speed = ReadLe<uint64_t>(p + 80);
+                a.rcv_link_speed = ReadLe<uint64_t>(p + 88);
+                a.mtu = ReadLe<uint32_t>(p + 96);
+                a.mac_options = ReadLe<uint32_t>(p + 100);
+                a.supported_packet_filters = ReadLe<uint32_t>(p + 104);
+                a.max_multicast_list_size = ReadLe<uint32_t>(p + 108);
+                a.max_xmit_link_speed = ReadLe<uint64_t>(p + 112);
+                a.max_rcv_link_speed = ReadLe<uint64_t>(p + 120);
+                a.lookahead_size = ReadLe<uint32_t>(p + 128);
+                a.access_type = ReadLe<uint32_t>(p + 132);
+                a.connection_type = ReadLe<uint32_t>(p + 136);
+                a.supported_statistics = ReadLe<uint32_t>(p + 140);
+                a.data_backfill_size = ReadLe<uint32_t>(p + 144);
+                a.context_backfill_size = ReadLe<uint32_t>(p + 148);
+                a.restart_flags = ReadLe<uint32_t>(p + 152);
+                a.attach_flags = ReadLe<uint32_t>(p + 156);
+                a.connector_present = ReadLe<uint32_t>(p + 160);
+                a.mac_address_length = ReadLe<uint32_t>(p + 164);
+                std::memcpy(a.mac_address.data(), p + 168, a.mac_address.size());
+                a.instance_name_length = ReadLe<uint32_t>(p + 200);
+                a.base_name_length = ReadLe<uint32_t>(p + 204);
+                a.filter_module_name_length = ReadLe<uint32_t>(p + 208);
+                a.auto_negotiation_flags = ReadLe<uint32_t>(p + 212);
+                a.pause_reason = ReadLe<uint32_t>(p + 216);
+                a.pause_flags = ReadLe<uint32_t>(p + 220);
+                if ((a.flags & ~AdapterKnownFlags) || a.mac_address_length > AdapterMacCapacity ||
+                    a.connector_present > 1 || !DecodeAdapterName(p + 224, a.instance_name_length, a.instance_name) ||
+                    !DecodeAdapterName(p + 736, a.base_name_length, a.base_name) ||
+                    !DecodeAdapterName(p + 1248, a.filter_module_name_length, a.filter_module_name))
+                    return ERROR_INVALID_DATA;
+                if (a.flags & AdapterRunning) ++running;
+            }
+            if (running != running_count) return ERROR_INVALID_DATA;
+            out.adapters.swap(snapshot.adapters);
+            out.running_count = snapshot.running_count;
+            return ERROR_SUCCESS;
+        } catch (const std::bad_alloc&) {
+            return ERROR_NOT_ENOUGH_MEMORY;
+        }
     }
 
     // Device-independent, borrowed packed views. Exactly one complete bounded record.
@@ -251,6 +383,14 @@ public:
     };
 
 private:
+    static bool DecodeAdapterName(const uint8_t* bytes, uint32_t length, std::wstring& out) {
+        if (length >= AdapterNameCapacity || ReadLe<uint16_t>(bytes + 2 * length) != 0) return false;
+        for (uint32_t i = 0; i < length; ++i)
+            if (ReadLe<uint16_t>(bytes + 2 * i) == 0) return false;
+        out.resize(length);
+        for (uint32_t i = 0; i < length; ++i) out[i] = static_cast<wchar_t>(ReadLe<uint16_t>(bytes + 2 * i));
+        return true;
+    }
     template <class T> static DWORD DispatchConnection(Bytes body, void* context, ConnectionCallback<T> callback) {
         constexpr size_t prefix = sizeof(T) + sizeof(uint32_t);
         if (body.size() < prefix) return ERROR_INVALID_DATA;

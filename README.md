@@ -68,6 +68,8 @@ Without `--duration`, an open failure makes the monitor create/open `Global\Hype
 
 The monitor prints `Filtered network devices: N (running NDIS modules)` after the version check and whenever the count changes, checking at the `--poll` interval (default 1000 ms). This is the driver's live attachment/running-state count, not the number of configured or enabled bindings. A loaded driver can report zero. Status lines honor `--out` and `--timestamps`. If the installed SYS lacks the new IOCTL or a query fails, the monitor warns that the count is unavailable rather than reporting zero; monitoring continues and later polls retry.
 
+At startup it also prints `Attached network adapters: N` and one `[ADAPTER]` block per attached module: names, host indices/GUID/LUIDs, running state, MAC, media/link/duplex, speeds, MTU and available general NDIS attributes. Paused modules remain visible as not-running. Unknown fields and truncated names are labelled explicitly. This one-time diagnostic honors `--out`/`--timestamps`; an unavailable query warns without stopping monitoring. See the complete snapshot API below.
+
 Each `[CONN v4]` / `[CONN v6]` header prints `interface_index=N` immediately after `id`, in both console output and `--out` files. This is the host adapter index from that event, not a guest interface index; traffic from different adapters retains its own value.
 
 `--match` selects the remote endpoint in both directions; unmatched events receive PermanentAccept. `--filter-ip` only filters output, not verdicts. A blocking verdict without `--match` applies to every event and can disconnect the host-vNIC path.
@@ -88,7 +90,7 @@ Uninstall first disarms and removes the `hyperv_xndis_filter` NetCfg component, 
 
 ## API
 
-The public C++ interface is [PortmasterKext.h](monitor/include/PortmasterKext.h), namespace `pmkext`. The wire codec is [DriverProtocol.h](monitor/include/DriverProtocol.h); the driver-side encoding is defined in [protocol/src/lib.rs](protocol/src/lib.rs).
+The public C++ interface is [PortmasterKext.h](monitor/include/PortmasterKext.h), namespace `pmkext`. The wire codec is [DriverProtocol.h](monitor/include/DriverProtocol.h); driver-side event/command encoding is defined in [protocol/src/lib.rs](protocol/src/lib.rs), with the separate adapter-snapshot codec in [adapter_info.h](driver/shim/adapter_info.h).
 
 ### Semantics and compatibility
 
@@ -117,12 +119,65 @@ All supported IOCTLs use `CTL_CODE(40000, function, METHOD_BUFFERED, FILE_READ_D
 | `IOCTL_VERSION` | `0x800` / `0x9C40E000` | Exactly four bytes: `00 03 02 00`. The output buffer must have at least four bytes. |
 | `IOCTL_SHUTDOWN` | `0x801` / `0x9C40E004` | No output. Deactivates the policy session, discards queued events/cache/bandwidth, and resolves pending packets through the configured fallback. Does not unload, unbind, or uninstall the LWF. |
 | `IOCTL_FILTERED_DEVICE_COUNT` | `0x802` / `0x9C40E008` | Exactly four bytes: an unsigned 32-bit little-endian count of running NDIS filter modules. The output buffer must have at least four bytes; input must be empty. No policy or binding side effects. |
+| `IOCTL_ADAPTER_INFO` | `0x803` / `0x9C40E00C` | Versioned snapshot of every attached module, including not-running modules, with host adapter identity, names, MAC, link and general NDIS attributes. Empty input; allocate **56336 bytes** for the maximum reply. No policy, OID or binding side effects. |
 
 The count includes only modules admitted by the kernel target gate that successfully restarted and have not begun pausing. Merely configured, rejected, attached-but-paused, failed-restart and detached modules do not count. Pause removes a module immediately, even while outstanding NBLs are draining; a later successful restart adds it again. The snapshot is independent of the controller's policy-session state, so shutdown does not reset it. It describes active interception on adapters, not packet delivery, link connectivity or proof that traffic was observed. Current target isolation normally allows zero or one running device. Polling can miss brief transitions.
 
 All other IOCTLs are unsupported. After shutdown, close and reopen the handle to activate a new session. Closing the active handle also disconnects the controller and drains pending decisions. Shutdown does not itself close the handle or stop a custom application's read loop.
 
 Reads return an event byte stream, at most **65536 bytes per driver read**. A nonzero read remains pending until bytes exist; it never succeeds empty merely because the queue is empty. Zero-length requests still complete with zero bytes. The cancel-safe queue allows at most 16 waiting reads; excess requests fail with `STATUS_DEVICE_BUSY`. Shutdown, cleanup and unload cancel waiting reads; new reads after session shutdown fail until close/reopen. `CancelIoEx` cancels a waiting read, but cancellation can race a successful completion. Always reap an outstanding OVERLAPPED operation before freeing its buffer/event. Reads can split a record or contain multiple records; retain incomplete bytes between reads. No read-polling delay is needed. A work item copies queued bytes and completes requests outside the policy/NDIS locks; stale-only queues leave the read pending instead of returning zero.
+
+### Adapter information snapshot
+
+`IOCTL_ADAPTER_INFO` is an additive diagnostic: event/command wire version remains **0.3.2.0**. Earlier SYS builds with that same event version may not support it; treat an unsupported/failed query as **unavailable**, never as an empty adapter list. At startup, after checking the device version, the monitor prints this snapshot once, respecting `--out` and `--timestamps`. It warns and continues monitoring if the query fails. The separate running-device count still updates at `--poll` intervals; the two queries can observe different instants.
+
+The snapshot lists only modules accepted by the existing exact-target attach gate, not all Windows adapters or configured bindings. A module remains listed while attached but initially paused, pausing, or after a failed restart; flag `Running` means its admission gate is open. Detached modules disappear. `module_id` is an ephemeral internal module identifier, distinct from every Windows interface index/LUID. Interface identities describe the **host NDIS stack**, not guest adapters, switch ports or VM ownership. GUIDs/LUIDs are diagnostic only and do not broaden binding authorization.
+
+The driver copies names and current MAC at attach, captures general attributes supplied during successful restart, and updates link state/speeds from valid `NDIS_STATUS_LINK_STATE` indications. Fields describe the **last NDIS-supplied values**, not a fresh hardware/OID interrogation. A new restart without general attributes retains the last supplied general values. The base connector flag is available only with attach revision 4. `LinkStateValid` indicates that auto-negotiation flags were supplied by a link-state indication; initial connection/duplex/speeds already come from attach. Speeds are bits/s; `UINT64_MAX` means unknown under the NDIS convention. `PauseValid` reports the last observed pause reason/flags, even after restarting. Pointer-bearing capabilities, kernel handles/addresses, IP configuration, routes, process/guest identities and arbitrary OID data are not exported.
+
+The reply is **not an event record**. Its explicit byte codec is [adapter_info.h](driver/shim/adapter_info.h); do not serialize native structures. All integers and UTF-16 code units are little-endian. The first 16 bytes are four `u32` values:
+
+| Offset | Field | Value |
+|---:|---|---|
+| 0 | Schema version | `1`, independent of the device/event version. |
+| 4 | Entry size | `1760` bytes. |
+| 8 | Attached module count | `0..32`. |
+| 12 | Running module count | Number of entries with flag `Running`; `0..count`. |
+
+Exactly `count` entries follow. Successful output length is **`16 + count * 1760`**, at most **56336** bytes; zero modules is a successful 16-byte reply. The whole list, entry state and running count are protected by one diagnostic lock, including detach lifetime. Nonempty input fails with `STATUS_INVALID_PARAMETER`. An output buffer smaller than the **complete current snapshot** fails with `STATUS_BUFFER_TOO_SMALL`, with no partial list or successful size-only response; use the fixed maximum to avoid probe/retry races. No kernel allocation is needed for the query. The existing exclusive Administrator/SYSTEM device access requirement applies, including after policy shutdown while the handle remains open.
+
+Entry offsets are relative to each 1760-byte entry. C++ `AdapterInfo` has the following fields; header-only `Client::AdapterInfo` exposes the same data. These are owning decoded types, **not** native wire-layout views:
+
+| Offset | C++ field(s) | Wire format / source |
+|---:|---|---|
+| 0 | `module_id` | `u64`, driver module identity. |
+| 8, 12, 16 | `interface_index`, `filter_interface_index`, `lower_interface_index` | Three `u32`: base miniport (matches connection events), filter, and lower interface indices. |
+| 20 | `flags` | `u32`, validity/state/truncation bits below. |
+| 24, 32, 40 | `interface_luid`, `filter_interface_luid`, `lower_interface_luid` | Three `u64`, corresponding NET_LUID values. |
+| 48 | `interface_guid` | 16 bytes: Windows GUID field order (`Data1:u32 LE`, `Data2:u16 LE`, `Data3:u16 LE`, `Data4[8]`). C++ uses `std::array<uint8_t,16>`. |
+| 64, 68 | `media_type`, `physical_medium` | Two `u32`, NDIS medium / physical-medium enum values. |
+| 72, 76 | `media_connect_state`, `media_duplex_state` | Two `u32`: connect unknown/connected/disconnected=`0/1/2`; duplex unknown/half/full=`0/1/2`. |
+| 80, 88 | `xmit_link_speed`, `rcv_link_speed` | Two `u64`, last known TX/RX link speeds in bits/s. |
+| 96, 100, 104, 108 | `mtu`, `mac_options`, `supported_packet_filters`, `max_multicast_list_size` | Four `u32`, general restart attributes; MTU in bytes, option/filter values are bitmasks. |
+| 112, 120 | `max_xmit_link_speed`, `max_rcv_link_speed` | Two `u64`, general maximum TX/RX speeds in bits/s. |
+| 128, 132, 136, 140 | `lookahead_size`, `access_type`, `connection_type`, `supported_statistics` | Four `u32`, general restart attributes: bytes, NET_IF access/connection enums, statistics bitmask. |
+| 144, 148, 152, 156 | `data_backfill_size`, `context_backfill_size`, `restart_flags`, `attach_flags` | Four `u32`: backfill byte counts, general restart flags, attach flags. |
+| 160, 164 | `connector_present`, `mac_address_length` | Two `u32`: `0/1` (only meaningful with connector-valid flag), MAC length `0..32`. |
+| 168 | `mac_address` | 32 bytes, zero-padded; C++ `std::array<uint8_t,32>`, first `mac_address_length` bytes are meaningful. |
+| 200, 204, 208 | `instance_name_length`, `base_name_length`, `filter_module_name_length` | Three `u32` UTF-16 **code-unit** counts `0..255`, excluding the terminator. Equal to the corresponding decoded string lengths. |
+| 212, 216, 220 | `auto_negotiation_flags`, `pause_reason`, `pause_flags` | Three `u32`, meaningful with link-state / pause validity flags. |
+| 224, 736, 1248 | `instance_name`, `base_name`, `filter_module_name` | Three 256-code-unit UTF-16LE arrays: `BaseMiniportInstanceName`, `BaseMiniportName`, `FilterModuleGuidName`. Each has a NUL at its counted length and zero-filled tail; C++ decodes to `std::wstring`. Empty means unavailable/empty. |
+
+| Flag | Bit | C++ `AdapterInfo::` constant |
+|---|---:|---|
+| Admission open | `0x01` | `Running` |
+| General restart fields available | `0x02` | `GeneralAttributesValid` |
+| Connector-present field available | `0x04` | `ConnectorPresentValid` |
+| Instance/base/filter-module name truncated | `0x08` / `0x10` / `0x20` | `InstanceNameTruncated` / `BaseNameTruncated` / `FilterModuleNameTruncated` |
+| Link-state indication received | `0x40` | `LinkStateValid` |
+| Pause reason/flags available | `0x80` | `PauseValid` |
+
+Names longer than 255 UTF-16 code units are bounded explicitly, with the corresponding truncation bit; truncation never splits a surrogate pair. Unknown numeric NDIS enum values are preserved. Clients validate schema/entry sizes, exact total length, counts, flags, MAC length and counted-string bounds/terminators before publishing any result. On failure the caller's snapshot is unchanged. `AdapterSnapshot` contains `uint32_t running_count` and `std::vector<AdapterInfo> adapters`; an empty vector is meaningful only after a successful query. Monitor names are UTF-8 with control bytes escaped, and unavailable general/connector/auto-negotiation fields are labelled unknown rather than reported as real zeros.
 
 ### Driver-start notification
 
@@ -139,6 +194,7 @@ Construct `Driver(std::wstring service_name = L"HyperVXNdisFilter")`; the argume
 | `bool Open(std::string& error)` | Opens the already installed device. Fails if this client session is already open. Does not install, bind, or negotiate the version. |
 | `bool GetVersion(uint8_t out[4], std::string& error)` | Reads the four-byte version; integrations should require `0.3.2.0`. |
 | `bool GetFilteredDeviceCount(uint32_t& out, std::string& error)` | Synchronously reads the running-module snapshot through `IOCTL_FILTERED_DEVICE_COUNT`. Requires exactly four response bytes. On failure returns false and leaves `out` unchanged; an unsupported request means unavailable, not zero. |
+| `bool GetAdapterInfo(AdapterSnapshot& out, std::string& error)` | Synchronously reads and validates the bounded attached-module snapshot described above. Includes not-running modules; owning strings/arrays remain valid after return. Leaves `out` unchanged on failure, including malformed output or allocation failure. |
 | `void Run(const Handlers& handlers, unsigned poll_interval_ms = 1000)` | Starts a reader thread and blocks until stopped or the reader exits. Dispatches complete records and invokes `on_poll` on the calling thread. It does not automatically request logs/statistics or send verdicts. |
 | `bool SendVerdict(uint64_t id, Verdict verdict, std::string& error)` | Sends one verdict for a pending event ID. Only verdict values 2–7 are accepted. |
 | `bool RequestLogs(std::string& error)` | Sends `GetLogs`; existing log events are already queued for reading. |
@@ -166,6 +222,7 @@ A typical integration opens the device, checks its version, installs handlers, a
 | `Stop()` | Thread-safe local stop, usable during Open/Run; wakes the wait. Does not itself shut down policy, close handles or unload the LWF. |
 | `Close()` | Returns `ERROR_BUSY` during Run. Otherwise closes handles; device cleanup disconnects policy and releases pending packets through fallback. Join Run and all other callers before Close/destruction. |
 | `GetVersion(std::array<uint8_t,4>&)` / `GetFilteredDeviceCount(uint32_t&)` | Synchronous IOCTL queries; exact four-byte replies. Outputs are unchanged on failure. |
+| `GetAdapterInfo(AdapterSnapshot&)` | Synchronous bounded attached-module query, including not-running modules. Owning `Client::AdapterSnapshot` / `Client::AdapterInfo` types have the fields and validity flags documented above. Leaves output unchanged on failure; malformed replies return `ERROR_INVALID_DATA`, allocation failure returns `ERROR_NOT_ENOUGH_MEMORY`. |
 | `SendVerdict(uint64_t id, Verdict)` | Sends the fixed ten-byte verdict; values 2..7 only. No verdict-application acknowledgement. |
 | `Send(Command)` | Single-byte ClearCache=4, GetLogs=5, GetBandwidthStats=6, PrintMemoryStats=7 or CleanEndedConnections=8. No automatic scheduling. |
 | `Shutdown()` | Calls Stop and issues the policy shutdown IOCTL. Does not close, unload or unbind. |
@@ -190,6 +247,8 @@ Every header/array/payload pointer refers directly to the validated input buffer
 These fixed, trivially-copyable wire views use scoped `#pragma pack(push, 1)` / `pop`, with compile-time size, alignment and offset checks. All numbers are little-endian (native on supported Windows x64); addresses remain network-order bytes. Read packed scalar fields by value; do not pass a field's address/reference to an API expecting naturally aligned integers. IPv4/IPv6 is selected by the callback type, not an added `ipv6` field; no PID/thread ID is present. Guest direction and all policy/fallback semantics are unchanged. `Verdict` contains Accept=2, PermanentAccept=3, Block=4, PermanentBlock=5, Drop=6 and PermanentDrop=7.
 
 **C++ source migration:** the former unified `on_connection(const Connection&)` and per-tuple `on_bandwidth(const Bandwidth&)` callbacks are replaced by the IPv4/IPv6 pointer callbacks above. Update consumers as in [callback_client.cpp](monitor/examples/callback_client.cpp); both clients now require wire version **0.3.2.0** and decode the added host adapter index. Older SYS/client generations must not be mixed.
+
+For offline adapter replies, `Client::DecodeAdapterInfo(Bytes, AdapterSnapshot&)` performs the same owning validation/decoding as `GetAdapterInfo`, without device access. Its limits are `AdapterInfoVersion=1`, `AdapterInfoHeaderSize=16`, `AdapterInfoEntrySize=1760`, `MaxAdapters=32`, `AdapterNameCapacity=256`, `AdapterMacCapacity=32`, `MaxAdapterInfoSize=56336`. The `Client::Adapter*` flag constants correspond to the `AdapterInfo::` aliases above, with `AdapterKnownFlags=0xff`.
 
 For offline/custom transports, `Client::DispatchRecord(Bytes, callbacks)` validates one complete record before exposing any packed views. The optional `Client::Stream` helper exposes a writable `Buffer()` (at most 65536 bytes), `Commit(written, callbacks)`, `PendingBytes()` and `Reset()`; an invalid stream stays failed until Reset. Fill the latest Buffer and Commit it before asking for another; Buffer may compact storage, so do not retain its pointer across calls. Record size is bounded by `MaxRecordSize=1048636`, payload by `MaxPayloadSize=1048576`, read size by `ReadSize=65536`. Legacy connection-END types are not exposed by this client: the driver never generates them.
 
@@ -326,7 +385,7 @@ Empty/oversized/truncated writes are rejected with `STATUS_INVALID_PARAMETER`; u
 
 ### Device-independent codec helpers
 
-`pmkext::wire` exposes `IsCompatibleVersion`, `DecodeFilteredDeviceCount`, `IsSupportedVerdict`, `ValidateCommands`, `EncodeVerdict`, and `DispatchRecord`. `IsCompatibleVersion` accepts exactly `kRequiredDeviceVersion={0,3,2,0}`; `Open` itself does not perform this check. `DecodeFilteredDeviceCount` requires a non-null, exactly four-byte little-endian reply and leaves its output unchanged on failure. `EncodeVerdict` fills a fixed ten-byte array; `DispatchRecord` validates exactly one complete frame before invoking its handler.
+`pmkext::wire` exposes `IsCompatibleVersion`, `DecodeFilteredDeviceCount`, `DecodeAdapterInfo`, `IsSupportedVerdict`, `ValidateCommands`, `EncodeVerdict`, and `DispatchRecord`. `DecodeAdapterInfo(bytes, length, AdapterSnapshot&, error)` validates and decodes exactly one complete adapter snapshot, leaving output unchanged on failure. Its constants are `kIoctlAdapterInfo=0x9C40E00C`, `kAdapterInfoVersion=1`, `kAdapterInfoHeaderSize=16`, `kAdapterInfoEntrySize=1760`, `kMaxAdapters=32`, `kAdapterNameCapacity=256`, and `kMaxAdapterInfoSize=56336`. `IsCompatibleVersion` accepts exactly `kRequiredDeviceVersion={0,3,2,0}`; `Open` itself does not perform this check. `DecodeFilteredDeviceCount` requires a non-null, exactly four-byte little-endian reply and leaves its output unchanged on failure. `EncodeVerdict` fills a fixed ten-byte array; `DispatchRecord` validates exactly one complete frame before invoking its handler.
 
 `RecordStream::Feed(bytes, length, callback, error)` accepts arbitrary read boundaries and invokes the callback for each complete frame. `PendingBytes()` reports buffered incomplete bytes; `Reset()` discards buffered state. An oversized header invalidates the stream until reset; it does not guess a new boundary. The stream keeps at most one bounded record in heap storage and assembles large records across multiple driver reads. Constants are `kRecordHeaderSize=5`, `kConnectionIpv4PrefixSize=36`, `kConnectionIpv6PrefixSize=60`, `kMaxPayloadSize=1048576`, `kMaxRecordSize=1048636`, `kMaxLogRecordSize=512`, `kMaxCommandBatchSize=65536`, and `kVerdictCommandSize=10`.
 

@@ -4,6 +4,7 @@
 #include <netioapi.h>
 #include "lwf_contract.h"
 #include "driver_ready.h"
+#include "adapter_info.h"
 
 #define TAG 'gVHH'
 #define MAX_TOKENS 2048
@@ -11,6 +12,9 @@
 #define VERSION_IOCTL CTL_CODE(40000, 0x800, METHOD_BUFFERED, FILE_READ_DATA | FILE_WRITE_DATA)
 #define SHUTDOWN_IOCTL CTL_CODE(40000, 0x801, METHOD_BUFFERED, FILE_READ_DATA | FILE_WRITE_DATA)
 #define FILTERED_DEVICE_COUNT_IOCTL CTL_CODE(40000, 0x802, METHOD_BUFFERED, FILE_READ_DATA | FILE_WRITE_DATA)
+#define ADAPTER_INFO_IOCTL CTL_CODE(40000, 0x803, METHOD_BUFFERED, FILE_READ_DATA | FILE_WRITE_DATA)
+
+C_ASSERT(NDIS_MAX_PHYS_ADDRESS_LENGTH == HV_ADAPTER_INFO_MAC_CAPACITY);
 
 typedef struct _HV_ADAPTER HV_ADAPTER;
 typedef struct _HV_TOKEN {
@@ -27,7 +31,8 @@ struct _HV_ADAPTER {
     NDIS_SPIN_LOCK Lock;
     PNDIS_RW_LOCK_EX ClassificationLock;
     EX_RUNDOWN_REF OidRundown;
-    LIST_ENTRY Tokens;
+    LIST_ENTRY Tokens, AdapterLink;
+    HV_ADAPTER_INFO Info; // Protected by AdapterInfoLock; no borrowed NDIS pointers.
     UINT64 Id, Epoch;
     LONG Active, TokenCount;
     ULONG CopyBytes;
@@ -55,6 +60,11 @@ static PDEVICE_OBJECT ControlDevice;
 static HANDLE ReadyEventHandle;
 static PKEVENT ReadyEvent;
 static KSPIN_LOCK PolicyLock;
+// List/lifetime and diagnostic fields only. When both locks are needed, the
+// adapter admission lock precedes this lock; queries never take adapter locks.
+static KSPIN_LOCK AdapterInfoLock;
+static LIST_ENTRY Adapters;
+static ULONG AdapterCount;
 static FAST_MUTEX IoMutex;
 static PFILE_OBJECT Client;
 static volatile LONG Stopping;
@@ -83,7 +93,7 @@ FILTER_OID_REQUEST_COMPLETE HvOidComplete;
 FILTER_CANCEL_OID_REQUEST HvCancelOid;
 FILTER_NET_PNP_EVENT HvPnp;
 FILTER_STATUS HvStatus;
-static BOOLEAN TargetAdapter(PNDIS_FILTER_ATTACH_PARAMETERS p);
+static BOOLEAN TargetAdapter(PNDIS_FILTER_ATTACH_PARAMETERS p, GUID* interfaceGuid);
 
 // A bounded cancel-safe queue. NDIS only schedules the reader; buffered copies
 // and IRP completions run outside the policy/NDIS locks on a system work item.
@@ -251,7 +261,11 @@ static void ReleaseActive(HV_ADAPTER* a, LONG count) {
 static void SetFilterRunning(HV_ADAPTER* a, BOOLEAN running) {
     LONG count;
     NdisAcquireSpinLock(&a->Lock);
+    KeAcquireSpinLockAtDpcLevel(&AdapterInfoLock);
     count = InterlockedAdd(&FilteredDeviceCount, HvSetFilterRunning(&a->Running, running));
+    if (running) a->Info.Flags |= HV_ADAPTER_RUNNING;
+    else a->Info.Flags &= ~HV_ADAPTER_RUNNING;
+    KeReleaseSpinLockFromDpcLevel(&AdapterInfoLock);
     NT_ASSERT(count >= 0);
     UNREFERENCED_PARAMETER(count);
     NdisReleaseSpinLock(&a->Lock);
@@ -587,9 +601,134 @@ _Use_decl_annotations_
 NDIS_STATUS HvPnp(NDIS_HANDLE context, PNET_PNP_EVENT_NOTIFICATION event) {
     return NdisFNetPnPEvent(((HV_ADAPTER*)context)->Filter, event);
 }
+static uint32_t CopyAdapterName(uint16_t* out, PNDIS_STRING name, uint32_t* flags, uint32_t truncatedFlag) {
+    return HvCopyAdapterName(out, name ? (const uint16_t*)name->Buffer : NULL,
+        name ? name->Length / sizeof(WCHAR) : 0, flags, truncatedFlag);
+}
+static void CaptureAttachInfo(HV_ADAPTER* a, PNDIS_FILTER_ATTACH_PARAMETERS p, const GUID* guid) {
+    HV_ADAPTER_INFO* info = &a->Info;
+    info->ModuleId = a->Id;
+    info->InterfaceIndex = p->BaseMiniportIfIndex;
+    info->FilterInterfaceIndex = p->IfIndex;
+    info->LowerInterfaceIndex = p->LowerIfIndex;
+    info->InterfaceLuid = p->BaseMiniportNetLuid.Value;
+    info->FilterInterfaceLuid = p->NetLuid.Value;
+    info->LowerInterfaceLuid = p->LowerIfNetLuid.Value;
+    HvInfoWrite32(info->InterfaceGuid, guid->Data1);
+    info->InterfaceGuid[4] = (UCHAR)guid->Data2; info->InterfaceGuid[5] = (UCHAR)(guid->Data2 >> 8);
+    info->InterfaceGuid[6] = (UCHAR)guid->Data3; info->InterfaceGuid[7] = (UCHAR)(guid->Data3 >> 8);
+    RtlCopyMemory(info->InterfaceGuid + 8, guid->Data4, sizeof(guid->Data4));
+    info->MediaType = p->MiniportMediaType;
+    info->PhysicalMedium = p->MiniportPhysicalMediaType;
+    info->MediaConnectState = p->MediaConnectState;
+    info->MediaDuplexState = p->MediaDuplexState;
+    info->XmitLinkSpeed = p->XmitLinkSpeed;
+    info->RcvLinkSpeed = p->RcvLinkSpeed;
+    info->AttachFlags = p->Flags;
+    info->MacAddressLength = min(p->MacAddressLength, HV_ADAPTER_INFO_MAC_CAPACITY);
+    RtlCopyMemory(info->MacAddress, p->CurrentMacAddress, info->MacAddressLength);
+    if (p->Header.Revision >= NDIS_FILTER_ATTACH_PARAMETERS_REVISION_4 &&
+        p->Header.Size >= NDIS_SIZEOF_FILTER_ATTACH_PARAMETERS_REVISION_4) {
+        info->Flags |= HV_ADAPTER_CONNECTOR_VALID;
+        info->ConnectorPresent = p->BaseMiniportIfConnectorPresent != FALSE;
+    }
+    // Counted strings belong to NDIS only for this callback, so copy now.
+    info->InstanceNameLength = CopyAdapterName(info->InstanceName, p->BaseMiniportInstanceName,
+        &info->Flags, HV_ADAPTER_INSTANCE_NAME_TRUNCATED);
+    info->BaseNameLength = CopyAdapterName(info->BaseName, p->BaseMiniportName,
+        &info->Flags, HV_ADAPTER_BASE_NAME_TRUNCATED);
+    info->FilterModuleNameLength = CopyAdapterName(info->FilterModuleName, p->FilterModuleGuidName,
+        &info->Flags, HV_ADAPTER_FILTER_NAME_TRUNCATED);
+}
+static void CaptureRestartInfo(HV_ADAPTER* a, PNDIS_FILTER_RESTART_PARAMETERS p) {
+    PNDIS_RESTART_ATTRIBUTES attribute;
+    NDIS_RESTART_GENERAL_ATTRIBUTES general = {0};
+    ULONG mediaType = p->MiniportMediaType, physicalMedium = p->MiniportPhysicalMediaType;
+    ULONG lowerIndex = p->LowerIfIndex;
+    UINT64 lowerLuid = p->LowerIfNetLuid.Value;
+    BOOLEAN haveGeneral = FALSE;
+    KIRQL irql;
+    // Traverse/copy borrowed restart data at callback IRQL, before taking a spin
+    // lock. Only our nonpaged snapshot and small local values are used below it.
+    for (attribute = p->RestartAttributes; attribute != NULL; attribute = attribute->Next) {
+        const NDIS_RESTART_GENERAL_ATTRIBUTES* candidate;
+        if (attribute->Oid != OID_GEN_MINIPORT_RESTART_ATTRIBUTES ||
+            attribute->DataLength < NDIS_SIZEOF_RESTART_GENERAL_ATTRIBUTES_REVISION_1) continue;
+        candidate = (const NDIS_RESTART_GENERAL_ATTRIBUTES*)attribute->Data;
+        if (candidate->Header.Type != NDIS_OBJECT_TYPE_RESTART_GENERAL_ATTRIBUTES ||
+            candidate->Header.Revision < NDIS_RESTART_GENERAL_ATTRIBUTES_REVISION_1 ||
+            candidate->Header.Size < NDIS_SIZEOF_RESTART_GENERAL_ATTRIBUTES_REVISION_1 ||
+            candidate->Header.Size > attribute->DataLength) continue;
+        RtlCopyMemory(&general, candidate, NDIS_SIZEOF_RESTART_GENERAL_ATTRIBUTES_REVISION_1);
+        haveGeneral = TRUE;
+        break;
+    }
+    KeAcquireSpinLock(&AdapterInfoLock, &irql);
+    a->Info.MediaType = mediaType;
+    a->Info.PhysicalMedium = physicalMedium;
+    a->Info.LowerInterfaceIndex = lowerIndex;
+    a->Info.LowerInterfaceLuid = lowerLuid;
+    if (haveGeneral) {
+        a->Info.Flags |= HV_ADAPTER_GENERAL_VALID;
+        a->Info.Mtu = general.MtuSize;
+        a->Info.MaxXmitLinkSpeed = general.MaxXmitLinkSpeed;
+        a->Info.MaxRcvLinkSpeed = general.MaxRcvLinkSpeed;
+        a->Info.LookaheadSize = general.LookaheadSize;
+        a->Info.MacOptions = general.MacOptions;
+        a->Info.SupportedPacketFilters = general.SupportedPacketFilters;
+        a->Info.MaxMulticastListSize = general.MaxMulticastListSize;
+        a->Info.AccessType = general.AccessType;
+        a->Info.RestartFlags = general.Flags;
+        a->Info.ConnectionType = general.ConnectionType;
+        a->Info.SupportedStatistics = general.SupportedStatistics;
+        a->Info.DataBackFillSize = general.DataBackFillSize;
+        a->Info.ContextBackFillSize = general.ContextBackFillSize;
+    }
+    KeReleaseSpinLock(&AdapterInfoLock, irql);
+}
+static NTSTATUS QueryAdapterInfo(UCHAR* out, ULONG capacity, ULONG_PTR* transferred) {
+    PLIST_ENTRY entry;
+    KIRQL irql;
+    ULONG size, offset = HV_ADAPTER_INFO_HEADER_SIZE;
+    NTSTATUS status = STATUS_SUCCESS;
+    KeAcquireSpinLock(&AdapterInfoLock, &irql);
+    size = HvAdapterInfoSize(AdapterCount);
+    if (size == 0) status = STATUS_INSUFFICIENT_RESOURCES;
+    else if (capacity < size) status = STATUS_BUFFER_TOO_SMALL;
+    else if (out == NULL) status = STATUS_INVALID_PARAMETER;
+    else {
+        HvEncodeAdapterInfoHeader(out, AdapterCount, (ULONG)FilteredDeviceCount);
+        for (entry = Adapters.Flink; entry != &Adapters; entry = entry->Flink) {
+            HV_ADAPTER* a = CONTAINING_RECORD(entry, HV_ADAPTER, AdapterLink);
+            HvEncodeAdapterInfo(out + offset, &a->Info);
+            offset += HV_ADAPTER_INFO_ENTRY_SIZE;
+        }
+        NT_ASSERT(offset == size);
+        *transferred = size;
+    }
+    KeReleaseSpinLock(&AdapterInfoLock, irql);
+    return status;
+}
 _Use_decl_annotations_
 void HvStatus(NDIS_HANDLE context, PNDIS_STATUS_INDICATION status) {
-    NdisFIndicateStatus(((HV_ADAPTER*)context)->Filter, status);
+    HV_ADAPTER* a = context;
+    if (status->StatusCode == NDIS_STATUS_LINK_STATE && status->StatusBuffer != NULL &&
+        status->StatusBufferSize >= NDIS_SIZEOF_LINK_STATE_REVISION_1) {
+        const NDIS_LINK_STATE* link = status->StatusBuffer;
+        if (link->Header.Type == NDIS_OBJECT_TYPE_DEFAULT && link->Header.Revision >= NDIS_LINK_STATE_REVISION_1 &&
+            link->Header.Size >= NDIS_SIZEOF_LINK_STATE_REVISION_1 && link->Header.Size <= status->StatusBufferSize) {
+            KIRQL irql;
+            KeAcquireSpinLock(&AdapterInfoLock, &irql);
+            a->Info.Flags |= HV_ADAPTER_LINK_STATE_VALID;
+            a->Info.MediaConnectState = link->MediaConnectState;
+            a->Info.MediaDuplexState = link->MediaDuplexState;
+            a->Info.XmitLinkSpeed = link->XmitLinkSpeed;
+            a->Info.RcvLinkSpeed = link->RcvLinkSpeed;
+            a->Info.AutoNegotiationFlags = link->AutoNegotiationFlags;
+            KeReleaseSpinLock(&AdapterInfoLock, irql);
+        }
+    }
+    NdisFIndicateStatus(a->Filter, status);
 }
 _Use_decl_annotations_
 NDIS_STATUS HvFilterAttach(NDIS_HANDLE filter, NDIS_HANDLE context, PNDIS_FILTER_ATTACH_PARAMETERS p) {
@@ -598,15 +737,18 @@ NDIS_STATUS HvFilterAttach(NDIS_HANDLE filter, NDIS_HANDLE context, PNDIS_FILTER
     NET_BUFFER_LIST_POOL_PARAMETERS nblPool = {0};
     NET_BUFFER_POOL_PARAMETERS nbPool = {0};
     NDIS_STATUS status = NDIS_STATUS_RESOURCES;
+    GUID interfaceGuid;
+    KIRQL irql;
     UNREFERENCED_PARAMETER(context);
     // No fallback by friendly name, media type or wildcard. Missing/stale target
     // configuration means no adapter attaches; optional LWFs are bypassed by NDIS.
     if (p->MiniportMediaType != NdisMedium802_3 ||
-        !TargetAdapter(p)) return NDIS_STATUS_NOT_SUPPORTED;
+        !TargetAdapter(p, &interfaceGuid)) return NDIS_STATUS_NOT_SUPPORTED;
     a = ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(*a), TAG);
     if (a == NULL) return NDIS_STATUS_RESOURCES;
     a->Filter = filter; a->Epoch = 1;
     a->Id = (UINT64)InterlockedIncrement64(&NextAdapter);
+    CaptureAttachInfo(a, p, &interfaceGuid);
     NdisAllocateSpinLock(&a->Lock); InitializeListHead(&a->Tokens); ExInitializeRundownProtection(&a->OidRundown);
     a->ClassificationLock = NdisAllocateRWLock(filter);
     if (a->ClassificationLock == NULL) goto FreeLock;
@@ -628,7 +770,13 @@ NDIS_STATUS HvFilterAttach(NDIS_HANDLE filter, NDIS_HANDLE context, PNDIS_FILTER
     attributes.Header.Revision = NDIS_FILTER_ATTRIBUTES_REVISION_1;
     attributes.Header.Size = NDIS_SIZEOF_FILTER_ATTRIBUTES_REVISION_1;
     status = NdisFSetAttributes(filter, a, &attributes);
-    if (status == NDIS_STATUS_SUCCESS) return status;
+    if (status == NDIS_STATUS_SUCCESS) {
+        KeAcquireSpinLock(&AdapterInfoLock, &irql);
+        InsertTailList(&Adapters, &a->AdapterLink); ++AdapterCount;
+        NT_ASSERT(AdapterCount <= HV_ADAPTER_INFO_MAX_ADAPTERS);
+        KeReleaseSpinLock(&AdapterInfoLock, irql);
+        return status;
+    }
     HvDetach(a->Id);
 FreeNbPool:
     NdisFreeNetBufferPool(a->NbPool);
@@ -642,8 +790,8 @@ FreeLock:
 _Use_decl_annotations_
 NDIS_STATUS HvFilterRestart(NDIS_HANDLE context, PNDIS_FILTER_RESTART_PARAMETERS parameters) {
     HV_ADAPTER* a = context;
-    UNREFERENCED_PARAMETER(parameters);
     if (!HvRestart(a->Id)) return NDIS_STATUS_FAILURE;
+    CaptureRestartInfo(a, parameters);
     SetFilterRunning(a, TRUE);
     return NDIS_STATUS_SUCCESS;
 }
@@ -651,8 +799,13 @@ _Use_decl_annotations_
 NDIS_STATUS HvFilterPause(NDIS_HANDLE context, PNDIS_FILTER_PAUSE_PARAMETERS parameters) {
     HV_ADAPTER* a = context;
     NDIS_STATUS status;
-    UNREFERENCED_PARAMETER(parameters);
+    KIRQL irql;
     SetFilterRunning(a, FALSE);
+    KeAcquireSpinLock(&AdapterInfoLock, &irql);
+    a->Info.Flags |= HV_ADAPTER_PAUSE_VALID;
+    a->Info.PauseReason = parameters->PauseReason;
+    a->Info.PauseFlags = parameters->Flags;
+    KeReleaseSpinLock(&AdapterInfoLock, irql);
     Invalidate(a);
     NdisAcquireSpinLock(&a->Lock);
     status = a->Active == 0 ? NDIS_STATUS_SUCCESS : NDIS_STATUS_PENDING;
@@ -663,7 +816,11 @@ NDIS_STATUS HvFilterPause(NDIS_HANDLE context, PNDIS_FILTER_PAUSE_PARAMETERS par
 _Use_decl_annotations_
 void HvFilterDetach(NDIS_HANDLE context) {
     HV_ADAPTER* a = context;
+    KIRQL irql;
     NT_ASSERT(!a->Running && a->Active == 0 && IsListEmpty(&a->Tokens) && a->CopyBytes == 0);
+    KeAcquireSpinLock(&AdapterInfoLock, &irql);
+    RemoveEntryList(&a->AdapterLink); --AdapterCount;
+    KeReleaseSpinLock(&AdapterInfoLock, irql);
     ExWaitForRundownProtectionRelease(&a->OidRundown);
     HvDetach(a->Id);
     NdisFreeNetBufferPool(a->NbPool); NdisFreeNetBufferListPool(a->NblPool);
@@ -719,6 +876,10 @@ NTSTATUS HvDispatch(PDEVICE_OBJECT device, PIRP irp) {
                     out[2] = (UCHAR)(count >> 16); out[3] = (UCHAR)(count >> 24);
                     transferred = sizeof(ULONG);
                 }
+            } else if (code == ADAPTER_INFO_IOCTL) {
+                if (stack->Parameters.DeviceIoControl.InputBufferLength != 0) status = STATUS_INVALID_PARAMETER;
+                else status = QueryAdapterInfo(irp->AssociatedIrp.SystemBuffer,
+                    stack->Parameters.DeviceIoControl.OutputBufferLength, &transferred);
             } else status = STATUS_NOT_SUPPORTED;
         } else status = STATUS_INVALID_DEVICE_REQUEST;
         break;
@@ -762,7 +923,7 @@ static UINT64 ReadQword(HANDLE key, PCWSTR name) {
         info->Type == REG_QWORD && info->DataLength == sizeof(result)) RtlCopyMemory(&result, info->Data, sizeof(result));
     return result;
 }
-static BOOLEAN TargetAdapter(PNDIS_FILTER_ATTACH_PARAMETERS p) {
+static BOOLEAN TargetAdapter(PNDIS_FILTER_ATTACH_PARAMETERS p, GUID* interfaceGuid) {
     UNICODE_STRING path = RTL_CONSTANT_STRING(L"\\Registry\\Machine\\SOFTWARE\\HyperVXNdisFilter\\Lwf");
     UNICODE_STRING name = RTL_CONSTANT_STRING(L"TargetInterfaceGuid");
     UNICODE_STRING text;
@@ -784,6 +945,7 @@ static BOOLEAN TargetAdapter(PNDIS_FILTER_ATTACH_PARAMETERS p) {
     if (text.Buffer[38] != 0 || !NT_SUCCESS(RtlGUIDFromString(&text, &target))) goto Exit;
     if (!NT_SUCCESS(ConvertInterfaceLuidToGuid(&p->BaseMiniportNetLuid, &actual))) goto Exit;
     match = RtlEqualMemory(&target, &actual, sizeof(GUID));
+    if (match) *interfaceGuid = actual;
 Exit:
     ZwClose(key); return match;
 }
@@ -850,6 +1012,7 @@ NTSTATUS hv_initialize(PDRIVER_OBJECT driver, PUNICODE_STRING registry) {
     NDIS_STATUS status;
     LARGE_INTEGER due;
     KeInitializeSpinLock(&PolicyLock); ExInitializeFastMutex(&IoMutex);
+    KeInitializeSpinLock(&AdapterInfoLock); InitializeListHead(&Adapters);
     KeInitializeSpinLock(&ReadLock); InitializeListHead(&ReadIrps);
     ExInitializeRundownProtection(&ReadRundown);
     status = IoCsqInitializeEx(&ReadCsq, ReadInsert, ReadRemove, ReadPeek,

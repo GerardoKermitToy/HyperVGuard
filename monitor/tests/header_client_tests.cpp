@@ -5,13 +5,53 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cwchar>
 #include <future>
 #include <mutex>
+#include <new>
 #include <stdexcept>
 #include <unordered_map>
 #include <vector>
+#include "../../driver/shim/adapter_info.h" // Fixture encoder only; the client remains independent.
+
+// Thread-local, one-shot allocation failures exercise both the nothrow IOCTL
+// buffer and each owning-decoder allocation without affecting the Run thread.
+namespace allocation {
+thread_local ptrdiff_t remaining = -1;
+thread_local bool failed = false;
+bool ShouldFail() noexcept {
+    if (remaining < 0) return false;
+    if (remaining > 0) { --remaining; return false; }
+    remaining = -1; failed = true;
+    return true;
+}
+struct FailAfter {
+    ptrdiff_t previous = remaining;
+    bool previous_failed = failed;
+    explicit FailAfter(ptrdiff_t count) { remaining = count; failed = false; }
+    ~FailAfter() { remaining = previous; failed = previous_failed; }
+    bool Triggered() const noexcept { return failed; }
+};
+}
+void* operator new(size_t size) {
+    if (!allocation::ShouldFail()) if (void* p = std::malloc(size ? size : 1)) return p;
+    throw std::bad_alloc();
+}
+void* operator new[](size_t size) { return ::operator new(size); }
+void operator delete(void* p) noexcept { std::free(p); }
+void operator delete[](void* p) noexcept { ::operator delete(p); }
+void operator delete(void* p, size_t) noexcept { ::operator delete(p); }
+void operator delete[](void* p, size_t) noexcept { ::operator delete(p); }
+void* operator new(size_t size, const std::nothrow_t&) noexcept {
+    try { return ::operator new(size); } catch (...) { return nullptr; }
+}
+void* operator new[](size_t size, const std::nothrow_t&) noexcept {
+    try { return ::operator new[](size); } catch (...) { return nullptr; }
+}
+void operator delete(void* p, const std::nothrow_t&) noexcept { ::operator delete(p); }
+void operator delete[](void* p, const std::nothrow_t&) noexcept { ::operator delete(p); }
 
 namespace testio {
 HANDLE CreateEventW(LPSECURITY_ATTRIBUTES, BOOL, BOOL, LPCWSTR);
@@ -59,10 +99,11 @@ struct State {
     HANDLE submitted = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
     HANDLE startup_seen = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
     HANDLE driver_ready = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    Bytes queued, written;
+    Bytes queued, written, adapter_info;
+    DWORD adapter_info_error = ERROR_SUCCESS;
     std::vector<DWORD> open_errors;
     size_t offset = 0;
-    unsigned reads = 0, cancels = 0, opens = 0, closes = 0;
+    unsigned reads = 0, cancels = 0, opens = 0, closes = 0, adapter_queries = 0;
     bool empty_read = false, short_control = false, wrong_version = false, fail_open = false, secure_ready = false;
     const uint8_t* first_buffer = nullptr;
     Client* stop_on_read = nullptr;
@@ -74,7 +115,10 @@ void Reset() {
     if (!state.operations.empty()) throw std::runtime_error("unreaped fake I/O");
     state.pending = nullptr;
     state.queued.clear(); state.written.clear(); state.open_errors.clear(); state.offset = 0;
-    state.reads = state.cancels = state.opens = state.closes = 0;
+    state.adapter_info.assign(HV_ADAPTER_INFO_HEADER_SIZE, 0);
+    HvEncodeAdapterInfoHeader(state.adapter_info.data(), 0, 0);
+    state.adapter_info_error = ERROR_SUCCESS;
+    state.reads = state.cancels = state.opens = state.closes = state.adapter_queries = 0;
     state.empty_read = state.short_control = state.wrong_version = state.fail_open = state.secure_ready = false;
     state.first_buffer = nullptr; state.stop_on_read = nullptr;
     ::ResetEvent(state.submitted); ::ResetEvent(state.startup_seen); ::ResetEvent(state.driver_ready);
@@ -139,6 +183,21 @@ BOOL DeviceIoControl(HANDLE, DWORD code, LPVOID input, DWORD input_size, LPVOID 
                      DWORD capacity, LPDWORD actual, LPOVERLAPPED ov) {
     std::lock_guard lock(state.mutex);
     if (input || input_size) { ::SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+    if (code == 0x9c40e00cu) {
+        ++state.adapter_queries;
+        if (!output || capacity != HV_ADAPTER_INFO_MAX_SIZE || !ov) {
+            ::SetLastError(ERROR_INVALID_PARAMETER); return FALSE;
+        }
+        if (state.adapter_info_error) { ::SetLastError(state.adapter_info_error); return FALSE; }
+        const DWORD size = static_cast<DWORD>(state.adapter_info.size());
+        const size_t copied = (std::min)(state.adapter_info.size(), static_cast<size_t>(capacity));
+        if (copied) std::memcpy(output, state.adapter_info.data(), copied);
+        state.operations[ov] = {};
+        // A malformed fake may claim more bytes than fit, but never overwrite.
+        Complete(ov, size);
+        *actual = size;
+        return TRUE;
+    }
     uint8_t bytes[4]{};
     DWORD size = 4;
     if (code == 0x9c40e000u) {
@@ -214,6 +273,309 @@ BOOL CancelIoEx(HANDLE, LPOVERLAPPED ov) {
 namespace {
 void Put(Bytes& bytes, size_t offset, uint64_t value, unsigned count) {
     for (unsigned i = 0; i < count; ++i) bytes[offset + i] = static_cast<uint8_t>(value >> (i * 8));
+}
+void SetAdapterName(uint16_t (&out)[HV_ADAPTER_INFO_NAME_CAPACITY], uint32_t& length, std::wstring_view name) {
+    if (name.size() >= HV_ADAPTER_INFO_NAME_CAPACITY) throw std::runtime_error("oversized fixture name");
+    std::fill(std::begin(out), std::end(out), uint16_t{0});
+    length = static_cast<uint32_t>(name.size());
+    for (size_t i = 0; i < name.size(); ++i) out[i] = static_cast<uint16_t>(name[i]);
+}
+HV_ADAPTER_INFO AdapterFixture(uint32_t seed, uint32_t flags) {
+    HV_ADAPTER_INFO a{};
+    a.ModuleId = 0xfedcba9876543200ull + seed;
+    a.InterfaceIndex = 0x80000010u + seed;
+    a.FilterInterfaceIndex = 0x90000020u + seed;
+    a.LowerInterfaceIndex = 0xa0000030u + seed;
+    a.Flags = flags;
+    a.InterfaceLuid = 0x8123456789abcd00ull + seed;
+    a.FilterInterfaceLuid = 0x923456789abcde00ull + seed;
+    a.LowerInterfaceLuid = 0xa3456789abcdef00ull + seed;
+    for (size_t i = 0; i < sizeof(a.InterfaceGuid); ++i) a.InterfaceGuid[i] = static_cast<uint8_t>(i * 13 + seed);
+    a.InterfaceGuid[3] = 0; // Binary identity is not a GUID string or an integer.
+    a.MediaType = 0xf1000001u + seed; // Unknown NDIS enum values must remain usable.
+    a.PhysicalMedium = 0xf2000002u + seed;
+    a.MediaConnectState = 0xf3000003u + seed;
+    a.MediaDuplexState = 0xf4000004u + seed;
+    a.XmitLinkSpeed = 0xb456789abcdef000ull + seed;
+    a.RcvLinkSpeed = 0xc56789abcdef0100ull + seed;
+    a.Mtu = 0xe0000100u + seed;
+    a.MacOptions = 0xe0000200u + seed;
+    a.SupportedPacketFilters = 0xe0000300u + seed;
+    a.MaxMulticastListSize = 0xe0000400u + seed;
+    a.MaxXmitLinkSpeed = 0xd6789abcdef01200ull + seed;
+    a.MaxRcvLinkSpeed = 0xe789abcdef012300ull + seed;
+    a.LookaheadSize = 0xe0000500u + seed;
+    a.AccessType = 0xf5000005u + seed;
+    a.ConnectionType = 0xf6000006u + seed;
+    a.SupportedStatistics = 0xe0000600u + seed;
+    a.DataBackFillSize = 0xe0000700u + seed;
+    a.ContextBackFillSize = 0xe0000800u + seed;
+    a.RestartFlags = 0xe0000900u + seed;
+    a.AttachFlags = 0xe0000a00u + seed;
+    a.ConnectorPresent = seed % 2;
+    a.MacAddressLength = seed % 2 ? HV_ADAPTER_INFO_MAC_CAPACITY : 6;
+    for (size_t i = 0; i < sizeof(a.MacAddress); ++i) a.MacAddress[i] = static_cast<uint8_t>(i * 7 + seed);
+    a.MacAddress[5] = 0;
+    a.AutoNegotiationFlags = 0xe0000b00u + seed;
+    a.PauseReason = 0xf7000007u + seed;
+    a.PauseFlags = 0xe0000c00u + seed;
+    SetAdapterName(a.InstanceName, a.InstanceNameLength, L"instance-网卡-Ω-\U0001f680-" + std::to_wstring(seed));
+    SetAdapterName(a.BaseName, a.BaseNameLength, L"base-é-中-name-" + std::to_wstring(seed));
+    SetAdapterName(a.FilterModuleName, a.FilterModuleNameLength, L"filter-Ж-日-name-" + std::to_wstring(seed));
+    return a;
+}
+Bytes AdapterResponse(std::span<const HV_ADAPTER_INFO> adapters = {}) {
+    if (adapters.size() > HV_ADAPTER_INFO_MAX_ADAPTERS) throw std::runtime_error("oversized fixture snapshot");
+    const auto count = static_cast<uint32_t>(adapters.size());
+    uint32_t running = 0;
+    for (const auto& adapter : adapters) if (adapter.Flags & HV_ADAPTER_RUNNING) ++running;
+    Bytes bytes(HvAdapterInfoSize(count));
+    HvEncodeAdapterInfoHeader(bytes.data(), count, running);
+    for (size_t i = 0; i < adapters.size(); ++i)
+        HvEncodeAdapterInfo(bytes.data() + HV_ADAPTER_INFO_HEADER_SIZE + i * HV_ADAPTER_INFO_ENTRY_SIZE, &adapters[i]);
+    return bytes;
+}
+bool NameMatches(std::wstring_view actual, const uint16_t* expected, uint32_t length) {
+    CHECK(actual.size() == length);
+    for (size_t i = 0; i < actual.size(); ++i) CHECK(actual[i] == static_cast<wchar_t>(expected[i]));
+    return true;
+}
+bool MatchesAdapter(const Client::AdapterInfo& a, const HV_ADAPTER_INFO& b) {
+#define FIELD(name, source) CHECK(a.name == b.source)
+    FIELD(module_id, ModuleId);
+    FIELD(interface_index, InterfaceIndex);
+    FIELD(filter_interface_index, FilterInterfaceIndex);
+    FIELD(lower_interface_index, LowerInterfaceIndex);
+    FIELD(flags, Flags);
+    FIELD(interface_luid, InterfaceLuid);
+    FIELD(filter_interface_luid, FilterInterfaceLuid);
+    FIELD(lower_interface_luid, LowerInterfaceLuid);
+    FIELD(media_type, MediaType);
+    FIELD(physical_medium, PhysicalMedium);
+    FIELD(media_connect_state, MediaConnectState);
+    FIELD(media_duplex_state, MediaDuplexState);
+    FIELD(xmit_link_speed, XmitLinkSpeed);
+    FIELD(rcv_link_speed, RcvLinkSpeed);
+    FIELD(mtu, Mtu);
+    FIELD(mac_options, MacOptions);
+    FIELD(supported_packet_filters, SupportedPacketFilters);
+    FIELD(max_multicast_list_size, MaxMulticastListSize);
+    FIELD(max_xmit_link_speed, MaxXmitLinkSpeed);
+    FIELD(max_rcv_link_speed, MaxRcvLinkSpeed);
+    FIELD(lookahead_size, LookaheadSize);
+    FIELD(access_type, AccessType);
+    FIELD(connection_type, ConnectionType);
+    FIELD(supported_statistics, SupportedStatistics);
+    FIELD(data_backfill_size, DataBackFillSize);
+    FIELD(context_backfill_size, ContextBackFillSize);
+    FIELD(restart_flags, RestartFlags);
+    FIELD(attach_flags, AttachFlags);
+    FIELD(connector_present, ConnectorPresent);
+    FIELD(mac_address_length, MacAddressLength);
+    FIELD(instance_name_length, InstanceNameLength);
+    FIELD(base_name_length, BaseNameLength);
+    FIELD(filter_module_name_length, FilterModuleNameLength);
+    FIELD(auto_negotiation_flags, AutoNegotiationFlags);
+    FIELD(pause_reason, PauseReason);
+    FIELD(pause_flags, PauseFlags);
+#undef FIELD
+    CHECK(std::equal(a.interface_guid.begin(), a.interface_guid.end(), std::begin(b.InterfaceGuid)));
+    CHECK(std::equal(a.mac_address.begin(), a.mac_address.end(), std::begin(b.MacAddress)));
+    CHECK(NameMatches(a.instance_name, b.InstanceName, b.InstanceNameLength));
+    CHECK(NameMatches(a.base_name, b.BaseName, b.BaseNameLength));
+    CHECK(NameMatches(a.filter_module_name, b.FilterModuleName, b.FilterModuleNameLength));
+    return true;
+}
+bool MatchesSnapshot(const Client::AdapterSnapshot& snapshot, std::span<const HV_ADAPTER_INFO> expected) {
+    CHECK(snapshot.adapters.size() == expected.size());
+    uint32_t running = 0;
+    for (size_t i = 0; i < expected.size(); ++i) {
+        CHECK(MatchesAdapter(snapshot.adapters[i], expected[i]));
+        if (expected[i].Flags & HV_ADAPTER_RUNNING) ++running;
+    }
+    CHECK(snapshot.running_count == running);
+    return true;
+}
+bool TestAdapterInfoCodec() {
+    static_assert(Client::AdapterInfoVersion == HV_ADAPTER_INFO_VERSION);
+    static_assert(Client::AdapterInfoHeaderSize == HV_ADAPTER_INFO_HEADER_SIZE);
+    static_assert(Client::AdapterInfoEntrySize == HV_ADAPTER_INFO_ENTRY_SIZE);
+    static_assert(Client::MaxAdapters == HV_ADAPTER_INFO_MAX_ADAPTERS);
+    static_assert(Client::AdapterNameCapacity == HV_ADAPTER_INFO_NAME_CAPACITY);
+    static_assert(Client::AdapterMacCapacity == HV_ADAPTER_INFO_MAC_CAPACITY);
+    static_assert(Client::MaxAdapterInfoSize == HV_ADAPTER_INFO_MAX_SIZE && Client::MaxAdapterInfoSize == 56336);
+    static_assert(Client::AdapterRunning == HV_ADAPTER_RUNNING && Client::AdapterGeneralValid == HV_ADAPTER_GENERAL_VALID);
+    static_assert(Client::AdapterConnectorValid == HV_ADAPTER_CONNECTOR_VALID);
+    static_assert(Client::AdapterInstanceNameTruncated == HV_ADAPTER_INSTANCE_NAME_TRUNCATED);
+    static_assert(Client::AdapterBaseNameTruncated == HV_ADAPTER_BASE_NAME_TRUNCATED);
+    static_assert(Client::AdapterFilterNameTruncated == HV_ADAPTER_FILTER_NAME_TRUNCATED);
+    static_assert(Client::AdapterLinkStateValid == HV_ADAPTER_LINK_STATE_VALID && Client::AdapterPauseValid == HV_ADAPTER_PAUSE_VALID);
+    static_assert(Client::AdapterKnownFlags == HV_ADAPTER_INFO_KNOWN_FLAGS);
+    static_assert(Client::RequiredVersion == std::array<uint8_t, 4>{0, 3, 2, 0}); // Additive, not an event-wire change.
+    std::vector<HV_ADAPTER_INFO> fixtures{
+        AdapterFixture(1, HV_ADAPTER_INFO_KNOWN_FLAGS),
+        AdapterFixture(2, HV_ADAPTER_INFO_KNOWN_FLAGS & ~HV_ADAPTER_RUNNING),
+        {}};
+    fixtures[2].ModuleId = 3; // Initially attached, no optional attributes yet.
+    fixtures[2].InterfaceIndex = 19;
+    const std::wstring longest(HV_ADAPTER_INFO_NAME_CAPACITY - 1, L'中');
+    SetAdapterName(fixtures[1].InstanceName, fixtures[1].InstanceNameLength, longest);
+    SetAdapterName(fixtures[1].BaseName, fixtures[1].BaseNameLength, longest);
+    SetAdapterName(fixtures[1].FilterModuleName, fixtures[1].FilterModuleNameLength, longest);
+    const auto response = AdapterResponse(fixtures);
+    CHECK(response.size() == HV_ADAPTER_INFO_HEADER_SIZE + fixtures.size() * HV_ADAPTER_INFO_ENTRY_SIZE);
+    Client::AdapterSnapshot snapshot;
+    for (size_t shift = 0; shift < 8; ++shift) {
+        Bytes storage(shift + response.size());
+        std::memcpy(storage.data() + shift, response.data(), response.size());
+        CHECK(Client::DecodeAdapterInfo(Client::Bytes(storage).subspan(shift), snapshot) == ERROR_SUCCESS);
+        std::fill(storage.begin(), storage.end(), uint8_t{0}); // No decoded identity or name borrows response memory.
+        CHECK(MatchesSnapshot(snapshot, fixtures));
+        CHECK(snapshot.running_count == 1 && snapshot.adapters.size() == 3);
+    }
+    CHECK(Client::DecodeAdapterInfo(AdapterResponse(), snapshot) == ERROR_SUCCESS);
+    CHECK(snapshot.running_count == 0 && snapshot.adapters.empty());
+    std::vector<HV_ADAPTER_INFO> maximum;
+    for (uint32_t i = 0; i < HV_ADAPTER_INFO_MAX_ADAPTERS; ++i)
+        maximum.push_back(AdapterFixture(i, i % 2 ? 0 : HV_ADAPTER_RUNNING));
+    maximum.back() = fixtures[1];
+    const auto full = AdapterResponse(maximum);
+    CHECK(full.size() == Client::MaxAdapterInfoSize);
+    CHECK(Client::DecodeAdapterInfo(full, snapshot) == ERROR_SUCCESS);
+    CHECK(MatchesSnapshot(snapshot, maximum) && snapshot.running_count == 16);
+    return true;
+}
+bool TestAdapterInfoMalformed() {
+    const std::vector<HV_ADAPTER_INFO> fixtures{
+        AdapterFixture(1, HV_ADAPTER_INFO_KNOWN_FLAGS), AdapterFixture(2, HV_ADAPTER_PAUSE_VALID)};
+    const auto good = AdapterResponse(fixtures);
+    const std::vector<HV_ADAPTER_INFO> kept{AdapterFixture(99, HV_ADAPTER_RUNNING)};
+    Client::AdapterSnapshot snapshot;
+    CHECK(Client::DecodeAdapterInfo(AdapterResponse(kept), snapshot) == ERROR_SUCCESS);
+    const auto* original = snapshot.adapters.data();
+    const auto reject = [&](Client::Bytes bytes) {
+        CHECK(Client::DecodeAdapterInfo(bytes, snapshot) == ERROR_INVALID_DATA);
+        CHECK(snapshot.adapters.data() == original && MatchesSnapshot(snapshot, kept));
+        return true;
+    };
+    const auto reject32 = [&](size_t offset, uint32_t value) {
+        auto bad = good; Put(bad, offset, value, 4);
+        return reject(bad);
+    };
+    CHECK(reject({})); // Null/empty input, before any header load.
+    for (size_t length = 0; length < good.size(); ++length) CHECK(reject(Client::Bytes(good).first(length)));
+    auto bad = good; bad.push_back(0); CHECK(reject(bad));
+    CHECK(reject(Bytes(Client::MaxAdapterInfoSize + 1)));
+    for (uint32_t value : {0u, 2u, 0xffffffffu}) CHECK(reject32(0, value));
+    for (uint32_t value : {0u, 1759u, 1761u, 0xffffffffu}) CHECK(reject32(4, value));
+    for (uint32_t value : {0u, 1u, 33u, 0xffffffffu}) CHECK(reject32(8, value));
+    for (uint32_t value : {0u, 2u, 3u, 0xffffffffu}) CHECK(reject32(12, value));
+    for (size_t i = 0; i < fixtures.size(); ++i) { // Also reject after an earlier entry has already decoded.
+        const size_t entry = HV_ADAPTER_INFO_HEADER_SIZE + i * HV_ADAPTER_INFO_ENTRY_SIZE;
+        CHECK(reject32(entry + 20, fixtures[i].Flags | 0x100u));
+        CHECK(reject32(entry + 20, fixtures[i].Flags | 0x80000000u));
+        for (uint32_t value : {2u, 0xffffffffu}) CHECK(reject32(entry + 160, value));
+        for (uint32_t value : {33u, 0xffffffffu}) CHECK(reject32(entry + 164, value));
+        const size_t length_offsets[]{200, 204, 208}, name_offsets[]{224, 736, 1248};
+        const uint32_t lengths[]{fixtures[i].InstanceNameLength, fixtures[i].BaseNameLength, fixtures[i].FilterModuleNameLength};
+        for (size_t name = 0; name < 3; ++name) {
+            for (uint32_t value : {0u, 256u, 0xffffffffu}) CHECK(reject32(entry + length_offsets[name], value));
+            bad = good; Put(bad, entry + name_offsets[name] + 2 * lengths[name], 0x1234, 2);
+            CHECK(reject(bad)); // Counted terminator must be zero.
+            bad = good; Put(bad, entry + name_offsets[name] + 2, 0, 2);
+            CHECK(reject(bad)); // Counted contents cannot contain an embedded NUL.
+        }
+    }
+    return true;
+}
+bool TestAdapterInfoQuery() {
+    testio::Reset();
+    const std::vector<HV_ADAPTER_INFO> fixtures{
+        AdapterFixture(7, HV_ADAPTER_INFO_KNOWN_FLAGS), AdapterFixture(8, HV_ADAPTER_PAUSE_VALID)};
+    const auto good = AdapterResponse(fixtures);
+    Client::AdapterSnapshot snapshot;
+    CHECK(Client::DecodeAdapterInfo(good, snapshot) == ERROR_SUCCESS);
+    const auto* original = snapshot.adapters.data();
+    Client client;
+    CHECK(client.GetAdapterInfo(snapshot) == ERROR_INVALID_HANDLE);
+    CHECK(snapshot.adapters.data() == original && MatchesSnapshot(snapshot, fixtures));
+    CHECK(client.Open() == ERROR_SUCCESS);
+    CHECK(client.GetAdapterInfo(snapshot) == ERROR_SUCCESS); // Successful zero-adapter response replaces old output.
+    CHECK(snapshot.adapters.empty() && snapshot.running_count == 0);
+    testio::state.adapter_info = good;
+    CHECK(client.GetAdapterInfo(snapshot) == ERROR_SUCCESS && MatchesSnapshot(snapshot, fixtures));
+    original = snapshot.adapters.data();
+    const auto unchanged = [&] {
+        CHECK(snapshot.adapters.data() == original && MatchesSnapshot(snapshot, fixtures));
+        CHECK(testio::state.operations.empty());
+        return true;
+    };
+    for (DWORD error : {DWORD{ERROR_NOT_SUPPORTED}, DWORD{ERROR_ACCESS_DENIED}, DWORD{ERROR_INSUFFICIENT_BUFFER}}) {
+        testio::state.adapter_info_error = error;
+        CHECK(client.GetAdapterInfo(snapshot) == error && unchanged());
+    }
+    testio::state.adapter_info_error = ERROR_SUCCESS;
+    std::vector<Bytes> malformed{{}, Bytes(good.begin(), good.begin() + 15), good, good, Bytes(Client::MaxAdapterInfoSize + 1)};
+    malformed[2].pop_back(); malformed[3].push_back(0);
+    const auto add_bad32 = [&](size_t offset, uint32_t value) {
+        malformed.push_back(good); Put(malformed.back(), offset, value, 4);
+    };
+    add_bad32(0, 2); add_bad32(4, 1761); add_bad32(8, 33); add_bad32(12, 0);
+    add_bad32(HV_ADAPTER_INFO_HEADER_SIZE + 20, 0x100);
+    add_bad32(HV_ADAPTER_INFO_HEADER_SIZE + 160, 2);
+    add_bad32(HV_ADAPTER_INFO_HEADER_SIZE + 164, 33);
+    add_bad32(HV_ADAPTER_INFO_HEADER_SIZE + 200, 256);
+    malformed.push_back(good);
+    Put(malformed.back(), HV_ADAPTER_INFO_HEADER_SIZE + 224 + 2 * fixtures[0].InstanceNameLength, 1, 2);
+    for (auto& response : malformed) {
+        testio::state.adapter_info = std::move(response);
+        CHECK(client.GetAdapterInfo(snapshot) == ERROR_INVALID_DATA && unchanged());
+    }
+    CHECK(testio::state.adapter_queries == 5 + malformed.size());
+    CHECK(client.Close() == ERROR_SUCCESS);
+    CHECK(client.GetAdapterInfo(snapshot) == ERROR_INVALID_HANDLE && unchanged());
+    return true;
+}
+bool TestAdapterInfoAllocationFailures() {
+    const std::vector<HV_ADAPTER_INFO> kept{AdapterFixture(99, HV_ADAPTER_RUNNING)};
+    const std::vector<HV_ADAPTER_INFO> fixtures{
+        AdapterFixture(1, HV_ADAPTER_INFO_KNOWN_FLAGS), AdapterFixture(2, HV_ADAPTER_PAUSE_VALID)};
+    const auto good = AdapterResponse(fixtures);
+    Client::AdapterSnapshot snapshot;
+    CHECK(Client::DecodeAdapterInfo(AdapterResponse(kept), snapshot) == ERROR_SUCCESS);
+    const auto* original = snapshot.adapters.data();
+    unsigned failures = 0;
+    for (ptrdiff_t after = 0; after < 32; ++after) {
+        DWORD result = ERROR_SUCCESS;
+        bool triggered = false;
+        {
+            allocation::FailAfter fail(after);
+            result = Client::DecodeAdapterInfo(good, snapshot);
+            triggered = fail.Triggered();
+        }
+        if (!triggered) {
+            CHECK(result == ERROR_SUCCESS && MatchesSnapshot(snapshot, fixtures));
+            break;
+        }
+        ++failures;
+        CHECK(result == ERROR_NOT_ENOUGH_MEMORY);
+        CHECK(snapshot.adapters.data() == original && MatchesSnapshot(snapshot, kept));
+    }
+    CHECK(failures >= 7 && failures < 32); // Vector plus all three owning names for both entries.
+    testio::Reset();
+    Client client;
+    CHECK(client.Open() == ERROR_SUCCESS);
+    original = snapshot.adapters.data();
+    DWORD result = ERROR_SUCCESS;
+    {
+        allocation::FailAfter fail(0);
+        result = client.GetAdapterInfo(snapshot); // The bounded nothrow raw buffer fails before any IOCTL.
+        CHECK(fail.Triggered());
+    }
+    CHECK(result == ERROR_NOT_ENOUGH_MEMORY && testio::state.adapter_queries == 0);
+    CHECK(snapshot.adapters.data() == original && MatchesSnapshot(snapshot, fixtures));
+    CHECK(client.Close() == ERROR_SUCCESS && testio::state.operations.empty());
+    return true;
 }
 Bytes Connection(bool ipv6, size_t payload, uint32_t interface_index = 0x12345678) {
     const size_t prefix = ipv6 ? 60 : 36, addr = ipv6 ? 16 : 4;
@@ -455,6 +817,9 @@ bool TestLogAndBandwidth() {
 }
 bool TestIdleAndStop() {
     testio::Reset();
+    const std::vector<HV_ADAPTER_INFO> adapters{
+        AdapterFixture(1, HV_ADAPTER_INFO_KNOWN_FLAGS), AdapterFixture(2, HV_ADAPTER_PAUSE_VALID)};
+    testio::state.adapter_info = AdapterResponse(adapters);
     Client client;
     CHECK(client.Open() == ERROR_SUCCESS);
     auto run = std::async(std::launch::async, [&] { return client.Run({}, 1000); });
@@ -462,6 +827,9 @@ bool TestIdleAndStop() {
     CHECK(client.Close() == ERROR_BUSY);
     uint32_t count = 0;
     CHECK(client.GetFilteredDeviceCount(count) == ERROR_SUCCESS && count == 1); // While read is pending.
+    Client::AdapterSnapshot snapshot;
+    CHECK(client.GetAdapterInfo(snapshot) == ERROR_SUCCESS && MatchesSnapshot(snapshot, adapters));
+    CHECK(testio::state.adapter_queries == 1);
     HANDLE quiet = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
     const DWORD waited = ::WaitForSingleObject(quiet, 80);
     ::CloseHandle(quiet);
@@ -616,6 +984,10 @@ bool TestErrorsAndException() {
 
 int main() {
     const struct { const char* name; bool (*run)(); } tests[]{
+        {"owning adapter snapshots, binary identity, UTF-16 names, wide scalars and maximum bounds", TestAdapterInfoCodec},
+        {"adapter snapshot validation rejects malformed lengths, versions, flags, counts, MAC and names without changing output", TestAdapterInfoMalformed},
+        {"adapter-information IOCTL empty/multiadapter replies, unsupported/errors and malformed responses preserve output", TestAdapterInfoQuery},
+        {"adapter-information raw-buffer and owning-decoder allocation failures preserve output", TestAdapterInfoAllocationFailures},
         {"interleaved adapter indices survive fragmented/coalesced IPv4/IPv6 streams", TestAdapterIndices},
         {"borrowed packed connection headers/payloads, 1 MiB packets, chunked/coalesced reads and poisoned-stream reset", TestCodecAndStream},
         {"unaligned zero-copy views, restored packing and deferred stream compaction", TestUnalignedViewsAndDeferredCompaction},

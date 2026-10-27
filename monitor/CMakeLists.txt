@@ -79,7 +79,7 @@ if(BUILD_TESTING)
     add_header_client_target(header_client_tests tests/header_client_tests.cpp)
     add_test(NAME header_client_tests COMMAND header_client_tests)
     set_tests_properties(header_client_tests PROPERTIES TIMEOUT 30 LABELS "no-driver")
-    foreach(test_name IN ITEMS ip_address_tests protocol_codec_tests monitor_options_tests
+    foreach(test_name IN ITEMS ip_address_tests protocol_codec_tests adapter_info_tests monitor_options_tests
                                driver_startup_tests delayed_verdict_tests record_output_tests lwf_contract_tests
                                binding_policy_tests netcfg_binding_tests)
         add_executable(${test_name} "tests/${test_name}.cpp")

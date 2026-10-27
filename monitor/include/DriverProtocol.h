@@ -32,9 +32,18 @@ constexpr uint32_t MakeCtlCode(uint32_t function) {
 constexpr uint32_t kIoctlVersion = MakeCtlCode(0x800);
 constexpr uint32_t kIoctlShutdown = MakeCtlCode(0x801);
 constexpr uint32_t kIoctlFilteredDeviceCount = MakeCtlCode(0x802);
+constexpr uint32_t kIoctlAdapterInfo = MakeCtlCode(0x803);
+constexpr uint32_t kAdapterInfoVersion = 1;
+constexpr size_t kAdapterInfoHeaderSize = 16;
+constexpr size_t kAdapterInfoEntrySize = 1760;
+constexpr size_t kMaxAdapters = 32;
+constexpr size_t kAdapterNameCapacity = 256;
+constexpr size_t kMaxAdapterInfoSize = kAdapterInfoHeaderSize + kMaxAdapters * kAdapterInfoEntrySize;
 
 bool DecodeFilteredDeviceCount(const uint8_t* bytes, size_t length,
                                uint32_t& out, std::string& error);
+bool DecodeAdapterInfo(const uint8_t* bytes, size_t length,
+                       AdapterSnapshot& out, std::string& error);
 
 bool IsSupportedVerdict(uint8_t verdict) noexcept;
 bool ValidateCommands(const uint8_t* bytes, size_t length, std::string& error);

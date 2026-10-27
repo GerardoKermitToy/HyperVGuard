@@ -3,6 +3,7 @@
 // Wire integers are little-endian; record headers are [u8 type][u32 size].
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -142,6 +143,41 @@ struct BandwidthStats {
     std::vector<BandwidthEntry> entries;
 };
 
+// A diagnostic snapshot of an attached NDIS module. Indices/LUIDs describe the
+// host stack, never guest NICs. Strings/MAC are copied at attach; link/general
+// attributes are the last values supplied by NDIS, not fresh OID queries.
+struct AdapterInfo {
+    static constexpr uint32_t Running = 0x01;
+    static constexpr uint32_t GeneralAttributesValid = 0x02;
+    static constexpr uint32_t ConnectorPresentValid = 0x04;
+    static constexpr uint32_t InstanceNameTruncated = 0x08;
+    static constexpr uint32_t BaseNameTruncated = 0x10;
+    static constexpr uint32_t FilterModuleNameTruncated = 0x20;
+    static constexpr uint32_t LinkStateValid = 0x40;
+    static constexpr uint32_t PauseValid = 0x80;
+
+    uint64_t module_id = 0;
+    uint32_t interface_index = 0, filter_interface_index = 0, lower_interface_index = 0, flags = 0;
+    uint64_t interface_luid = 0, filter_interface_luid = 0, lower_interface_luid = 0;
+    std::array<uint8_t, 16> interface_guid{};
+    uint32_t media_type = 0, physical_medium = 0, media_connect_state = 0, media_duplex_state = 0;
+    uint64_t xmit_link_speed = 0, rcv_link_speed = 0;
+    uint32_t mtu = 0, mac_options = 0, supported_packet_filters = 0, max_multicast_list_size = 0;
+    uint64_t max_xmit_link_speed = 0, max_rcv_link_speed = 0;
+    uint32_t lookahead_size = 0, access_type = 0, connection_type = 0, supported_statistics = 0;
+    uint32_t data_backfill_size = 0, context_backfill_size = 0, restart_flags = 0, attach_flags = 0;
+    uint32_t connector_present = 0, mac_address_length = 0;
+    std::array<uint8_t, 32> mac_address{};
+    uint32_t instance_name_length = 0, base_name_length = 0, filter_module_name_length = 0;
+    uint32_t auto_negotiation_flags = 0, pause_reason = 0, pause_flags = 0;
+    std::wstring instance_name, base_name, filter_module_name;
+};
+
+struct AdapterSnapshot {
+    uint32_t running_count = 0;
+    std::vector<AdapterInfo> adapters; // Includes attached but not running modules.
+};
+
 // Callbacks are optional. on_poll runs on Run()'s thread; other handlers run
 // on its reader thread. All driver records are dispatched locally.
 struct Handlers {
@@ -186,6 +222,8 @@ public:
     // Snapshot of running NDIS modules, not configured/enabled bindings or traffic.
     // Paused modules are excluded; the count does not depend on policy-session state.
     bool GetFilteredDeviceCount(uint32_t& out, std::string& error);
+    // Bounded, versioned snapshot; leaves out unchanged on every failure.
+    bool GetAdapterInfo(AdapterSnapshot& out, std::string& error);
     bool RequestShutdown(std::string& error);
 
     // Original unframed commands, with unchanged IDs and fixed field sizes.

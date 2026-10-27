@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cstring>
+#include <new>
+#include <utility>
 
 namespace pmkext::wire {
 namespace {
@@ -36,6 +38,91 @@ bool DecodeFilteredDeviceCount(const uint8_t* bytes, size_t length,
         return false;
     }
     out = ReadU32(bytes);
+    error.clear();
+    return true;
+}
+
+bool DecodeAdapterInfo(const uint8_t* bytes, size_t length,
+                       AdapterSnapshot& out, std::string& error) {
+    auto invalid = [&]() {
+        error = "IOCTL_ADAPTER_INFO returned an invalid snapshot";
+        return false;
+    };
+    if (bytes == nullptr || length < kAdapterInfoHeaderSize || length > kMaxAdapterInfoSize ||
+        ReadU32(bytes) != kAdapterInfoVersion || ReadU32(bytes + 4) != kAdapterInfoEntrySize) return invalid();
+    const uint32_t count = ReadU32(bytes + 8), running = ReadU32(bytes + 12);
+    if (count > kMaxAdapters || running > count ||
+        length != kAdapterInfoHeaderSize + count * kAdapterInfoEntrySize) return invalid();
+    try {
+        AdapterSnapshot snapshot;
+        snapshot.running_count = running;
+        snapshot.adapters.reserve(count);
+        uint32_t observed_running = 0;
+        for (uint32_t i = 0; i < count; ++i) {
+            const uint8_t* p = bytes + kAdapterInfoHeaderSize + i * kAdapterInfoEntrySize;
+            AdapterInfo a;
+            a.module_id = ReadU64(p);
+            a.interface_index = ReadU32(p + 8);
+            a.filter_interface_index = ReadU32(p + 12);
+            a.lower_interface_index = ReadU32(p + 16);
+            a.flags = ReadU32(p + 20);
+            a.interface_luid = ReadU64(p + 24);
+            a.filter_interface_luid = ReadU64(p + 32);
+            a.lower_interface_luid = ReadU64(p + 40);
+            std::copy_n(p + 48, a.interface_guid.size(), a.interface_guid.begin());
+            a.media_type = ReadU32(p + 64);
+            a.physical_medium = ReadU32(p + 68);
+            a.media_connect_state = ReadU32(p + 72);
+            a.media_duplex_state = ReadU32(p + 76);
+            a.xmit_link_speed = ReadU64(p + 80);
+            a.rcv_link_speed = ReadU64(p + 88);
+            a.mtu = ReadU32(p + 96);
+            a.mac_options = ReadU32(p + 100);
+            a.supported_packet_filters = ReadU32(p + 104);
+            a.max_multicast_list_size = ReadU32(p + 108);
+            a.max_xmit_link_speed = ReadU64(p + 112);
+            a.max_rcv_link_speed = ReadU64(p + 120);
+            a.lookahead_size = ReadU32(p + 128);
+            a.access_type = ReadU32(p + 132);
+            a.connection_type = ReadU32(p + 136);
+            a.supported_statistics = ReadU32(p + 140);
+            a.data_backfill_size = ReadU32(p + 144);
+            a.context_backfill_size = ReadU32(p + 148);
+            a.restart_flags = ReadU32(p + 152);
+            a.attach_flags = ReadU32(p + 156);
+            a.connector_present = ReadU32(p + 160);
+            a.mac_address_length = ReadU32(p + 164);
+            std::copy_n(p + 168, a.mac_address.size(), a.mac_address.begin());
+            a.instance_name_length = ReadU32(p + 200);
+            a.base_name_length = ReadU32(p + 204);
+            a.filter_module_name_length = ReadU32(p + 208);
+            a.auto_negotiation_flags = ReadU32(p + 212);
+            a.pause_reason = ReadU32(p + 216);
+            a.pause_flags = ReadU32(p + 220);
+            if ((a.flags & ~0xffu) != 0 || a.mac_address_length > a.mac_address.size() ||
+                a.connector_present > 1) return invalid();
+            auto name = [&](size_t offset, uint32_t units, std::wstring& text) {
+                if (units >= kAdapterNameCapacity || ReadU16(p + offset + 2 * units) != 0) return false;
+                text.reserve(units);
+                for (uint32_t j = 0; j < units; ++j) {
+                    const uint16_t unit = ReadU16(p + offset + 2 * j);
+                    if (unit == 0) return false;
+                    text.push_back(static_cast<wchar_t>(unit));
+                }
+                return true;
+            };
+            if (!name(224, a.instance_name_length, a.instance_name) ||
+                !name(736, a.base_name_length, a.base_name) ||
+                !name(1248, a.filter_module_name_length, a.filter_module_name)) return invalid();
+            if (a.flags & AdapterInfo::Running) ++observed_running;
+            snapshot.adapters.push_back(std::move(a));
+        }
+        if (observed_running != running) return invalid();
+        out = std::move(snapshot);
+    } catch (const std::bad_alloc&) {
+        error = "cannot allocate adapter information snapshot";
+        return false;
+    }
     error.clear();
     return true;
 }

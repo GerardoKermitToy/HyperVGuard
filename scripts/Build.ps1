@@ -68,10 +68,12 @@ try {
         $signArgs += @('/f', $PfxPath, '/p', $PfxPassword)
         if ($RootCertificate) { $signArgs += @('/ac', (Resolve-Path -LiteralPath $RootCertificate).Path) }
     } elseif ($CertificateThumbprint) { $signArgs += @('/sha1', $CertificateThumbprint) }
+    $signedFiles = @('HyperVXNdisFilter.sys', 'HyperVXNdisFilterNotify.dll', 'Install.exe', 'Uninstall.exe')
+    if (!$SkipMonitor) { $signedFiles += 'hyperv_monitor.exe' }
     if ($sign) {
         # Local signing only: no timestamp request, key copy, certificate import
         # or boot/security policy change. The PFX remains at the supplied path.
-        foreach ($file in @('HyperVXNdisFilter.sys', 'HyperVXNdisFilterNotify.dll', 'Install.exe', 'Uninstall.exe')) {
+        foreach ($file in $signedFiles) {
             & "$bin\signtool.exe" @signArgs (Join-Path $dist $file)
             if ($LASTEXITCODE) { throw "Signing failed: $file" }
         }
@@ -95,7 +97,7 @@ try {
     if ($sign) {
         & "$bin\signtool.exe" @signArgs "$dist\HyperVXNdisFilter.cat"
         if ($LASTEXITCODE) { throw 'Catalog signing failed.' }
-        foreach ($file in @('HyperVXNdisFilter.sys', 'HyperVXNdisFilterNotify.dll', 'HyperVXNdisFilter.cat', 'Install.exe', 'Uninstall.exe')) {
+        foreach ($file in ($signedFiles + 'HyperVXNdisFilter.cat')) {
             & "$bin\signtool.exe" verify /pa (Join-Path $dist $file)
             if ($LASTEXITCODE) { throw "Authenticode verification failed: $file (not a kernel admission test)." }
         }

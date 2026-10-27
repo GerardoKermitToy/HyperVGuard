@@ -209,6 +209,14 @@ int MonitorMain(int argc, wchar_t** argv) {
         return 1;
     }
     report_filtered_devices();
+    pmkext::AdapterSnapshot adapters;
+    if (driver.GetAdapterInfo(adapters, error)) {
+        pmkext::RecordOutput record(g_out, g_print_mutex);
+        record.WriteAdapters(adapters, TimePrefix(opt.timestamps).c_str());
+    } else {
+        Emit("%s[WARN] Adapter information unavailable: %s\n",
+             TimePrefix(opt.timestamps).c_str(), error.c_str());
+    }
     std::printf("CONN: one NBL decision, direction=0 outbound/1 inbound from the guest side.\n"
                 "Local=guest endpoint, remote=peer; host receive=outbound, host send=inbound; no process/thread identity.\n"
                 "Payload is the complete layer-3 logical IP packet, up to 1 MiB without truncation.\n"

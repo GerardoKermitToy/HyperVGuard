@@ -11,6 +11,25 @@ pub const IOCTL_VERSION: u32 = ctl_code(0x800);
 pub const IOCTL_SHUTDOWN: u32 = ctl_code(0x801);
 // Four-byte little-endian count of running NDIS filter modules; no input.
 pub const IOCTL_FILTERED_DEVICE_COUNT: u32 = ctl_code(0x802);
+// No input; bounded attached-module snapshot, including paused modules. This
+// additive diagnostic has its own schema version, not an event-wire change.
+pub const IOCTL_ADAPTER_INFO: u32 = ctl_code(0x803);
+pub const ADAPTER_INFO_VERSION: u32 = 1;
+pub const ADAPTER_INFO_HEADER_SIZE: usize = 16;
+pub const ADAPTER_INFO_ENTRY_SIZE: usize = 1760;
+pub const ADAPTER_INFO_MAX_ADAPTERS: usize = 32;
+pub const ADAPTER_INFO_NAME_CAPACITY: usize = 256;
+pub const ADAPTER_INFO_MAC_CAPACITY: usize = 32;
+pub const ADAPTER_INFO_MAX_SIZE: usize =
+    ADAPTER_INFO_HEADER_SIZE + ADAPTER_INFO_MAX_ADAPTERS * ADAPTER_INFO_ENTRY_SIZE;
+pub const ADAPTER_RUNNING: u32 = 0x01;
+pub const ADAPTER_GENERAL_VALID: u32 = 0x02;
+pub const ADAPTER_CONNECTOR_VALID: u32 = 0x04;
+pub const ADAPTER_INSTANCE_NAME_TRUNCATED: u32 = 0x08;
+pub const ADAPTER_BASE_NAME_TRUNCATED: u32 = 0x10;
+pub const ADAPTER_FILTER_NAME_TRUNCATED: u32 = 0x20;
+pub const ADAPTER_LINK_STATE_VALID: u32 = 0x40;
+pub const ADAPTER_PAUSE_VALID: u32 = 0x80;
 const fn ctl_code(function: u32) -> u32 {
     (40000 << 16) | (3 << 14) | (function << 2)
 }
@@ -275,6 +294,23 @@ mod tests {
         assert_eq!(IOCTL_VERSION, 0x9c40_e000);
         assert_eq!(IOCTL_SHUTDOWN, 0x9c40_e004);
         assert_eq!(IOCTL_FILTERED_DEVICE_COUNT, 0x9c40_e008);
+        assert_eq!(IOCTL_ADAPTER_INFO, 0x9c40_e00c);
+        assert_eq!(ADAPTER_INFO_MAX_SIZE, 56_336);
+        assert_eq!(
+            ADAPTER_INFO_ENTRY_SIZE,
+            224 + 3 * 2 * ADAPTER_INFO_NAME_CAPACITY
+        );
+        assert_eq!(
+            ADAPTER_RUNNING
+                | ADAPTER_GENERAL_VALID
+                | ADAPTER_CONNECTOR_VALID
+                | ADAPTER_INSTANCE_NAME_TRUNCATED
+                | ADAPTER_BASE_NAME_TRUNCATED
+                | ADAPTER_FILTER_NAME_TRUNCATED
+                | ADAPTER_LINK_STATE_VALID
+                | ADAPTER_PAUSE_VALID,
+            0xff
+        );
     }
     #[test]
     fn exact_v4_abi_without_process_id() {
