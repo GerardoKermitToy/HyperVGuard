@@ -2,7 +2,7 @@
 
 Experimental Rust-based **NDIS Lightweight Filter (LWF)** and a C++ monitor with a `kext_monitor`-style API. The filter targets only the management-OS host adapter **`vEthernet (Default Switch)`**. It is not a Hyper-V switch extension or a WFP callout.
 
-Driver package and device API: **0.3.1.0**. Nonzero reads now wait for event data and support cancellation. The PID-free, complete-IP-packet Connection layouts from 0.3.0.0 are unchanged. Use a matching SYS and monitor; the monitor rejects older device versions.
+Driver package and device API: **0.3.2.0**. Connection records add the host adapter `interface_index:u32` immediately after `id:u64`. This breaks compatibility with 0.3.1.0 and earlier layouts; nonzero reads still wait for event data and support cancellation. Use a matching SYS and monitor; the monitor rejects older device versions.
 
 Only traffic passing through the host vNIC is covered; VM-to-VM traffic is not guaranteed to be visible. The installer and kernel check the exact adapter GUID/NET_LUID, not its display name. The standalone setup tools do not automatically retarget a recreated adapter. A compatible controller can perform validated target-only recovery as described below; otherwise explicitly uninstall and reinstall.
 
@@ -18,7 +18,7 @@ powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts/
 
 This builds the package and runs offline tests without installing, loading, or binding the driver. Output goes to `dist/`: **`HyperVXNdisFilter.sys`**, `HyperVXNdisFilter.pdb`, `HyperVXNdisFilter.inf`, `HyperVXNdisFilter.cat`, `HyperVXNdisFilterNotify.dll`, `hyperv_monitor.exe`, `Install.exe`, and `Uninstall.exe`. Keep package files together; do not mix versions.
 
-All product identities use the new name: service `HyperVXNdisFilter`, device `\\.\HyperVXNdisFilter`, startup event `Global\HyperVXNdisFilter.DriverReady`, NetCfg component `hyperv_xndis_filter`, and header-only client `HyperVXNdisFilter.hpp` / `hypervxndisfilter::Client`. Wire layouts, IOCTLs, version 0.3.1.0 and the `pmkext` API are unchanged; old header/namespace/device aliases are not provided. Use a clean `dist/` when rebuilding after the rename and deploy the entire new package, not individually renamed binaries. An existing installation under a previous name must first be removed with **its matching old `Uninstall.exe`**. The new installer rejects another component with the same filter GUID; it does not migrate, replace or remove it automatically.
+All product identities use the new name: service `HyperVXNdisFilter`, device `\\.\HyperVXNdisFilter`, startup event `Global\HyperVXNdisFilter.DriverReady`, NetCfg component `hyperv_xndis_filter`, and header-only client `HyperVXNdisFilter.hpp` / `hypervxndisfilter::Client`. The rename preserved the IOCTLs and product GUIDs; the current 0.3.2.0 Connection API additionally exposes the host adapter index; old header/namespace/device aliases are not provided. Use a clean `dist/` when rebuilding after the rename and deploy the entire new package, not individually renamed binaries. An existing installation under a previous name must first be removed with **its matching old `Uninstall.exe`**. The new installer rejects another component with the same filter GUID; it does not migrate, replace or remove it automatically.
 
 The default build is unsigned. For signing, pass `-PfxPath` and `-RootCertificate` to the build script. The local test-PFX password defaults to `1`; a nonempty process environment variable `HYPERVXNDISFILTER_PFX_PASSWORD` overrides that default, and an explicit `-PfxPassword` overrides both (including an explicitly empty password). The script does not import certificates or change security policy. Installation requires trusted package signatures.
 
@@ -68,6 +68,8 @@ Without `--duration`, an open failure makes the monitor create/open `Global\Hype
 
 The monitor prints `Filtered network devices: N (running NDIS modules)` after the version check and whenever the count changes, checking at the `--poll` interval (default 1000 ms). This is the driver's live attachment/running-state count, not the number of configured or enabled bindings. A loaded driver can report zero. Status lines honor `--out` and `--timestamps`. If the installed SYS lacks the new IOCTL or a query fails, the monitor warns that the count is unavailable rather than reporting zero; monitoring continues and later polls retry.
 
+Each `[CONN v4]` / `[CONN v6]` header prints `interface_index=N` immediately after `id`, in both console output and `--out` files. This is the host adapter index from that event, not a guest interface index; traffic from different adapters retains its own value.
+
 `--match` selects the remote endpoint in both directions; unmatched events receive PermanentAccept. `--filter-ip` only filters output, not verdicts. A blocking verdict without `--match` applies to every event and can disconnect the host-vNIC path.
 
 The monitor never installs, unbinds, or uninstalls the filter. Exiting closes the policy session; the LWF remains installed and bound. Use `--help` for all options without opening the device.
@@ -90,7 +92,7 @@ The public C++ interface is [PortmasterKext.h](monitor/include/PortmasterKext.h)
 
 ### Semantics and compatibility
 
-- **ConnectionIpv4/ConnectionIpv6 have no `process_id` field.** There is no TID or public switch/port/NIC/GUID/LUID field, and no host-process or individual-VM ownership is inferred. Unused legacy END compatibility records retain their zero PID.
+- **ConnectionIpv4/ConnectionIpv6 have no `process_id` field.** The `interface_index:u32` after `id` identifies the host adapter at the interception point (`BaseMiniportIfIndex`), not an interface inside the guest. It is retained per attached module, so interleaved traffic from different adapters keeps its own index. There is no compartment/sub-interface ID, TID, switch/port/GUID/LUID field, and no host-process or individual-VM ownership is inferred. Interface indices can change or be reused after adapter recreation; they are not permanent identities. Existing exact-target binding restrictions are unchanged. Unused legacy END compatibility records retain their zero PID.
 - `direction=0` is **guest/Sandbox outbound**, corresponding to host NDIS receive. `direction=1` is **guest/Sandbox inbound**, corresponding to host NDIS send. `local_*` describes the guest endpoint; `remote_*` describes the peer. NAT/forwarding can affect the addresses visible on this path.
 - One connection event and its `id` represent **one pending NBL**, not a socket or a connection lifetime. A homogeneous multi-NB NBL has one verdict and the complete IP packet from its first NB, not a concatenation of all NBs. Mixed-flow or malformed batches are dropped rather than represented as one flow.
 - `payload_layer=3`. `payload` contains the **complete observed IP packet**, including IP/transport headers, without Ethernet/VLAN headers or Ethernet padding. `payload_size` is its full byte count. No 256-byte capture truncation remains. Endpoint normalization does not rewrite packet bytes. For LSO/RSC, this is the logical packet observed at NDIS, not necessarily one frame on the wire.
@@ -112,7 +114,7 @@ All supported IOCTLs use `CTL_CODE(40000, function, METHOD_BUFFERED, FILE_READ_D
 
 | IOCTL | Function / numeric code | Output and effect |
 |---|---|---|
-| `IOCTL_VERSION` | `0x800` / `0x9C40E000` | Exactly four bytes: `00 03 01 00`. The output buffer must have at least four bytes. |
+| `IOCTL_VERSION` | `0x800` / `0x9C40E000` | Exactly four bytes: `00 03 02 00`. The output buffer must have at least four bytes. |
 | `IOCTL_SHUTDOWN` | `0x801` / `0x9C40E004` | No output. Deactivates the policy session, discards queued events/cache/bandwidth, and resolves pending packets through the configured fallback. Does not unload, unbind, or uninstall the LWF. |
 | `IOCTL_FILTERED_DEVICE_COUNT` | `0x802` / `0x9C40E008` | Exactly four bytes: an unsigned 32-bit little-endian count of running NDIS filter modules. The output buffer must have at least four bytes; input must be empty. No policy or binding side effects. |
 
@@ -135,7 +137,7 @@ Construct `Driver(std::wstring service_name = L"HyperVXNdisFilter")`; the argume
 | Method | Contract |
 |---|---|
 | `bool Open(std::string& error)` | Opens the already installed device. Fails if this client session is already open. Does not install, bind, or negotiate the version. |
-| `bool GetVersion(uint8_t out[4], std::string& error)` | Reads the four-byte version; integrations should require `0.3.1.0`. |
+| `bool GetVersion(uint8_t out[4], std::string& error)` | Reads the four-byte version; integrations should require `0.3.2.0`. |
 | `bool GetFilteredDeviceCount(uint32_t& out, std::string& error)` | Synchronously reads the running-module snapshot through `IOCTL_FILTERED_DEVICE_COUNT`. Requires exactly four response bytes. On failure returns false and leaves `out` unchanged; an unsupported request means unavailable, not zero. |
 | `void Run(const Handlers& handlers, unsigned poll_interval_ms = 1000)` | Starts a reader thread and blocks until stopped or the reader exits. Dispatches complete records and invokes `on_poll` on the calling thread. It does not automatically request logs/statistics or send verdicts. |
 | `bool SendVerdict(uint64_t id, Verdict verdict, std::string& error)` | Sends one verdict for a pending event ID. Only verdict values 2–7 are accepted. |
@@ -159,7 +161,7 @@ A typical integration opens the device, checks its version, installs handlers, a
 
 | Method | Contract (`DWORD`: 0 is success, otherwise a Win32 error) |
 |---|---|
-| `Open()` | Tries the existing exclusive Administrator/SYSTEM device. An exclusive-device `ERROR_SHARING_VIOLATION` is returned immediately on any attempt; the caller may retry after the other controller releases its handle. After any other open failure, creates/opens the protected `Global\HyperVXNdisFilter.DriverReady` event, resets it before retrying, then waits **indefinitely**, without device polling or a startup timeout. A signal only requests a retry. `Stop()` cancels this wait with `ERROR_OPERATION_ABORTED`. Never installs/loads the driver. Requires version `{0,3,1,0}` after opening; version/I/O errors are returned rather than treated as startup signals. |
+| `Open()` | Tries the existing exclusive Administrator/SYSTEM device. An exclusive-device `ERROR_SHARING_VIOLATION` is returned immediately on any attempt; the caller may retry after the other controller releases its handle. After any other open failure, creates/opens the protected `Global\HyperVXNdisFilter.DriverReady` event, resets it before retrying, then waits **indefinitely**, without device polling or a startup timeout. A signal only requests a retry. `Stop()` cancels this wait with `ERROR_OPERATION_ABORTED`. Never installs/loads the driver. Requires version `{0,3,2,0}` after opening; version/I/O errors are returned rather than treated as startup signals. |
 | `Run(const Callbacks&, DWORD duration_ms = INFINITE)` | Blocking callback dispatch on the calling thread. A positive duration limits monitoring only, **not Open's unlimited startup wait**; zero is invalid. Stop/runtime expiry returns success after cancelling/reaping the outstanding read. Unexpected zero-byte reads are an error, not a retry loop. Callback exceptions propagate after pending I/O is reaped. |
 | `Stop()` | Thread-safe local stop, usable during Open/Run; wakes the wait. Does not itself shut down policy, close handles or unload the LWF. |
 | `Close()` | Returns `ERROR_BUSY` during Run. Otherwise closes handles; device cleanup disconnects policy and releases pending packets through fallback. Join Run and all other callers before Close/destruction. |
@@ -182,14 +184,14 @@ Every header/array/payload pointer refers directly to the validated input buffer
 
 | Packed type (`Client::`) | Size / fields in wire order |
 |---|---|
-| `ConnectionV4` / `ConnectionV6` | 23 / 47 bytes: `id:u64`, `direction:u8`, `protocol:u8`, `local_ip[4/16]`, `remote_ip[4/16]`, `local_port:u16`, `remote_port:u16`, `payload_layer:u8=3`. The following four-byte payload length is validated and passed separately with the complete-IP payload pointer. |
+| `ConnectionV4` / `ConnectionV6` | 27 / 51 bytes: `id:u64`, `interface_index:u32`, `direction:u8`, `protocol:u8`, `local_ip[4/16]`, `remote_ip[4/16]`, `local_port:u16`, `remote_port:u16`, `payload_layer:u8=3`. The following four-byte payload length is validated and passed separately with the complete-IP payload pointer. |
 | `BandwidthV4` / `BandwidthV6` | 28 / 52 bytes per entry: `local_ip[4/16]`, `local_port:u16`, `remote_ip[4/16]`, `remote_port:u16`, `transmitted_bytes:u64`, `received_bytes:u64`. One callback receives the entire contiguous array; an empty array produces no callback. |
 
 These fixed, trivially-copyable wire views use scoped `#pragma pack(push, 1)` / `pop`, with compile-time size, alignment and offset checks. All numbers are little-endian (native on supported Windows x64); addresses remain network-order bytes. Read packed scalar fields by value; do not pass a field's address/reference to an API expecting naturally aligned integers. IPv4/IPv6 is selected by the callback type, not an added `ipv6` field; no PID/thread ID is present. Guest direction and all policy/fallback semantics are unchanged. `Verdict` contains Accept=2, PermanentAccept=3, Block=4, PermanentBlock=5, Drop=6 and PermanentDrop=7.
 
-**C++ source migration:** the former unified `on_connection(const Connection&)` and per-tuple `on_bandwidth(const Bandwidth&)` callbacks are replaced by the IPv4/IPv6 pointer callbacks above. Update consumers as in [callback_client.cpp](monitor/examples/callback_client.cpp); `pmkext::Driver` and the driver wire API/version **0.3.1.0** are unchanged.
+**C++ source migration:** the former unified `on_connection(const Connection&)` and per-tuple `on_bandwidth(const Bandwidth&)` callbacks are replaced by the IPv4/IPv6 pointer callbacks above. Update consumers as in [callback_client.cpp](monitor/examples/callback_client.cpp); both clients now require wire version **0.3.2.0** and decode the added host adapter index. Older SYS/client generations must not be mixed.
 
-For offline/custom transports, `Client::DispatchRecord(Bytes, callbacks)` validates one complete record before exposing any packed views. The optional `Client::Stream` helper exposes a writable `Buffer()` (at most 65536 bytes), `Commit(written, callbacks)`, `PendingBytes()` and `Reset()`; an invalid stream stays failed until Reset. Fill the latest Buffer and Commit it before asking for another; Buffer may compact storage, so do not retain its pointer across calls. Record size is bounded by `MaxRecordSize=1048632`, payload by `MaxPayloadSize=1048576`, read size by `ReadSize=65536`. Legacy connection-END types are not exposed by this client: the driver never generates them.
+For offline/custom transports, `Client::DispatchRecord(Bytes, callbacks)` validates one complete record before exposing any packed views. The optional `Client::Stream` helper exposes a writable `Buffer()` (at most 65536 bytes), `Commit(written, callbacks)`, `PendingBytes()` and `Reset()`; an invalid stream stays failed until Reset. Fill the latest Buffer and Commit it before asking for another; Buffer may compact storage, so do not retain its pointer across calls. Record size is bounded by `MaxRecordSize=1048636`, payload by `MaxPayloadSize=1048576`, read size by `ReadSize=65536`. Legacy connection-END types are not exposed by this client: the driver never generates them.
 
 ### Callbacks and data types
 
@@ -208,7 +210,7 @@ Callback arguments are temporary; copy data needed after the callback returns. S
 
 | Type | Public fields |
 |---|---|
-| `Connection` | `bool ipv6`; `uint64_t id`; `uint8_t direction, protocol`; `uint8_t local_ip[16], remote_ip[16]`; `uint16_t local_port, remote_port`; `uint8_t payload_layer`; `uint32_t payload_size`; `std::vector<uint8_t> payload`. |
+| `Connection` | `bool ipv6`; `uint64_t id`; `uint32_t interface_index`; `uint8_t direction, protocol`; `uint8_t local_ip[16], remote_ip[16]`; `uint16_t local_port, remote_port`; `uint8_t payload_layer`; `uint32_t payload_size`; `std::vector<uint8_t> payload`. |
 | `ConnectionEnd` | `bool ipv6`; `uint64_t process_id`; `uint8_t direction, protocol`; `uint8_t local_ip[16], remote_ip[16]`; `uint16_t local_port, remote_port`. No verdict ID or payload. |
 | `LogLine` | `Severity severity`; `std::string message`. |
 | `BandwidthEntry` | `bool ipv6`; `uint8_t local_ip[16]`; `uint16_t local_port`; `uint8_t remote_ip[16]`; `uint16_t remote_port`; `uint64_t transmitted_bytes, received_bytes`. |
@@ -247,7 +249,7 @@ Events use explicit byte encoding, never native C++/Rust structure layout:
 [type:u8][body_size:u32 LE][body:body_size bytes]
 ```
 
-The header is five bytes. `body_size` excludes the header; a complete record is at most **1048632 bytes** (`1 MiB + 56`, the IPv6 prefix). The IPv4 prefix is 32 bytes. Log records retain their separate 512-byte bound. All numeric fields, **including ports**, are little-endian. IP address bytes are in network order. There is no padding or implicit string terminator. In layouts below, `A=4` for IPv4 and `A=16` for IPv6.
+The header is five bytes. `body_size` excludes the header; a complete record is at most **1048636 bytes** (`1 MiB + 60`, the IPv6 prefix). The IPv4 prefix is 36 bytes. Log records retain their separate 512-byte bound. All numeric fields, **including ports**, are little-endian. IP address bytes are in network order. There is no padding or implicit string terminator. In layouts below, `A=4` for IPv4 and `A=16` for IPv6.
 
 | `InfoType` | Byte | Body layout / availability |
 |---|---:|---|
@@ -264,6 +266,7 @@ The header is five bytes. `body_size` excludes the header; a complete record is 
 | Field | Encoding / meaning |
 |---|---|
 | `id` | `u64`, pending NBL verdict ID. |
+| `interface_index` | `u32`, host adapter index (`BaseMiniportIfIndex`) for this NBL, not the guest interface index. |
 | `direction` | `u8`, guest outbound=0 / inbound=1. |
 | `protocol` | `u8`, IP protocol number. |
 | `local_ip` | `A` raw bytes, guest endpoint. |
@@ -274,7 +277,7 @@ The header is five bytes. `body_size` excludes the header; a complete record is 
 | `payload_size` | `u32`, complete observed IP packet length, at most 1048576. |
 | `payload` | Exactly `payload_size` bytes, starting with the original IP header; never a shortened capture. |
 
-Body size is `27 + payload_size` for IPv4 or `51 + payload_size` for IPv6; total frame size is respectively `32 + payload_size` or `56 + payload_size`. No process-ID bytes or alignment padding are present. These layouts are not wire-compatible with 0.2.1.0; command, verdict, bandwidth and legacy END layouts are unchanged.
+Body size is `31 + payload_size` for IPv4 or `55 + payload_size` for IPv6; total frame size is respectively `36 + payload_size` or `60 + payload_size`. No process-ID bytes or alignment padding are present. These layouts are not wire-compatible with 0.3.1.0 or earlier; command, verdict, bandwidth and legacy END layouts are unchanged.
 
 **END compatibility body**, understood by the client but not produced by the LWF:
 
@@ -323,9 +326,9 @@ Empty/oversized/truncated writes are rejected with `STATUS_INVALID_PARAMETER`; u
 
 ### Device-independent codec helpers
 
-`pmkext::wire` exposes `IsCompatibleVersion`, `DecodeFilteredDeviceCount`, `IsSupportedVerdict`, `ValidateCommands`, `EncodeVerdict`, and `DispatchRecord`. `IsCompatibleVersion` accepts exactly `kRequiredDeviceVersion={0,3,1,0}`; `Open` itself does not perform this check. `DecodeFilteredDeviceCount` requires a non-null, exactly four-byte little-endian reply and leaves its output unchanged on failure. `EncodeVerdict` fills a fixed ten-byte array; `DispatchRecord` validates exactly one complete frame before invoking its handler.
+`pmkext::wire` exposes `IsCompatibleVersion`, `DecodeFilteredDeviceCount`, `IsSupportedVerdict`, `ValidateCommands`, `EncodeVerdict`, and `DispatchRecord`. `IsCompatibleVersion` accepts exactly `kRequiredDeviceVersion={0,3,2,0}`; `Open` itself does not perform this check. `DecodeFilteredDeviceCount` requires a non-null, exactly four-byte little-endian reply and leaves its output unchanged on failure. `EncodeVerdict` fills a fixed ten-byte array; `DispatchRecord` validates exactly one complete frame before invoking its handler.
 
-`RecordStream::Feed(bytes, length, callback, error)` accepts arbitrary read boundaries and invokes the callback for each complete frame. `PendingBytes()` reports buffered incomplete bytes; `Reset()` discards buffered state. An oversized header invalidates the stream until reset; it does not guess a new boundary. The stream keeps at most one bounded record in heap storage and assembles large records across multiple driver reads. Constants are `kRecordHeaderSize=5`, `kConnectionIpv4PrefixSize=32`, `kConnectionIpv6PrefixSize=56`, `kMaxPayloadSize=1048576`, `kMaxRecordSize=1048632`, `kMaxLogRecordSize=512`, `kMaxCommandBatchSize=65536`, and `kVerdictCommandSize=10`.
+`RecordStream::Feed(bytes, length, callback, error)` accepts arbitrary read boundaries and invokes the callback for each complete frame. `PendingBytes()` reports buffered incomplete bytes; `Reset()` discards buffered state. An oversized header invalidates the stream until reset; it does not guess a new boundary. The stream keeps at most one bounded record in heap storage and assembles large records across multiple driver reads. Constants are `kRecordHeaderSize=5`, `kConnectionIpv4PrefixSize=36`, `kConnectionIpv6PrefixSize=60`, `kMaxPayloadSize=1048576`, `kMaxRecordSize=1048636`, `kMaxLogRecordSize=512`, `kMaxCommandBatchSize=65536`, and `kVerdictCommandSize=10`.
 
 ## License
 

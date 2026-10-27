@@ -81,11 +81,12 @@ bool NormalizeIpAddress(const std::wstring& literal, std::string& normalized);
 
 // One event identifies one owned NBL pending one verdict. For a homogeneous
 // multi-NB NBL, payload is the complete first NB IP packet, not concatenated NB
-// data. Unsupported/mixed batches are dropped. No host process, thread, switch,
-// port or NIC identity is inferred.
+// data. Unsupported/mixed batches are dropped. interface_index identifies the host
+// adapter at the interception point, not a guest NIC. No process/thread is inferred.
 struct Connection {
     bool     ipv6 = false;
     uint64_t id = 0;
+    uint32_t interface_index = 0;
     uint8_t  direction = 0;  // Guest outbound=0/inbound=1; local=guest, opposite host NDIS path.
     uint8_t  protocol = 0;
     uint8_t  local_ip[16] = {};

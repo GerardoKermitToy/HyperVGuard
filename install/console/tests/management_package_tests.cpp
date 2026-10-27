@@ -25,7 +25,7 @@ int wmain(int argc, wchar_t** argv) {
             {"HyperVXNdisFilter.sys,,,2", "HyperVXNdisFilter.sys,,,2\nUnrelated.sys,,,2"},
             {"HyperVXNdisFilter.sys=1", "OtherFilter.sys=1"},
             {"DriverFiles=13", "DriverFiles=12"},
-            {"0.3.1.0", "0.3.0.0"},
+            {"0.3.2.0", "0.3.0.0"},
             {"6E76EAD1-7BCB-49C4-9547-D3E6B3488F71", "00000001-0002-0003-0405-060708090A0B"},
             {"Install, hyperv_xndis_filter", "Install, another_component"},
             {"AddService=HyperVXNdisFilter,,Service", "AddService=OtherFilter,,Service"},

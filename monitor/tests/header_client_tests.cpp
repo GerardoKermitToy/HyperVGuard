@@ -144,7 +144,7 @@ BOOL DeviceIoControl(HANDLE, DWORD code, LPVOID input, DWORD input_size, LPVOID 
     if (code == 0x9c40e000u) {
         const auto version = Client::RequiredVersion;
         std::memcpy(bytes, version.data(), 4);
-        if (state.wrong_version) bytes[2] = 0;
+        if (state.wrong_version) bytes[2] = 1;
     } else if (code == 0x9c40e008u) bytes[0] = 1;
     else if (code == 0x9c40e004u) {
         size = 0;
@@ -215,15 +215,16 @@ namespace {
 void Put(Bytes& bytes, size_t offset, uint64_t value, unsigned count) {
     for (unsigned i = 0; i < count; ++i) bytes[offset + i] = static_cast<uint8_t>(value >> (i * 8));
 }
-Bytes Connection(bool ipv6, size_t payload) {
-    const size_t prefix = ipv6 ? 56 : 32, addr = ipv6 ? 16 : 4;
+Bytes Connection(bool ipv6, size_t payload, uint32_t interface_index = 0x12345678) {
+    const size_t prefix = ipv6 ? 60 : 36, addr = ipv6 ? 16 : 4;
     Bytes bytes(prefix + payload);
     bytes[0] = ipv6 ? 2 : 1;
     Put(bytes, 1, bytes.size() - 5, 4);
     Put(bytes, 5, 0x0102030405060708ull, 8);
-    bytes[13] = ipv6 ? 1 : 0; bytes[14] = 17;
-    bytes[15] = 0x20; bytes[15 + addr] = 0x30;
-    Put(bytes, 15 + addr * 2, 12345, 2); Put(bytes, 17 + addr * 2, 443, 2);
+    Put(bytes, 13, interface_index, 4);
+    bytes[17] = ipv6 ? 1 : 0; bytes[18] = 17;
+    bytes[19] = 0x20; bytes[19 + addr] = 0x30;
+    Put(bytes, 19 + addr * 2, 12345, 2); Put(bytes, 21 + addr * 2, 443, 2);
     bytes[prefix - 5] = 3;
     Put(bytes, prefix - 4, payload, 4);
     for (size_t i = 0; i < payload; ++i) bytes[prefix + i] = static_cast<uint8_t>(i % 251);
@@ -241,7 +242,7 @@ struct Observed {
 template <class T> void Observe(void* context, const T* packet, const uint8_t* payload, uint32_t size) {
     auto& s = *static_cast<Observed*>(context);
     ++s.calls;
-    s.good &= packet->id == 0x0102030405060708ull && (sizeof(packet->local_ip) == 16) == s.ipv6 &&
+    s.good &= packet->id == 0x0102030405060708ull && packet->interface_index == 0x12345678 && (sizeof(packet->local_ip) == 16) == s.ipv6 &&
         packet->direction == (s.ipv6 ? 1 : 0) && packet->protocol == 17 && packet->payload_layer == 3 &&
         packet->local_ip[0] == 0x20 && packet->remote_ip[0] == 0x30 &&
         packet->local_port == 12345 && packet->remote_port == 443 && size == s.payload &&
@@ -271,21 +272,45 @@ bool Feed(Client::Stream& stream, const Bytes& bytes, size_t chunk, const Client
     }
     return true;
 }
+template <class T> void ObserveInterface(void* context, const T* connection, const uint8_t*, uint32_t) {
+    static_cast<std::vector<uint32_t>*>(context)->push_back(connection->interface_index);
+}
+bool TestAdapterIndices() {
+    const std::vector<uint32_t> expected{101, 0x12345678, 101, 0x87654321};
+    for (bool ipv6 : {false, true}) {
+        Bytes records;
+        for (uint32_t index : expected) {
+            const auto record = Connection(ipv6, 28, index);
+            records.insert(records.end(), record.begin(), record.end());
+        }
+        for (size_t chunk : {size_t{1}, size_t{16}, size_t{65536}}) {
+            std::vector<uint32_t> observed;
+            Client::Callbacks cb;
+            cb.context = &observed;
+            cb.on_connection_v4 = ObserveInterface<Client::ConnectionV4>;
+            cb.on_connection_v6 = ObserveInterface<Client::ConnectionV6>;
+            Client::Stream stream;
+            CHECK(Feed(stream, records, chunk, cb));
+            CHECK(stream.PendingBytes() == 0 && observed == expected);
+        }
+    }
+    return true;
+}
 bool TestCodecAndStream() {
     static_assert(sizeof(Client) < 1024 && sizeof(Client::Stream) < 1024);
-    static_assert(Client::RequiredVersion == std::array<uint8_t, 4>{0, 3, 1, 0});
+    static_assert(Client::RequiredVersion == std::array<uint8_t, 4>{0, 3, 2, 0});
     for (bool v6 : {false, true}) for (size_t size : {size_t{0}, size_t{28}, size_t{65537}, size_t{1048576}}) {
         auto record = Connection(v6, size);
         Observed observed;
         observed.ipv6 = v6; observed.payload = size;
-        observed.header = record.data() + 5; observed.pointer = record.data() + (v6 ? 56 : 32);
+        observed.header = record.data() + 5; observed.pointer = record.data() + (v6 ? 60 : 36);
         auto cb = ConnectionCallbacks(observed);
         CHECK(Client::DispatchRecord(record, cb) == ERROR_SUCCESS);
         CHECK(observed.calls == 1 && observed.good);
         for (size_t chunk : {size_t{1}, size_t{31}, size_t{65536}}) {
             Client::Stream stream;
             observed.calls = 0; observed.header = stream.Buffer().data() + 5;
-            observed.pointer = stream.Buffer().data() + (v6 ? 56 : 32);
+            observed.pointer = stream.Buffer().data() + (v6 ? 60 : 36);
             CHECK(Feed(stream, record, chunk, cb));
             CHECK(stream.PendingBytes() == 0 && observed.calls == 1 && observed.good);
         }
@@ -299,7 +324,7 @@ bool TestCodecAndStream() {
     CHECK(observed.good && observed.calls == 2 && stream.PendingBytes() == 0);
     for (size_t n = 0; n < record.size(); ++n)
         CHECK(Client::DispatchRecord(Client::Bytes(record).first(n), cb) != ERROR_SUCCESS);
-    for (size_t offset : {size_t{13}, size_t{27}, size_t{28}}) {
+    for (size_t offset : {size_t{17}, size_t{31}, size_t{32}}) {
         auto invalid = record; invalid[offset] = 9;
         CHECK(Client::DispatchRecord(invalid, cb) != ERROR_SUCCESS);
     }
@@ -325,12 +350,12 @@ bool TestUnalignedViewsAndDeferredCompaction() {
             Bytes storage(shift + record.size());
             std::memcpy(storage.data() + shift, record.data(), record.size());
             observed.header = storage.data() + shift + 5;
-            observed.pointer = storage.data() + shift + (v6 ? 56 : 32);
+            observed.pointer = storage.data() + shift + (v6 ? 60 : 36);
             CHECK(Client::DispatchRecord(Client::Bytes(storage).subspan(shift), cb) == ERROR_SUCCESS);
             CHECK(observed.good && observed.calls == shift + 1);
         }
         const unsigned calls = observed.calls;
-        for (size_t offset : {size_t{13}, record.size() - 28 - 5, record.size() - 28 - 4}) {
+        for (size_t offset : {size_t{17}, record.size() - 28 - 5, record.size() - 28 - 4}) {
             auto invalid = record; invalid[offset] = 9;
             CHECK(Client::DispatchRecord(invalid, cb) == ERROR_INVALID_DATA);
             CHECK(Client::DispatchRecord(invalid, {}) == ERROR_INVALID_DATA);
@@ -344,13 +369,13 @@ bool TestUnalignedViewsAndDeferredCompaction() {
     const size_t partial = 17, written = first.size() + partial;
     std::memcpy(base, first.data(), first.size());
     std::memcpy(base + first.size(), second.data(), partial);
-    Observed observed; observed.header = base + 5; observed.pointer = base + 32;
+    Observed observed; observed.header = base + 5; observed.pointer = base + 36;
     auto cb = ConnectionCallbacks(observed);
     CHECK(stream.Commit(written, cb) == ERROR_SUCCESS);
     CHECK(observed.good && observed.calls == 1 && stream.PendingBytes() == partial);
     CHECK(stream.Buffer().data() == base + written); // The partial frame was not moved after dispatch.
     observed.ipv6 = true; observed.payload = Client::MaxPayloadSize;
-    observed.header = base + 5; observed.pointer = base + 56; // Compaction is eventually necessary at capacity.
+    observed.header = base + 5; observed.pointer = base + 60; // Compaction is eventually necessary at capacity.
     Bytes remainder(second.begin() + partial, second.end());
     CHECK(Feed(stream, remainder, Client::ReadSize, cb));
     CHECK(observed.good && observed.calls == 2 && stream.PendingBytes() == 0);
@@ -546,7 +571,7 @@ bool TestCallbacksAndLargeRead() {
         auto run = std::async(std::launch::async, [&] { return client.Run(cb, 2000); });
         CHECK(::WaitForSingleObject(testio::state.submitted, 2000) == WAIT_OBJECT_0);
         { std::lock_guard lock(testio::state.mutex);
-          observed.pointer = testio::state.first_buffer + 56; observed.header = testio::state.first_buffer + 5; }
+          observed.pointer = testio::state.first_buffer + 60; observed.header = testio::state.first_buffer + 5; }
         testio::Inject(Connection(true, size));
         CHECK(run.get() == ERROR_SUCCESS);
         CHECK(observed.good && observed.calls == 1 && testio::state.operations.empty());
@@ -591,6 +616,7 @@ bool TestErrorsAndException() {
 
 int main() {
     const struct { const char* name; bool (*run)(); } tests[]{
+        {"interleaved adapter indices survive fragmented/coalesced IPv4/IPv6 streams", TestAdapterIndices},
         {"borrowed packed connection headers/payloads, 1 MiB packets, chunked/coalesced reads and poisoned-stream reset", TestCodecAndStream},
         {"unaligned zero-copy views, restored packing and deferred stream compaction", TestUnalignedViewsAndDeferredCompaction},
         {"borrowed logs and batched bandwidth arrays, exact layouts and malformed records", TestLogAndBandwidth},

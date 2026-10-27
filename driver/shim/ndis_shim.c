@@ -34,8 +34,9 @@ struct _HV_ADAPTER {
     BOOLEAN Running, PausePending;
 };
 
+extern const UCHAR HV_API_VERSION[4];
 extern void HvConfigure(ULONG, ULONG, ULONG);
-extern ULONG HvAttach(UINT64);
+extern ULONG HvAttach(UINT64, ULONG);
 extern ULONG HvRestart(UINT64);
 extern void HvInvalidate(UINT64, ULONG);
 extern void HvDetach(UINT64);
@@ -622,7 +623,7 @@ NDIS_STATUS HvFilterAttach(NDIS_HANDLE filter, NDIS_HANDLE context, PNDIS_FILTER
     nbPool.PoolTag = TAG;
     a->NbPool = NdisAllocateNetBufferPool(filter, &nbPool);
     if (a->NbPool == NULL) goto FreeNblPool;
-    if (!HvAttach(a->Id)) goto FreeNbPool;
+    if (!HvAttach(a->Id, p->BaseMiniportIfIndex)) goto FreeNbPool;
     attributes.Header.Type = NDIS_OBJECT_TYPE_FILTER_ATTRIBUTES;
     attributes.Header.Revision = NDIS_FILTER_ATTRIBUTES_REVISION_1;
     attributes.Header.Size = NDIS_SIZEOF_FILTER_ATTRIBUTES_REVISION_1;
@@ -704,9 +705,8 @@ NTSTATUS HvDispatch(PDEVICE_OBJECT device, PIRP irp) {
         } else if (stack->MajorFunction == IRP_MJ_DEVICE_CONTROL) {
             ULONG code = stack->Parameters.DeviceIoControl.IoControlCode;
             if (code == VERSION_IOCTL) {
-                static const UCHAR version[4] = {0,3,1,0};
-                if (stack->Parameters.DeviceIoControl.OutputBufferLength < sizeof(version)) status = STATUS_BUFFER_TOO_SMALL;
-                else {RtlCopyMemory(irp->AssociatedIrp.SystemBuffer, version, sizeof(version)); transferred = sizeof(version);}
+                if (stack->Parameters.DeviceIoControl.OutputBufferLength < sizeof(HV_API_VERSION)) status = STATUS_BUFFER_TOO_SMALL;
+                else {RtlCopyMemory(irp->AssociatedIrp.SystemBuffer, HV_API_VERSION, sizeof(HV_API_VERSION)); transferred = sizeof(HV_API_VERSION);}
             } else if (code == SHUTDOWN_IOCTL) {HvDisconnect(); cancelReads = TRUE;}
             else if (code == FILTERED_DEVICE_COUNT_IOCTL) {
                 if (stack->Parameters.DeviceIoControl.InputBufferLength != 0) status = STATUS_INVALID_PARAMETER;

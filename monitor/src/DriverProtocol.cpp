@@ -139,6 +139,7 @@ bool DispatchRecord(const uint8_t* bytes, size_t length, const Handlers& handler
             c.ipv6 = v6;
             size_t offset = 0;
             c.id = ReadU64(p + offset); offset += 8;
+            c.interface_index = ReadU32(p + offset); offset += 4;
             c.direction = p[offset++];
             c.protocol = p[offset++];
             std::memcpy(c.local_ip, p + offset, addr_size); offset += addr_size;

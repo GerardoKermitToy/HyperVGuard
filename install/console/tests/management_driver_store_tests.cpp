@@ -40,9 +40,9 @@ int wmain(int argc, wchar_t** argv) {
         const auto fixture = std::filesystem::path(argv[2]) / L"removal-identity-fixture.inf";
         std::vector<std::string> accepted{
             original,
-            Replace(original, "0.3.1.0", "0.3.0.0"),
-            Replace(original, "0.3.1.0", "0.2.1.0"),
-            Replace(original, "DriverVer=10/25/2026,0.3.1.0", ""),
+            Replace(original, "0.3.2.0", "0.3.0.0"),
+            Replace(original, "0.3.2.0", "0.2.1.0"),
+            Replace(original, "DriverVer=10/27/2026,0.3.2.0", ""),
             Replace(original, "%13%", "%12%"),
             Replace(original, "NTamd64.10.0...25341", "NTamd64"),
             Replace(Replace(original, "%Provider%=Models,NTamd64.10.0...25341", "%Provider%=Models"),

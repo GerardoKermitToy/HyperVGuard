@@ -30,9 +30,9 @@ public:
     static_assert(std::endian::native == std::endian::little, "The device wire API is little-endian");
     using Bytes = std::span<const uint8_t>;
     static constexpr size_t MaxPayloadSize = 1'048'576;
-    static constexpr size_t MaxRecordSize = MaxPayloadSize + 56;
+    static constexpr size_t MaxRecordSize = MaxPayloadSize + 60;
     static constexpr DWORD ReadSize = 65'536;
-    static constexpr std::array<uint8_t, 4> RequiredVersion{0, 3, 1, 0};
+    static constexpr std::array<uint8_t, 4> RequiredVersion{0, 3, 2, 0};
     enum class Verdict : uint8_t { Accept = 2, PermanentAccept, Block, PermanentBlock, Drop, PermanentDrop };
     enum class Command : uint8_t { ClearCache = 4, GetLogs, GetBandwidthStats, PrintMemoryStats, CleanEndedConnections };
 
@@ -41,6 +41,7 @@ public:
 #pragma pack(push, 1)
     template <size_t AddressSize> struct ConnectionFixed {
         uint64_t id;
+        uint32_t interface_index; // Индекс хостового адаптера точки перехвата, не интерфейса гостя.
         uint8_t direction, protocol; // 0=guest outbound, 1=guest inbound; never host PID.
         uint8_t local_ip[AddressSize], remote_ip[AddressSize];
         uint16_t local_port, remote_port;
@@ -58,16 +59,17 @@ public:
     using ConnectionV6 = ConnectionFixed<16>;
     using BandwidthV4 = BandwidthValue<4>;
     using BandwidthV6 = BandwidthValue<16>;
-    static_assert(sizeof(ConnectionV4) == 23 && sizeof(ConnectionV6) == 47);
+    static_assert(sizeof(ConnectionV4) == 27 && sizeof(ConnectionV6) == 51);
     static_assert(alignof(ConnectionV4) == 1 && alignof(ConnectionV6) == 1);
     static_assert(offsetof(ConnectionV4, id) == 0 && offsetof(ConnectionV6, id) == 0);
-    static_assert(offsetof(ConnectionV4, direction) == 8 && offsetof(ConnectionV6, direction) == 8);
-    static_assert(offsetof(ConnectionV4, protocol) == 9 && offsetof(ConnectionV6, protocol) == 9);
-    static_assert(offsetof(ConnectionV4, local_ip) == 10 && offsetof(ConnectionV6, local_ip) == 10);
-    static_assert(offsetof(ConnectionV4, remote_ip) == 14 && offsetof(ConnectionV6, remote_ip) == 26);
-    static_assert(offsetof(ConnectionV4, local_port) == 18 && offsetof(ConnectionV6, local_port) == 42);
-    static_assert(offsetof(ConnectionV4, remote_port) == 20 && offsetof(ConnectionV6, remote_port) == 44);
-    static_assert(offsetof(ConnectionV4, payload_layer) == 22 && offsetof(ConnectionV6, payload_layer) == 46);
+    static_assert(offsetof(ConnectionV4, interface_index) == 8 && offsetof(ConnectionV6, interface_index) == 8);
+    static_assert(offsetof(ConnectionV4, direction) == 12 && offsetof(ConnectionV6, direction) == 12);
+    static_assert(offsetof(ConnectionV4, protocol) == 13 && offsetof(ConnectionV6, protocol) == 13);
+    static_assert(offsetof(ConnectionV4, local_ip) == 14 && offsetof(ConnectionV6, local_ip) == 14);
+    static_assert(offsetof(ConnectionV4, remote_ip) == 18 && offsetof(ConnectionV6, remote_ip) == 30);
+    static_assert(offsetof(ConnectionV4, local_port) == 22 && offsetof(ConnectionV6, local_port) == 46);
+    static_assert(offsetof(ConnectionV4, remote_port) == 24 && offsetof(ConnectionV6, remote_port) == 48);
+    static_assert(offsetof(ConnectionV4, payload_layer) == 26 && offsetof(ConnectionV6, payload_layer) == 50);
     static_assert(sizeof(BandwidthV4) == 28 && sizeof(BandwidthV6) == 52);
     static_assert(alignof(BandwidthV4) == 1 && alignof(BandwidthV6) == 1);
     static_assert(offsetof(BandwidthV4, local_ip) == 0 && offsetof(BandwidthV6, local_ip) == 0);

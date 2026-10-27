@@ -26,6 +26,9 @@ const SUCCESS: i32 = 0;
 const INVALID_PARAMETER: i32 = 0xc000000du32 as i32;
 const NOT_SUPPORTED: i32 = 0xc00000bbu32 as i32;
 
+#[unsafe(no_mangle)]
+pub static HV_API_VERSION: [u8; 4] = wire::VERSION;
+
 unsafe extern "C" {
     fn hv_initialize(driver: Handle, registry: Handle) -> i32;
     fn hv_lock() -> usize;
@@ -120,8 +123,8 @@ pub extern "C" fn HvConfigure(timeout: u32, cache_ttl: u32, fail_closed: u32) {
     with_state(|e| e.configure(timeout, cache_ttl, fail_closed != 0));
 }
 #[unsafe(no_mangle)]
-pub extern "C" fn HvAttach(id: u64) -> u32 {
-    with_state(|e| e.attach(id) as u32)
+pub extern "C" fn HvAttach(id: u64, interface_index: u32) -> u32 {
+    with_state(|e| e.attach(id, interface_index) as u32)
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn HvRestart(id: u64) -> u32 {

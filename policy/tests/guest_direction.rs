@@ -49,7 +49,7 @@ fn parse(bytes: &[u8], path: NdisPath) -> Packet {
 
 fn engine() -> Box<Engine> {
     let mut engine = Box::new(Engine::new());
-    assert!(engine.attach(1));
+    assert!(engine.attach(1, 101));
     assert!(engine.restart(1));
     engine.connect();
     engine
@@ -145,19 +145,20 @@ fn guest_wire_direction_and_endpoints_survive_allow_and_drop() {
                 let id = submit(&mut engine, packet, path, 7, &bytes);
                 let event = record(&mut engine, 1);
                 assert_eq!(u64::from_le_bytes(event[5..13].try_into().unwrap()), id);
-                assert_eq!(event[13], direction);
-                assert_eq!(event[14], protocol);
-                assert_eq!(&event[15..19], &[172, 28, 192, 8]);
-                assert_eq!(&event[19..23], &packet.connection.remote_ip[..4]);
+                assert_eq!(u32::from_le_bytes(event[13..17].try_into().unwrap()), 101);
+                assert_eq!(event[17], direction);
+                assert_eq!(event[18], protocol);
+                assert_eq!(&event[19..23], &[172, 28, 192, 8]);
+                assert_eq!(&event[23..27], &packet.connection.remote_ip[..4]);
                 assert_eq!(
-                    u16::from_le_bytes(event[23..25].try_into().unwrap()),
+                    u16::from_le_bytes(event[27..29].try_into().unwrap()),
                     packet.connection.local_port
                 );
                 assert_eq!(
-                    u16::from_le_bytes(event[25..27].try_into().unwrap()),
+                    u16::from_le_bytes(event[29..31].try_into().unwrap()),
                     packet.connection.remote_port
                 );
-                assert_eq!(&event[32..], &bytes[14..]);
+                assert_eq!(&event[36..], &bytes[14..]);
                 let action = engine.verdict(id, verdict, 101).unwrap();
                 assert_eq!(action.token, 7);
                 assert_eq!(

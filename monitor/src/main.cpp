@@ -204,7 +204,7 @@ int MonitorMain(int argc, wchar_t** argv) {
     }
     std::printf("Driver version: %u.%u.%u.%u\n", version[0], version[1], version[2], version[3]);
     if (!pmkext::wire::IsCompatibleVersion(version)) {
-        std::fprintf(stderr, "ERROR: incompatible HyperVXNdisFilter driver version (expected 0.3.1.0); "
+        std::fprintf(stderr, "ERROR: incompatible HyperVXNdisFilter driver version (expected 0.3.2.0); "
                              "installed SYS uses a different wire layout\n");
         return 1;
     }
@@ -312,15 +312,7 @@ int MonitorMain(int argc, wchar_t** argv) {
         // Output filtering must never withhold or change a verdict.
         if (!show) return;
         pmkext::RecordOutput record(g_out, g_print_mutex);
-        record.Write("%s[CONN %s] id=%llu %s proto=%u(%s) layer=%u(%s)\n"
-                     "          local(guest)=%s:%u  remote(peer)=%s:%u  payload=%u bytes\n",
-                     TimePrefix(opt.timestamps).c_str(), c.ipv6 ? "v6" : "v4",
-                     static_cast<unsigned long long>(c.id), pmkext::DirectionToString(c.direction),
-                     static_cast<unsigned>(c.protocol), pmkext::ProtocolToString(c.protocol),
-                     static_cast<unsigned>(c.payload_layer), pmkext::PayloadLayerToString(c.payload_layer),
-                     c.LocalIpString().c_str(), static_cast<unsigned>(c.local_port),
-                     c.RemoteIpString().c_str(), static_cast<unsigned>(c.remote_port),
-                     static_cast<unsigned>(c.payload_size));
+        record.WriteConnection(c, TimePrefix(opt.timestamps).c_str());
         if (opt.show_payload) {
             record.Write("          payload: %s\n", c.payload.empty() ? "(none)" : c.PayloadHexString().c_str());
         }

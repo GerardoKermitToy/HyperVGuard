@@ -21,10 +21,10 @@ static_assert(!HasProcessId<pmkext::Connection>);
 static_assert(HasProcessId<pmkext::ConnectionEnd>);
 static_assert(sizeof(pmkext::wire::RecordStream) < 1024, "record storage must live on the heap");
 static_assert(sizeof(pmkext::Driver) < 1024, "Driver must not embed a large record buffer");
-static_assert(pmkext::wire::kConnectionIpv4PrefixSize == 32);
-static_assert(pmkext::wire::kConnectionIpv6PrefixSize == 56);
+static_assert(pmkext::wire::kConnectionIpv4PrefixSize == 36);
+static_assert(pmkext::wire::kConnectionIpv6PrefixSize == 60);
 static_assert(pmkext::wire::kMaxPayloadSize == 1'048'576);
-static_assert(pmkext::wire::kMaxRecordSize == 1'048'632);
+static_assert(pmkext::wire::kMaxRecordSize == 1'048'636);
 static_assert(pmkext::wire::kMaxLogRecordSize == 512);
 
 // Complete UDP/IP packets. Wire metadata uses LE ports, while these unmodified
@@ -41,8 +41,9 @@ constexpr uint8_t kIpv6Packet[] = {
     0x12, 0x34, 0x00, 0x35, 0x00, 0x08, 0x92, 0x00,
 };
 constexpr uint8_t kConnectionIpv4[] = {
-    1, 0x37, 0, 0, 0,                         // Type 1, body = 27 + 28.
-    8, 7, 6, 5, 4, 3, 2, 1,                 // ID, immediately followed by direction.
+    1, 0x3b, 0, 0, 0,                         // Type 1, body = 31 + 28.
+    8, 7, 6, 5, 4, 3, 2, 1,                 // ID, then host adapter index (u32 LE).
+    0x78, 0x56, 0x34, 0x12,
     0, 17,
     10, 0, 0, 1, 10, 0, 0, 2,
     0x34, 0x12, 0x35, 0x00,
@@ -52,8 +53,9 @@ constexpr uint8_t kConnectionIpv4[] = {
     0x12, 0x34, 0x00, 0x35, 0x00, 0x08, 0x00, 0x00,
 };
 constexpr uint8_t kConnectionIpv6[] = {
-    2, 0x63, 0, 0, 0,                         // Type 2, body = 51 + 48.
+    2, 0x67, 0, 0, 0,                         // Type 2, body = 55 + 48.
     8, 7, 6, 5, 4, 3, 2, 1,
+    0x78, 0x56, 0x34, 0x12,
     0, 17,
     0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
     0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2,
@@ -64,8 +66,8 @@ constexpr uint8_t kConnectionIpv6[] = {
     0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2,
     0x12, 0x34, 0x00, 0x35, 0x00, 0x08, 0x92, 0x00,
 };
-static_assert(sizeof(kConnectionIpv4) == 32 + sizeof(kIpv4Packet));
-static_assert(sizeof(kConnectionIpv6) == 56 + sizeof(kIpv6Packet));
+static_assert(sizeof(kConnectionIpv4) == 36 + sizeof(kIpv4Packet));
+static_assert(sizeof(kConnectionIpv6) == 60 + sizeof(kIpv6Packet));
 
 // Legacy END records retain their original eight-byte PID=0 field and layout.
 constexpr uint8_t kConnectionEndIpv4[] = {
@@ -138,7 +140,7 @@ Bytes LogicalPacket(bool v6, size_t size) {
 }
 Bytes ConnectionRecord(bool v6, const Bytes& packet) {
     const auto fixture = ConnectionFixture(v6);
-    const size_t prefix = v6 ? 56 : 32;
+    const size_t prefix = v6 ? 60 : 36;
     Bytes b(fixture.begin(), fixture.begin() + prefix);
     StoreU32(b, prefix - 4, static_cast<uint32_t>(packet.size()));
     b.insert(b.end(), packet.begin(), packet.end());
@@ -157,14 +159,14 @@ bool TestConnectionAbi() {
     for (bool v6 : {false, true}) {
         const auto bytes = ConnectionFixture(v6);
         const auto packet = PacketFixture(v6);
-        CHECK(bytes.size() == (v6 ? 104u : 60u));
+        CHECK(bytes.size() == (v6 ? 108u : 64u));
         CHECK(bytes[0] == (v6 ? 2 : 1));
-        CHECK(bytes[1] == (v6 ? 99 : 55));
+        CHECK(bytes[1] == (v6 ? 103 : 59));
         const uint8_t id[] = {8, 7, 6, 5, 4, 3, 2, 1};
         CHECK(std::memcmp(bytes.data() + 5, id, 8) == 0);
-        CHECK(bytes[13] == 0 && bytes[14] == 17); // No intervening PID.
+        CHECK(bytes[17] == 0 && bytes[18] == 17); // Index follows ID; no PID.
         CHECK(pmkext::wire::DispatchRecord(bytes.data(), bytes.size(), handlers, error));
-        CHECK(observed.id == 0x0102030405060708ULL);
+        CHECK(observed.id == 0x0102030405060708ULL && observed.interface_index == 0x12345678);
         CHECK(observed.ipv6 == v6 && observed.direction == 0 && observed.protocol == 17);
         CHECK(observed.local_port == 0x1234 && observed.remote_port == 53);
         CHECK(observed.payload_layer == 3 && observed.payload_size == packet.size());
@@ -181,7 +183,7 @@ bool TestConnectionAbi() {
     }
     for (bool v6 : {false, true}) {
         auto bytes = ConnectionFixture(v6);
-        bytes[13] = 1;
+        bytes[17] = 1;
         CHECK(pmkext::wire::DispatchRecord(bytes.data(), bytes.size(), handlers, error));
         CHECK(observed.direction == 1 && observed.ipv6 == v6);
         CHECK(observed.local_port == 0x1234 && observed.remote_port == 53);
@@ -198,12 +200,12 @@ bool TestConnectionAbi() {
 }
 
 bool TestRequiredVersion() {
-    const std::array<uint8_t, 4> expected = {0, 3, 1, 0};
+    const std::array<uint8_t, 4> expected = {0, 3, 2, 0};
     CHECK(pmkext::wire::kRequiredDeviceVersion == expected);
     CHECK(pmkext::wire::IsCompatibleVersion(expected.data()));
     CHECK(!pmkext::wire::IsCompatibleVersion(nullptr));
-    for (const auto version : std::array<std::array<uint8_t, 4>, 7>{{
-            {0, 2, 1, 0}, {0, 2, 0, 0}, {0, 0, 0, 0}, {0, 3, 0, 1},
+    for (const auto version : std::array<std::array<uint8_t, 4>, 8>{{
+            {0, 3, 1, 0}, {0, 2, 1, 0}, {0, 2, 0, 0}, {0, 0, 0, 0}, {0, 3, 0, 1},
             {0, 3, 0, 0}, {0, 4, 0, 0}, {1, 3, 0, 0}}}) {
         CHECK(!pmkext::wire::IsCompatibleVersion(version.data()));
     }
@@ -243,7 +245,7 @@ bool TestLargeConnections() {
         for (const size_t size : {size_t{257}, size_t{65536}, size_t{65537}, pmkext::wire::kMaxPayloadSize}) {
             const auto packet = LogicalPacket(v6, size);
             const auto bytes = ConnectionRecord(v6, packet);
-            CHECK(bytes.size() == (v6 ? 56 : 32) + size);
+            CHECK(bytes.size() == (v6 ? 60 : 36) + size);
             CHECK(bytes.size() <= pmkext::wire::kMaxRecordSize);
             CHECK(pmkext::wire::DispatchRecord(bytes.data(), bytes.size(), handlers, error));
             CHECK(observed.ipv6 == v6 && observed.id == 0x0102030405060708ULL);
@@ -270,14 +272,14 @@ bool TestInvalidRecords() {
     handlers.on_log = [&](const auto&) { ++callbacks; };
     handlers.on_bandwidth = [&](const auto&) { ++callbacks; };
     for (bool v6 : {false, true}) {
-        const size_t prefix = v6 ? 56 : 32;
+        const size_t prefix = v6 ? 60 : 36;
         const auto fixture = ConnectionFixture(v6);
         for (size_t length = 0; length < 5; ++length) {
             CHECK(!pmkext::wire::DispatchRecord(fixture.data(), length, handlers, error));
         }
-        for (const size_t modified : {size_t{13}, prefix - 5}) {
+        for (const size_t modified : {size_t{17}, prefix - 5}) {
             auto bytes = fixture;
-            bytes[modified] = modified == 13 ? 2 : 4; // Direction or payload layer.
+            bytes[modified] = modified == 17 ? 2 : 4; // Direction or payload layer.
             CHECK(!pmkext::wire::DispatchRecord(bytes.data(), bytes.size(), handlers, error));
         }
         for (const uint32_t length : {uint32_t{0}, uint32_t{1},
@@ -394,9 +396,9 @@ bool TestLogsAndBandwidth() {
         const auto fixture = ConnectionFixture(v6);
         const size_t addr_size = v6 ? 16 : 4;
         Bytes stats{17}; U32(stats, 1);
-        stats.insert(stats.end(), fixture.begin() + 15, fixture.begin() + 15 + addr_size);
+        stats.insert(stats.end(), fixture.begin() + 19, fixture.begin() + 19 + addr_size);
         U16(stats, 0x1234);
-        stats.insert(stats.end(), fixture.begin() + 15 + addr_size, fixture.begin() + 15 + addr_size * 2);
+        stats.insert(stats.end(), fixture.begin() + 19 + addr_size, fixture.begin() + 19 + addr_size * 2);
         U16(stats, 53);
         U64(stats, 123); U64(stats, 456);
         const auto bytes = Record(v6 ? 6 : 5, stats);
@@ -447,7 +449,7 @@ bool TestStreamingMaximumRecords() {
     const auto v6 = ConnectionRecord(true, packet6);
     const auto log = Record(0, {3, 'o', 'k'});
     const auto end = EndFixture(true);
-    CHECK(v4.size() == pmkext::wire::kMaxPayloadSize + 32);
+    CHECK(v4.size() == pmkext::wire::kMaxPayloadSize + 36);
     CHECK(v6.size() == pmkext::wire::kMaxRecordSize);
     const std::array<const Bytes*, 5> expected = {&log, &v4, &log, &v6, &end};
     Bytes combined;
@@ -622,7 +624,7 @@ bool TestDeviceOnlySession() {
 int main() {
     const struct { const char* name; bool (*run)(); } tests[] = {
         {"IPv4/IPv6 exact PID-less wire fixtures and complete IP packets", TestConnectionAbi},
-        {"only blocking-read wire version 0.3.1.0 is compatible", TestRequiredVersion},
+        {"only adapter-index wire version 0.3.2.0 is compatible", TestRequiredVersion},
         {"filtered-device count exact little-endian reply and malformed lengths", TestFilteredDeviceCount},
         {"full packets above 256/65536 bytes and at the 1 MiB maximum", TestLargeConnections},
         {"malformed records, metadata and oversized payloads rejected before callbacks", TestInvalidRecords},

@@ -64,7 +64,7 @@ fn capture(packet: &Packet, frame: &[u8]) -> Vec<u8> {
 
 fn round_trip(packet: Packet, frame: &[u8], path: NdisPath, chunk_len: usize) -> Vec<u8> {
     let mut engine = Box::new(Engine::new());
-    assert!(engine.attach(1));
+    assert!(engine.attach(1, 101));
     assert!(engine.restart(1));
     engine.connect();
     engine.read(&mut [0; 512]);
@@ -94,7 +94,8 @@ fn round_trip(packet: Packet, frame: &[u8], path: NdisPath, chunk_len: usize) ->
         u32::from_le_bytes(result[1..5].try_into().unwrap()) as usize,
         result.len() - 5
     );
-    assert_eq!(result[13], packet.connection.direction as u8);
+    assert_eq!(u32::from_le_bytes(result[13..17].try_into().unwrap()), 101);
+    assert_eq!(result[17], packet.connection.direction as u8);
     let prefix = connection_header_len(&packet.connection);
     assert_eq!(
         u32::from_le_bytes(result[prefix - 4..prefix].try_into().unwrap()),

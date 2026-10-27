@@ -76,6 +76,7 @@ pub enum VerdictError {
 #[derive(Clone, Copy)]
 struct Adapter {
     id: u64,
+    interface_index: u32,
     epoch: u64,
     running: bool,
 }
@@ -212,6 +213,7 @@ impl Engine {
         Self {
             adapters: [Adapter {
                 id: 0,
+                interface_index: 0,
                 epoch: 0,
                 running: false,
             }; MAX_ADAPTERS],
@@ -295,13 +297,14 @@ impl Engine {
         self.clear_cache();
         self.bandwidth.fill(Bandwidth::EMPTY);
     }
-    pub fn attach(&mut self, id: u64) -> bool {
+    pub fn attach(&mut self, id: u64, interface_index: u32) -> bool {
         if id == 0 || self.adapters.iter().any(|s| s.id == id) {
             return false;
         }
         if let Some(s) = self.adapters.iter_mut().find(|s| s.id == 0) {
             *s = Adapter {
                 id,
+                interface_index,
                 epoch: 1,
                 running: false,
             };
@@ -435,9 +438,19 @@ impl Engine {
         record: Option<Vec<u8>>,
     ) -> Submission {
         self.stats.received = self.stats.received.saturating_add(1);
-        let immediate = if !self.live(&key) {
-            Some(false)
-        } else if !self.online {
+        let Some(interface_index) = self
+            .adapters
+            .iter()
+            .find(|a| a.id == key.adapter && a.running && a.epoch == key.epoch)
+            .map(|a| a.interface_index)
+        else {
+            self.account(&packet, false);
+            return Submission::Finish(Action {
+                token,
+                finish: Finish::Drop,
+            });
+        };
+        let immediate = if !self.online {
             Some(self.fallback() == Finish::Allow)
         } else if packet.cacheable {
             let c = self.cache_lookup(&key, now);
@@ -480,7 +493,15 @@ impl Engine {
         let id = self.next_id;
         self.next_id += 1;
         let mut data = record.unwrap_or_default();
-        if encode_connection_header(&mut data, id, &packet.connection, payload_len).is_err() {
+        if encode_connection_header(
+            &mut data,
+            id,
+            interface_index,
+            &packet.connection,
+            payload_len,
+        )
+        .is_err()
+        {
             self.stats.malformed = self.stats.malformed.saturating_add(1);
             self.account(&packet, false);
             return Submission::Finish(Action {
@@ -712,7 +733,7 @@ mod tests {
     use std::{boxed::Box, vec};
     fn engine() -> Box<Engine> {
         let mut e = Box::new(Engine::new());
-        assert!(e.attach(1));
+        assert!(e.attach(1, 101));
         assert!(e.restart(1));
         e.connect();
         e
@@ -746,6 +767,61 @@ mod tests {
         }
     }
     #[test]
+    fn connection_indices_follow_each_adapter_across_paths_and_slot_reuse() {
+        let mut e = engine();
+        e.read(&mut [0; 512]);
+        assert!(e.attach(2, 0x12345678));
+        assert!(e.restart(2));
+        let mut previous_id = 0;
+        for (adapter, interface_index) in [
+            (1, 101),
+            (2, 0x12345678),
+            (1, 101),
+            (3, 0x87654321),
+            (2, 0x12345678),
+        ] {
+            if adapter == 3 {
+                e.detach(1);
+                assert!(e.attach(3, interface_index));
+                assert!(e.restart(3));
+            }
+            for ipv6 in [false, true] {
+                for path in [NdisPath::Send, NdisPath::Receive] {
+                    let mut p = packet();
+                    p.connection.ipv6 = ipv6;
+                    p.orient(path);
+                    let k = Key {
+                        adapter,
+                        epoch: e.epoch(adapter).unwrap(),
+                        path,
+                        flow: p.flow,
+                        ..Key::EMPTY
+                    };
+                    let token = adapter as usize;
+                    let Submission::Pending(id) = e.submit(k, p, token, 42, 100, record(&p)) else {
+                        panic!("each adapter must produce its own event");
+                    };
+                    assert!(id > previous_id);
+                    previous_id = id;
+                    let mut bytes = [0; 256];
+                    let n = e.read(&mut bytes);
+                    assert_eq!(
+                        n,
+                        connection_header_len(&p.connection) + p.payload_len as usize
+                    );
+                    assert_eq!(bytes[0], if ipv6 { 2 } else { 1 });
+                    assert_eq!(u64::from_le_bytes(bytes[5..13].try_into().unwrap()), id);
+                    assert_eq!(
+                        u32::from_le_bytes(bytes[13..17].try_into().unwrap()),
+                        interface_index
+                    );
+                    assert_eq!(bytes[17], path.direction() as u8);
+                    assert_eq!(e.verdict(id, Verdict::Accept, 101).unwrap().token, token);
+                }
+            }
+        }
+    }
+    #[test]
     fn permanent_scoped_to_adapter_path_vlan_epoch() {
         let mut e = engine();
         let k = key(&e, 1);
@@ -773,7 +849,7 @@ mod tests {
         ] {
             let _ = submit(&mut e, changed, 13);
         }
-        assert!(e.attach(2));
+        assert!(e.attach(2, 101));
         e.restart(2);
         let other = Key {
             adapter: 2,
@@ -910,7 +986,7 @@ mod tests {
         e.take_due(2100);
         let n = e.read(&mut b);
         assert_eq!(prefix[0], 1);
-        assert_eq!(n, 129);
+        assert_eq!(n, 133);
         assert_eq!(u64::from_le_bytes(b[2..10].try_into().unwrap()), id);
     }
     #[test]
@@ -968,7 +1044,11 @@ mod tests {
             }
             assert_eq!(received.len(), prefix + MAX_PAYLOAD);
             assert_eq!(u64::from_le_bytes(received[5..13].try_into().unwrap()), id);
-            assert_eq!(received[13], 0);
+            assert_eq!(
+                u32::from_le_bytes(received[13..17].try_into().unwrap()),
+                101
+            );
+            assert_eq!(received[17], 0);
             assert_eq!(
                 u32::from_le_bytes(received[prefix - 4..prefix].try_into().unwrap()) as usize,
                 MAX_PAYLOAD

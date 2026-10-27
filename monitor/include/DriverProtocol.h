@@ -15,14 +15,14 @@ namespace pmkext::wire {
 constexpr size_t kRecordHeaderSize = 5;
 // Matches protocol/src/lib.rs. Connection prefixes include the record header;
 // their payload is the complete logical IP packet, never a shortened capture.
-constexpr size_t kConnectionIpv4PrefixSize = 32;
-constexpr size_t kConnectionIpv6PrefixSize = 56;
+constexpr size_t kConnectionIpv4PrefixSize = 36;
+constexpr size_t kConnectionIpv6PrefixSize = 60;
 constexpr size_t kMaxPayloadSize = 1024 * 1024;
 constexpr size_t kMaxRecordSize = kConnectionIpv6PrefixSize + kMaxPayloadSize;
 constexpr size_t kMaxLogRecordSize = 512;
 constexpr size_t kMaxCommandBatchSize = 64 * 1024;
 constexpr size_t kVerdictCommandSize = 10;
-constexpr std::array<uint8_t, 4> kRequiredDeviceVersion = {0, 3, 1, 0};
+constexpr std::array<uint8_t, 4> kRequiredDeviceVersion = {0, 3, 2, 0};
 
 bool IsCompatibleVersion(const uint8_t version[4]) noexcept;
 
