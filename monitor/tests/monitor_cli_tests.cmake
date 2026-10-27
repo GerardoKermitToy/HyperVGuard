@@ -71,6 +71,9 @@ if(NOT result STREQUAL "0" OR NOT output MATCHES "direction=0 outbound, 1 inboun
    NOT output MATCHES "up to 1 MiB, no truncation" OR
    NOT output MATCHES "pending timeout defaults to 8 s" OR
    NOT output MATCHES "Delays >= 8000 ms" OR
+   NOT output MATCHES "four tables per interface" OR
+   NOT output MATCHES "TCP and UDP use separate caches" OR
+   output MATCHES "TCP/UDP and both directions share" OR
    NOT output MATCHES "Connection events carry no process/thread identity" OR
    output MATCHES "--filter-pid|PID=0|possibly shortened" OR
    output MATCHES "HyperVXNdisFilterPipe|Bridge:|winrpc|named-pipe" OR

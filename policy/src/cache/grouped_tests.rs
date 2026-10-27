@@ -161,14 +161,17 @@ fn invalid_or_overflowed_layouts_fail_before_allocator_call() {
 fn randomized_cache_churn_matches_standard_map_verdicts_and_ttl() {
     fn check(ipv6: bool) {
         let mut cache = caches();
-        let mut expected = std::collections::HashMap::<u32, (bool, u64)>::new();
+        let mut expected = std::collections::HashMap::<(u8, u32), (bool, u64)>::new();
         let mut random = 0x4859564341434845u64;
         for now in 1..=20000u64 {
             random ^= random << 13;
             random ^= random >> 7;
             random ^= random << 17;
             let id = (random >> 16) as u32 % 1024;
-            let c = connection(ipv6, id);
+            let protocol = if random & (1 << 40) == 0 { 6 } else { 17 };
+            let key = (protocol, id);
+            let mut c = connection(ipv6, id);
+            c.protocol = protocol;
             match random % 7 {
                 0..=2 => {
                     let allow = random & 0x100 != 0;
@@ -181,10 +184,10 @@ fn randomized_cache_churn_matches_standard_map_verdicts_and_ttl() {
                         now,
                         &mut work
                     )));
-                    expected.insert(id, (allow, expires));
+                    expected.insert(key, (allow, expires));
                 }
                 3..=4 => {
-                    let wanted = expected.get_mut(&id).and_then(|(allow, expires)| {
+                    let wanted = expected.get_mut(&key).and_then(|(allow, expires)| {
                         if *expires <= now {
                             return None;
                         }
@@ -197,7 +200,7 @@ fn randomized_cache_churn_matches_standard_map_verdicts_and_ttl() {
                 }
                 5 => {
                     let wanted = expected
-                        .get(&id)
+                        .get(&key)
                         .and_then(|(allow, expires)| (*expires > now).then_some(*allow));
                     assert_eq!(locked(|| cache.get(&c, now)), wanted);
                 }
@@ -212,11 +215,15 @@ fn randomized_cache_churn_matches_standard_map_verdicts_and_ttl() {
                 expected.clear();
             }
         }
-        for id in 0..1024 {
-            let wanted = expected
-                .get(&id)
-                .and_then(|(allow, expires)| (*expires > 20000).then_some(*allow));
-            assert_eq!(cache.get(&connection(ipv6, id), 20000), wanted);
+        for protocol in [6, 17] {
+            for id in 0..1024 {
+                let wanted = expected
+                    .get(&(protocol, id))
+                    .and_then(|(allow, expires)| (*expires > 20000).then_some(*allow));
+                let mut c = connection(ipv6, id);
+                c.protocol = protocol;
+                assert_eq!(cache.get(&c, 20000), wanted);
+            }
         }
         drop(cache);
         BYTES.with(|v| assert_eq!(v.get(), 0));

@@ -69,8 +69,8 @@ fn separate_tables_grow_past_1024_without_evicting_live_entries() {
         }
     }
     assert_eq!(caches.counts(), (8192, 8192));
-    assert!(caches.ipv4.current.capacity >= 16384);
-    assert!(caches.ipv6.current.capacity >= 16384);
+    assert!(caches.ipv4[1].current.capacity >= 16384);
+    assert!(caches.ipv6[1].current.capacity >= 16384);
     let calls = ALLOCATIONS.with(Cell::get);
     for n in 0..8192 {
         for ipv6 in [false, true] {
@@ -146,7 +146,7 @@ fn equal_hashes_never_alias_distinct_ip_port_tuples() {
         ..tuple
     };
     // Force an exact 64-bit collision, not just a shared bucket index.
-    assert!(caches.ipv4.current.insert(
+    assert!(caches.ipv4[1].current.insert(
         Entry {
             tuple: other,
             allow: false,
@@ -154,26 +154,35 @@ fn equal_hashes_never_alias_distinct_ip_port_tuples() {
         },
         hash
     ));
-    let a = caches.ipv4.current.find(&tuple, hash).unwrap();
-    let b = caches.ipv4.current.find(&other, hash).unwrap();
+    let a = caches.ipv4[1].current.find(&tuple, hash).unwrap();
+    let b = caches.ipv4[1].current.find(&other, hash).unwrap();
     assert_ne!(a, b);
-    assert!(caches.ipv4.current.entry(a).allow);
-    assert!(!caches.ipv4.current.entry(b).allow);
+    assert!(caches.ipv4[1].current.entry(a).allow);
+    assert!(!caches.ipv4[1].current.entry(b).allow);
 }
 
 #[test]
-fn tcp_udp_share_the_same_ip_port_entry() {
+fn tcp_udp_have_independent_decisions_and_expiry_for_the_same_ip_port_tuple() {
     let mut caches = caches();
     for ipv6 in [false, true] {
         let udp = connection(ipv6, 10);
-        assert!(insert(&mut caches, &udp, true, 60000));
         let mut tcp = udp;
         tcp.protocol = 6;
-        assert_eq!(caches.apply(&tcp, 1, 1000), Some(true));
-        assert!(insert(&mut caches, &tcp, false, 60000));
-        assert_eq!(caches.get(&udp, 1), Some(false));
+        assert!(insert(&mut caches, &udp, false, 100));
+        assert_eq!(caches.get(&tcp, 1), None);
+        assert!(caches.plan(&tcp).is_some());
+        assert!(insert(&mut caches, &tcp, true, 100));
+        assert_eq!(caches.apply(&tcp, 99, 1000), Some(true));
+        assert_eq!(caches.get(&udp, 99), Some(false));
+        assert_eq!(caches.get(&udp, 100), None);
+        assert_eq!(caches.get(&tcp, 100), Some(true));
     }
+    assert_eq!(caches.counts(), (2, 2));
+    maintain(&mut caches, 100);
     assert_eq!(caches.counts(), (1, 1));
+    maintain(&mut caches, 1099);
+    assert_eq!(caches.bytes(), 0);
+    BYTES.with(|v| assert_eq!(v.get(), 0));
 }
 
 #[test]
@@ -218,12 +227,12 @@ fn failed_compaction_does_not_fill_probe_chains_with_tombstones() {
         maintain(&mut caches, 10);
     }
     assert_eq!(caches.counts(), (16, 0));
-    let used = caches.ipv4.current.used;
+    let used = caches.ipv4[1].current.used;
     FAIL.with(|v| v.set(true));
     for n in 100..200 {
         assert!(!insert(&mut caches, &connection(false, n), false, 10000));
     }
-    assert_eq!(caches.ipv4.current.used, used);
+    assert_eq!(caches.ipv4[1].current.used, used);
     for n in 80..96 {
         assert_eq!(caches.get(&connection(false, n), 10), Some(true));
     }
@@ -237,21 +246,21 @@ fn only_insertions_advance_migration_and_both_tables_stay_readable() {
     for n in 0..97 {
         assert!(insert(&mut caches, &connection(true, n), n % 2 == 0, 60000));
     }
-    assert_eq!(caches.ipv6.previous.capacity, INITIAL_CAPACITY);
-    assert_eq!(caches.ipv6.migrate, WORK_PER_PASS);
-    let old_count = caches.ipv6.previous.len;
+    assert_eq!(caches.ipv6[1].previous.capacity, INITIAL_CAPACITY);
+    assert_eq!(caches.ipv6[1].migrate, WORK_PER_PASS);
+    let old_count = caches.ipv6[1].previous.len;
     for _ in 0..4 {
         for n in 0..97 {
             assert_eq!(caches.get(&connection(true, n), 1), Some(n % 2 == 0));
         }
         maintain(&mut caches, 1);
-        assert_eq!(caches.ipv6.migrate, WORK_PER_PASS);
-        assert_eq!(caches.ipv6.previous.len, old_count);
+        assert_eq!(caches.ipv6[1].migrate, WORK_PER_PASS);
+        assert_eq!(caches.ipv6[1].previous.len, old_count);
     }
     for n in 97..101 {
         assert!(insert(&mut caches, &connection(true, n), n % 2 == 0, 60000));
     }
-    assert_eq!(caches.ipv6.previous.capacity, 0);
+    assert_eq!(caches.ipv6[1].previous.capacity, 0);
     assert_eq!(caches.counts(), (0, 101));
     for n in 0..101 {
         assert_eq!(caches.get(&connection(true, n), 1), Some(n % 2 == 0));
@@ -275,7 +284,7 @@ fn expiry_and_tombstone_reuse_release_tables_without_locked_free() {
     assert_eq!(caches.counts(), (16, 0));
     // At high used-slot load but low live load, compact without growing.
     assert!(insert(&mut caches, &connection(false, 100), false, 10000));
-    assert_eq!(caches.ipv4.current.capacity, INITIAL_CAPACITY);
+    assert_eq!(caches.ipv4[1].current.capacity, INITIAL_CAPACITY);
     for _ in 0..4 {
         maintain(&mut caches, 10);
     }
@@ -299,8 +308,8 @@ fn cleanup_expires_both_tables_without_advancing_migration() {
         }
     }
     assert!(caches.has_entries());
-    assert_eq!(caches.ipv4.migrate, WORK_PER_PASS);
-    assert_eq!(caches.ipv6.migrate, WORK_PER_PASS);
+    assert_eq!(caches.ipv4[1].migrate, WORK_PER_PASS);
+    assert_eq!(caches.ipv6[1].migrate, WORK_PER_PASS);
     for _ in 0..8 {
         maintain(&mut caches, 10);
     }
@@ -316,19 +325,19 @@ fn cleanup_keeps_a_migration_destination_until_old_entries_are_gone() {
     for n in 0..97 {
         assert!(insert(&mut caches, &connection(false, n), true, 60000));
     }
-    for i in 0..caches.ipv4.current.capacity {
-        if caches.ipv4.current.is_full(i) {
-            caches.ipv4.current.entry_mut(i).expires = 10;
+    for i in 0..caches.ipv4[1].current.capacity {
+        if caches.ipv4[1].current.is_full(i) {
+            caches.ipv4[1].current.entry_mut(i).expires = 10;
         }
     }
-    let old_count = caches.ipv4.previous.len;
+    let old_count = caches.ipv4[1].previous.len;
     for _ in 0..8 {
         maintain(&mut caches, 10);
     }
-    assert_eq!(caches.ipv4.current.len, 0);
-    assert_eq!(caches.ipv4.previous.len, old_count);
-    assert_ne!(caches.ipv4.current.capacity, 0);
-    assert_eq!(caches.ipv4.migrate, WORK_PER_PASS);
+    assert_eq!(caches.ipv4[1].current.len, 0);
+    assert_eq!(caches.ipv4[1].previous.len, old_count);
+    assert_ne!(caches.ipv4[1].current.capacity, 0);
+    assert_eq!(caches.ipv4[1].migrate, WORK_PER_PASS);
     assert!(insert(&mut caches, &connection(false, 100), false, 60000));
     assert_eq!(caches.get(&connection(false, 100), 11), Some(false));
 }
@@ -373,14 +382,14 @@ fn one_expiry_pass_cleans_large_current_and_previous_tables() {
         }
     }
     assert!(caches.cleanup_slots() > CLEANUP_SLOTS_PER_BATCH);
-    assert_ne!(caches.ipv4.previous.capacity, 0);
-    assert_ne!(caches.ipv6.previous.capacity, 0);
-    let v4_migrate = caches.ipv4.migrate;
-    let v6_migrate = caches.ipv6.migrate;
+    assert_ne!(caches.ipv4[1].previous.capacity, 0);
+    assert_ne!(caches.ipv6[1].previous.capacity, 0);
+    let v4_migrate = caches.ipv4[1].migrate;
+    let v6_migrate = caches.ipv6[1].migrate;
     maintain(&mut caches, 10);
     assert_eq!(caches.counts(), (1024, 1024));
-    assert_eq!(caches.ipv4.migrate, v4_migrate);
-    assert_eq!(caches.ipv6.migrate, v6_migrate);
+    assert_eq!(caches.ipv4[1].migrate, v4_migrate);
+    assert_eq!(caches.ipv6[1].migrate, v6_migrate);
     for ipv6 in [false, true] {
         for n in 0..1537 {
             assert_eq!(
@@ -425,7 +434,7 @@ fn range_cleanup_survives_growth_between_unlocked_batches() {
             &mut work
         )));
     }
-    assert_eq!(caches.ipv4.previous.capacity, slots);
+    assert_eq!(caches.ipv4[1].previous.capacity, slots);
     for start in (CLEANUP_SLOTS_PER_BATCH..slots).step_by(CLEANUP_SLOTS_PER_BATCH) {
         let mut work = CacheWork::empty();
         locked(|| caches.maintain_range(start, 10, &mut work));
@@ -462,7 +471,7 @@ fn stale_growth_plans_and_clear_during_migration_free_outside_lock() {
     for n in 2..98 {
         assert!(insert(&mut caches, &connection(false, n), true, 60000));
     }
-    assert_ne!(caches.ipv4.previous.capacity, 0);
+    assert_ne!(caches.ipv4[1].previous.capacity, 0);
     let retired = locked(|| caches.clear());
     assert_eq!(caches.bytes(), 0);
     assert!(retired.bytes() > 0);
@@ -522,4 +531,79 @@ fn refreshed_accept_and_fixed_drop_survive_rehash_and_expire_exactly() {
         maintain(&mut caches, 1999);
     }
     assert_eq!(caches.bytes(), 0);
+}
+
+#[test]
+fn all_four_caches_retire_current_and_previous_tables_in_one_cleanup_batch() {
+    let mut caches = caches();
+    for protocol in [6, 17] {
+        for ipv6 in [false, true] {
+            for n in 0..97 {
+                let mut c = connection(ipv6, n);
+                c.protocol = protocol;
+                assert!(insert(&mut caches, &c, true, 10));
+            }
+        }
+    }
+    for cache in &caches.ipv4 {
+        assert_ne!(cache.previous.capacity, 0);
+    }
+    for cache in &caches.ipv6 {
+        assert_ne!(cache.previous.capacity, 0);
+    }
+    assert_eq!(caches.counts(), (194, 194));
+    let mut work = CacheWork::empty();
+    locked(|| caches.maintain(10, &mut work));
+    assert_eq!(caches.counts(), (0, 0));
+    assert_eq!(caches.bytes(), 0);
+    assert_eq!(work.retired.iter().filter(|b| !b.data.is_null()).count(), 8);
+    BYTES.with(|v| assert!(v.get() > 0));
+    drop(work);
+    BYTES.with(|v| assert_eq!(v.get(), 0));
+}
+
+#[test]
+fn growth_and_migration_are_local_to_the_selected_protocol() {
+    let mut caches = caches();
+    for ipv6 in [false, true] {
+        for n in 0..97 {
+            assert!(insert(&mut caches, &connection(ipv6, n), true, 60000));
+        }
+        let old_bytes = caches.bytes();
+        for n in 0..10 {
+            let mut tcp = connection(ipv6, n);
+            tcp.protocol = 6;
+            assert_eq!(caches.get(&tcp, 1), None);
+            assert!(insert(&mut caches, &tcp, false, 60000));
+            assert_eq!(caches.get(&connection(ipv6, n), 1), Some(true));
+        }
+        assert!(caches.bytes() > old_bytes);
+    }
+    assert_eq!(caches.ipv4[1].migrate, WORK_PER_PASS);
+    assert_eq!(caches.ipv6[1].migrate, WORK_PER_PASS);
+    assert_eq!(caches.ipv4[0].previous.capacity, 0);
+    assert_eq!(caches.ipv6[0].previous.capacity, 0);
+    assert_eq!(caches.counts(), (107, 107));
+}
+
+#[test]
+fn allocation_failure_in_one_protocol_preserves_the_other_protocol_cache() {
+    let mut caches = caches();
+    for ipv6 in [false, true] {
+        let udp = connection(ipv6, 1);
+        assert!(insert(&mut caches, &udp, true, 60000));
+        let bytes = caches.bytes();
+        let mut tcp = udp;
+        tcp.protocol = 6;
+        FAIL.with(|v| v.set(true));
+        assert!(!insert(&mut caches, &tcp, false, 60000));
+        assert_eq!(caches.get(&tcp, 1), None);
+        assert_eq!(caches.get(&udp, 1), Some(true));
+        assert_eq!(caches.bytes(), bytes);
+        FAIL.with(|v| v.set(false));
+        assert!(insert(&mut caches, &tcp, false, 60000));
+        assert_eq!(caches.get(&tcp, 1), Some(false));
+        assert_eq!(caches.get(&udp, 1), Some(true));
+    }
+    assert_eq!(caches.counts(), (2, 2));
 }

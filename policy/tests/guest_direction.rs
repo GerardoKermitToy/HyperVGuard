@@ -1,5 +1,5 @@
 use hyperv_policy::{
-    engine::{Engine, Finish, Key, Submission, allocate_record},
+    engine::{Engine, Finish, Submission, allocate_record},
     packet::{self, NdisPath, Packet},
 };
 use hyperv_protocol::{Direction, Verdict, connection_header_len};
@@ -49,8 +49,8 @@ fn parse(bytes: &[u8], path: NdisPath) -> Packet {
 
 fn engine() -> Box<Engine> {
     let mut engine = Box::new(Engine::new());
-    assert!(engine.attach(1, 101));
-    assert!(engine.restart(1));
+    assert!(engine.attach(101));
+    assert!(engine.restart(101));
     engine.connect();
     engine
 }
@@ -63,15 +63,15 @@ fn capture(packet: &Packet, frame: &[u8]) -> Vec<u8> {
 }
 
 fn submit(engine: &mut Engine, packet: Packet, path: NdisPath, token: usize, frame: &[u8]) -> u64 {
-    let key = Key {
-        adapter: 1,
-        epoch: engine.epoch(1).unwrap(),
-        path,
-        vlan: 0,
-        flow: packet.flow,
-    };
     let data = capture(&packet, frame);
-    let Submission::Pending(id) = engine.submit(key, packet, token, 0, 100, Some(data)) else {
+    let Submission::Pending(id) = engine.submit(
+        101,
+        packet,
+        token,
+        (path == NdisPath::Send).then_some(0),
+        100,
+        Some(data),
+    ) else {
         panic!("expected one pending NBL")
     };
     id
@@ -186,14 +186,7 @@ fn tcp_reply_reuses_the_same_normalized_tuple_cache_entry() {
         engine.verdict(id, verdict, 101).unwrap();
         let response = reply(&request);
         let incoming = parse(&response, NdisPath::Send);
-        let key = Key {
-            adapter: 1,
-            epoch: engine.epoch(1).unwrap(),
-            path: NdisPath::Send,
-            vlan: 0,
-            flow: incoming.flow,
-        };
-        let action = engine.preflight(&key, &incoming, 2, 102).unwrap_err();
+        let action = engine.preflight(101, &incoming, 2, 102).unwrap_err();
         assert_eq!(action.token, 2);
         assert_eq!(
             action.finish,

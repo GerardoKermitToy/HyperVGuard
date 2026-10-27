@@ -229,8 +229,8 @@ public:
     // Original unframed commands, with unchanged IDs and fixed field sizes.
     // UpdateV4/UpdateV6 remain named for compatibility but are unsupported.
     // Only verdicts 2..7 are supported. Only TCP/UDP can use permanent cache:
-    // growing IPv4/IPv6 tables per interface; key=local/remote IP+port only.
-    // TCP/UDP and both directions share matching tuples; OOM skips insertion.
+    // four growing tables per interface: TCP/UDP, each IPv4/IPv6; key=IP+port only.
+    // TCP/UDP stay separate; both directions share tuples within one table. OOM skips insertion.
     // Default TTL is 60 seconds: PermanentAccept hits refresh it; Block/Drop do not.
     // Pending verdict timeout is 8 seconds by default, with fail-open behavior.
     bool SendVerdict(uint64_t id, Verdict verdict, std::string& error);

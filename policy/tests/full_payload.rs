@@ -1,5 +1,5 @@
 use hyperv_policy::{
-    engine::{Engine, Key, Submission, allocate_record},
+    engine::{Engine, Submission, allocate_record},
     packet::{self, NdisPath, Packet, SNAPSHOT},
 };
 use hyperv_protocol::{MAX_PAYLOAD, MAX_RECORD, connection_header_len};
@@ -64,20 +64,20 @@ fn capture(packet: &Packet, frame: &[u8]) -> Vec<u8> {
 
 fn round_trip(packet: Packet, frame: &[u8], path: NdisPath, chunk_len: usize) -> Vec<u8> {
     let mut engine = Box::new(Engine::new());
-    assert!(engine.attach(1, 101));
-    assert!(engine.restart(1));
+    assert!(engine.attach(101));
+    assert!(engine.restart(101));
     engine.connect();
     engine.read(&mut [0; 512]);
-    let key = Key {
-        adapter: 1,
-        epoch: engine.epoch(1).unwrap(),
-        path,
-        vlan: 0,
-        flow: packet.flow,
-    };
-    assert!(engine.wants_event(&key, &packet, 100));
+    assert!(engine.wants_event(101, &packet, 100));
     let data = capture(&packet, frame);
-    let Submission::Pending(id) = engine.submit(key, packet, 1, 0, 100, Some(data)) else {
+    let Submission::Pending(id) = engine.submit(
+        101,
+        packet,
+        1,
+        (path == NdisPath::Send).then_some(0),
+        100,
+        Some(data),
+    ) else {
         panic!("expected a complete packet event");
     };
     let mut result = Vec::new();

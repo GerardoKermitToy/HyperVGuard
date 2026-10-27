@@ -17,7 +17,7 @@ use core::{
 };
 use hyperv_policy::{
     cache::{CLEANUP_SLOTS_PER_BATCH, CacheAllocator, CacheWork},
-    engine::{Action, Engine, Finish, Key, Submission, allocate_record},
+    engine::{Action, Engine, Finish, Submission, allocate_record},
     packet::{self, NdisPath, Packet, SNAPSHOT},
 };
 use hyperv_protocol::{self as wire, Command};
@@ -120,7 +120,7 @@ fn finish(a: Action) {
         )
     }
 }
-// Old per-interface table pairs move out one at a time, keeping the kernel
+// Old per-interface cache banks move out one at a time, keeping the kernel
 // stack fixed-size. No cache pool allocation/free occurs under PolicyLock.
 fn reclaim_caches() {
     for _ in 0..hyperv_policy::engine::MAX_ADAPTERS {
@@ -152,23 +152,23 @@ pub extern "C" fn HvConfigure(timeout: u32, cache_ttl: u32, fail_closed: u32) {
     with_state(|e| e.configure(timeout, cache_ttl, fail_closed != 0));
 }
 #[unsafe(no_mangle)]
-pub extern "C" fn HvAttach(id: u64, interface_index: u32) -> u32 {
-    let result = with_state(|e| e.attach(id, interface_index) as u32);
+pub extern "C" fn HvAttach(interface_index: u32) -> u32 {
+    let result = with_state(|e| e.attach(interface_index) as u32);
     reclaim_caches();
     result
 }
 #[unsafe(no_mangle)]
-pub extern "C" fn HvRestart(id: u64) -> u32 {
-    with_state(|e| e.restart(id) as u32)
+pub extern "C" fn HvRestart(interface_index: u32) -> u32 {
+    with_state(|e| e.restart(interface_index) as u32)
 }
 #[unsafe(no_mangle)]
-pub extern "C" fn HvInvalidate(id: u64, pause: u32) {
-    with_state(|e| e.invalidate(id, pause != 0));
+pub extern "C" fn HvInvalidate(interface_index: u32, pause: u32) {
+    with_state(|e| e.invalidate(interface_index, pause != 0));
     reclaim_caches();
 }
 #[unsafe(no_mangle)]
-pub extern "C" fn HvDetach(id: u64) {
-    with_state(|e| e.detach(id));
+pub extern "C" fn HvDetach(interface_index: u32) {
+    with_state(|e| e.detach(interface_index));
     reclaim_caches();
     drain();
 }
@@ -212,9 +212,9 @@ pub extern "C" fn HvDisconnect() {
     drain();
 }
 #[unsafe(no_mangle)]
-pub extern "C" fn HvCancel(id: u64, cancel: usize) {
+pub extern "C" fn HvCancel(interface_index: u32, cancel: usize) {
     loop {
-        let a = with_state(|e| e.cancel(id, cancel));
+        let a = with_state(|e| e.cancel(interface_index, cancel));
         if let Some(a) = a {
             finish(a)
         } else {
@@ -254,16 +254,9 @@ fn capture_packet(nb: Handle, token: usize, packet: &Packet) -> Result<Option<Ve
 
 // Return -1 if the engine now owns token; otherwise the caller finishes it after
 // releasing the per-module classification lock. No NDIS calls occur under the
-// global policy lock. Adapter/epoch identities never leave the driver.
+// global policy lock. Only the host interface index identifies the policy path.
 #[unsafe(no_mangle)]
-pub extern "C" fn HvClassify(
-    token: usize,
-    id: u64,
-    epoch: u64,
-    path: u32,
-    vlan: u32,
-    cancel: usize,
-) -> i32 {
+pub extern "C" fn HvClassify(token: usize, interface_index: u32, path: u32, cancel: usize) -> i32 {
     let Some(path) = NdisPath::decode(path) else {
         with_state(|e| e.malformed());
         return 1;
@@ -347,23 +340,19 @@ pub extern "C" fn HvClassify(
         return 0;
     };
     packet.orient(path);
-    let key = Key {
-        adapter: id,
-        epoch,
-        path,
-        vlan,
-        flow: packet.flow,
-    };
-    let wants_event = match with_state(|e| e.preflight(&key, &packet, token, unsafe { hv_now() })) {
-        Ok(wants_event) => wants_event,
-        Err(action) => {
-            return match action.finish {
-                Finish::Allow => 0,
-                Finish::Drop => 1,
-                Finish::Cancel => 2,
-            };
-        }
-    };
+    // Cancellation eligibility is NDIS ownership metadata, not verdict identity.
+    let cancel = (path == NdisPath::Send).then_some(cancel);
+    let wants_event =
+        match with_state(|e| e.preflight(interface_index, &packet, token, unsafe { hv_now() })) {
+            Ok(wants_event) => wants_event,
+            Err(action) => {
+                return match action.finish {
+                    Finish::Allow => 0,
+                    Finish::Drop => 1,
+                    Finish::Cancel => 2,
+                };
+            }
+        };
     let record = if wants_event {
         match capture_packet(unsafe { hv_first_nb(token) }, token, &packet) {
             Ok(record) => record,
@@ -375,7 +364,16 @@ pub extern "C" fn HvClassify(
     } else {
         None
     };
-    match with_state(|e| e.submit(key, packet, token, cancel, unsafe { hv_now() }, record)) {
+    match with_state(|e| {
+        e.submit(
+            interface_index,
+            packet,
+            token,
+            cancel,
+            unsafe { hv_now() },
+            record,
+        )
+    }) {
         Submission::Pending(_) => -1,
         Submission::Finish(a) => match a.finish {
             Finish::Allow => 0,

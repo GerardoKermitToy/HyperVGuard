@@ -35,8 +35,8 @@ public:
     static constexpr size_t MaxRecordSize = MaxPayloadSize + 60;
     static constexpr DWORD ReadSize = 65'536;
     static constexpr std::array<uint8_t, 4> RequiredVersion{0, 3, 2, 0};
-    // Permanent cache is TCP/UDP only: IPv4/IPv6 tables per interface, key=IP+port tuple.
-    // TCP/UDP and both directions share identical normalized tuples.
+    // Four permanent caches per interface: TCP/UDP, each IPv4/IPv6; key=IP+port tuple.
+    // TCP/UDP stay separate; both directions share normalized tuples within one table.
     // PermanentAccept hits refresh idle TTL; PermanentBlock/Drop keep fixed TTL.
     enum class Verdict : uint8_t { Accept = 2, PermanentAccept, Block, PermanentBlock, Drop, PermanentDrop };
     enum class Command : uint8_t { ClearCache = 4, GetLogs, GetBandwidthStats, PrintMemoryStats, CleanEndedConnections };

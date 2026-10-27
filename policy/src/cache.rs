@@ -335,16 +335,16 @@ impl CachePlan {
 }
 
 // Prepare before acquiring the policy lock; drop AFTER releasing it. At most
-// two tables per IP family can be retired in one bounded maintenance pass.
+// current/previous tables for all four caches can retire in one cleanup batch.
 pub struct CacheWork {
     growth: Option<Allocation>,
-    retired: [Buffer; 4],
+    retired: [Buffer; 8],
 }
 impl CacheWork {
     pub const fn empty() -> Self {
         Self {
             growth: None,
-            retired: [const { Buffer::EMPTY }; 4],
+            retired: [const { Buffer::EMPTY }; 8],
         }
     }
     pub fn prepare(plan: Option<CachePlan>) -> Self {
@@ -531,19 +531,20 @@ impl<const N: usize> Cache<N> {
     }
 }
 
-// One pair per host interface index. IPv4 slots contain only four address bytes.
-// Identity is exclusively the normalized IP/port tuple; no hidden scope fields.
+// Four independent caches per host interface: TCP/UDP, each with IPv4/IPv6.
+// Inside each table identity is only the normalized IP/port tuple. Protocol and
+// interface select the table; neither is hashed or stored in its entries.
 // No fixed entry count and no capacity-driven eviction.
 pub struct Caches {
-    ipv4: Cache<4>,
-    ipv6: Cache<16>,
+    ipv4: [Cache<4>; 2],
+    ipv6: [Cache<16>; 2],
     allocator: CacheAllocator,
 }
 impl Caches {
     pub const fn new(allocator: CacheAllocator) -> Self {
         Self {
-            ipv4: Cache::new(),
-            ipv6: Cache::new(),
+            ipv4: [const { Cache::new() }; 2],
+            ipv6: [const { Cache::new() }; 2],
             allocator,
         }
     }
@@ -553,54 +554,57 @@ impl Caches {
     pub(crate) fn clear(&mut self) -> Self {
         mem::replace(self, Self::new(self.allocator))
     }
-    pub(crate) fn plan(&self, c: &Connection) -> Option<CachePlan> {
-        if !matches!(c.protocol, 6 | 17) {
-            return None;
+    fn transport(protocol: u8) -> Option<usize> {
+        match protocol {
+            6 => Some(0),
+            17 => Some(1),
+            _ => None,
         }
+    }
+    pub(crate) fn plan(&self, c: &Connection) -> Option<CachePlan> {
+        let protocol = Self::transport(c.protocol)?;
         if c.ipv6 {
+            let cache = &self.ipv6[protocol];
             let tuple = Tuple::from_connection(c);
             let hash = tuple.hash();
-            if self.ipv6.current.find(&tuple, hash).is_some()
-                || self.ipv6.previous.find(&tuple, hash).is_some()
+            if cache.current.find(&tuple, hash).is_some()
+                || cache.previous.find(&tuple, hash).is_some()
             {
                 None
             } else {
-                self.ipv6.plan(self.allocator)
+                cache.plan(self.allocator)
             }
         } else {
+            let cache = &self.ipv4[protocol];
             let tuple = Tuple::from_connection(c);
             let hash = tuple.hash();
-            if self.ipv4.current.find(&tuple, hash).is_some()
-                || self.ipv4.previous.find(&tuple, hash).is_some()
+            if cache.current.find(&tuple, hash).is_some()
+                || cache.previous.find(&tuple, hash).is_some()
             {
                 None
             } else {
-                self.ipv4.plan(self.allocator)
+                cache.plan(self.allocator)
             }
         }
     }
     pub(crate) fn get(&self, c: &Connection, now: u64) -> Option<bool> {
-        if !matches!(c.protocol, 6 | 17) {
-            return None;
-        }
+        let protocol = Self::transport(c.protocol)?;
         if c.ipv6 {
             let tuple = Tuple::from_connection(c);
-            self.ipv6.get(&tuple, tuple.hash(), now)
+            self.ipv6[protocol].get(&tuple, tuple.hash(), now)
         } else {
             let tuple = Tuple::from_connection(c);
-            self.ipv4.get(&tuple, tuple.hash(), now)
+            self.ipv4[protocol].get(&tuple, tuple.hash(), now)
         }
     }
     pub(crate) fn apply(&mut self, c: &Connection, now: u64, ttl: u64) -> Option<bool> {
-        if !matches!(c.protocol, 6 | 17) {
-            return None;
-        }
+        let protocol = Self::transport(c.protocol)?;
         if c.ipv6 {
             let tuple = Tuple::from_connection(c);
-            self.ipv6.apply(&tuple, tuple.hash(), now, ttl)
+            self.ipv6[protocol].apply(&tuple, tuple.hash(), now, ttl)
         } else {
             let tuple = Tuple::from_connection(c);
-            self.ipv4.apply(&tuple, tuple.hash(), now, ttl)
+            self.ipv4[protocol].apply(&tuple, tuple.hash(), now, ttl)
         }
     }
     pub(crate) fn insert(
@@ -610,11 +614,11 @@ impl Caches {
         now: u64,
         work: &mut CacheWork,
     ) -> bool {
-        if !matches!(c.protocol, 6 | 17) {
+        let Some(protocol) = Self::transport(c.protocol) else {
             return false;
-        }
+        };
         if c.ipv6 {
-            self.ipv6.insert(
+            self.ipv6[protocol].insert(
                 Entry {
                     tuple: Tuple::from_connection(c),
                     allow: decision.allow,
@@ -624,7 +628,7 @@ impl Caches {
                 work,
             )
         } else {
-            self.ipv4.insert(
+            self.ipv4[protocol].insert(
                 Entry {
                     tuple: Tuple::from_connection(c),
                     allow: decision.allow,
@@ -636,24 +640,41 @@ impl Caches {
         }
     }
     pub(crate) fn cleanup_slots(&self) -> usize {
-        self.ipv4.cleanup_slots().max(self.ipv6.cleanup_slots())
+        self.ipv4
+            .iter()
+            .map(Cache::cleanup_slots)
+            .chain(self.ipv6.iter().map(Cache::cleanup_slots))
+            .max()
+            .unwrap_or(0)
     }
     pub(crate) fn maintain_range(&mut self, start: usize, now: u64, work: &mut CacheWork) {
-        self.ipv4.maintain_range(start, now, work);
-        self.ipv6.maintain_range(start, now, work);
+        for cache in &mut self.ipv4 {
+            cache.maintain_range(start, now, work);
+        }
+        for cache in &mut self.ipv6 {
+            cache.maintain_range(start, now, work);
+        }
     }
     pub(crate) fn maintain(&mut self, now: u64, work: &mut CacheWork) {
-        self.ipv4.maintain(now, work);
-        self.ipv6.maintain(now, work);
+        for cache in &mut self.ipv4 {
+            cache.maintain(now, work);
+        }
+        for cache in &mut self.ipv6 {
+            cache.maintain(now, work);
+        }
     }
     pub(crate) fn has_entries(&self) -> bool {
-        self.ipv4.len() != 0 || self.ipv6.len() != 0
+        self.ipv4.iter().any(|c| c.len() != 0) || self.ipv6.iter().any(|c| c.len() != 0)
     }
     pub fn counts(&self) -> (usize, usize) {
-        (self.ipv4.len(), self.ipv6.len())
+        (
+            self.ipv4.iter().map(Cache::len).sum(),
+            self.ipv6.iter().map(Cache::len).sum(),
+        )
     }
     pub fn bytes(&self) -> usize {
-        self.ipv4.bytes() + self.ipv6.bytes()
+        self.ipv4.iter().map(Cache::bytes).sum::<usize>()
+            + self.ipv6.iter().map(Cache::bytes).sum::<usize>()
     }
 }
 

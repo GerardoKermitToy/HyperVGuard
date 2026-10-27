@@ -24,7 +24,6 @@ typedef struct _HV_TOKEN {
     PNET_BUFFER_LIST Nbl;
     NDIS_PORT_NUMBER Port;
     ULONG Flags, Direction, CopyBytes;
-    UINT64 Epoch;
     BOOLEAN Copied, Forwarded;
 } HV_TOKEN;
 struct _HV_ADAPTER {
@@ -34,24 +33,24 @@ struct _HV_ADAPTER {
     EX_RUNDOWN_REF OidRundown;
     LIST_ENTRY Tokens, AdapterLink;
     HV_ADAPTER_INFO Info; // Protected by AdapterInfoLock; no borrowed NDIS pointers.
-    UINT64 Id, Epoch;
+    UINT64 Id; // Diagnostic module ID only; policy uses InterfaceIndex.
     LONG Active, TokenCount;
-    ULONG CopyBytes;
+    ULONG CopyBytes, InterfaceIndex;
     BOOLEAN Running, PausePending;
 };
 
 extern const UCHAR HV_API_VERSION[4];
 extern void HvConfigure(ULONG, ULONG, ULONG);
-extern ULONG HvAttach(UINT64, ULONG);
-extern ULONG HvRestart(UINT64);
-extern void HvInvalidate(UINT64, ULONG);
-extern void HvDetach(UINT64);
+extern ULONG HvAttach(ULONG);
+extern ULONG HvRestart(ULONG);
+extern void HvInvalidate(ULONG, ULONG);
+extern void HvDetach(ULONG);
 extern void HvDrain(void);
 extern void HvCleanCaches(void);
 extern void HvConnect(void);
 extern void HvDisconnect(void);
-extern void HvCancel(UINT64, ULONG_PTR);
-extern int HvClassify(ULONG_PTR, UINT64, UINT64, ULONG, ULONG, ULONG_PTR);
+extern void HvCancel(ULONG, ULONG_PTR);
+extern int HvClassify(ULONG_PTR, ULONG, ULONG, ULONG_PTR);
 extern void HvResourceDrop(void);
 extern ULONG HvRead(UCHAR*, ULONG);
 extern NTSTATUS HvWrite(const UCHAR*, ULONG);
@@ -430,7 +429,7 @@ static HV_TOKEN* CreateToken(HV_ADAPTER* a, PNET_BUFFER_LIST nbl, NDIS_PORT_NUMB
         ReleaseActive(a, 1); return NULL;
     }
     t->Adapter = a; t->Nbl = nbl; t->Port = port; t->Flags = flags;
-    t->Direction = direction; t->Epoch = a->Epoch;
+    t->Direction = direction;
     if (resources) {
         t->Nbl = CopyReceive(a, nbl, &t->CopyBytes);
         if (t->Nbl == NULL) { ReleaseToken(t); return NULL; }
@@ -449,7 +448,7 @@ void hv_finish(ULONG_PTR token, ULONG finish) {
     BOOLEAN allow;
     HV_FINISH_ROUTE route;
     NdisAcquireSpinLock(&a->Lock);
-    allow = finish == 0 && a->Running && t->Epoch == a->Epoch;
+    allow = finish == 0 && a->Running;
     if (allow) t->Forwarded = TRUE;
     else RemoveEntryList(&t->Link);
     NdisReleaseSpinLock(&a->Lock);
@@ -524,10 +523,9 @@ static void ClassifyChain(HV_ADAPTER* a, PNET_BUFFER_LIST chain, NDIS_PORT_NUMBE
             NdisAcquireRWLockRead(a->ClassificationLock, &state, 0);
             t = CreateToken(a, nbl, port, flags, direction, resources);
             if (t != NULL) {
-                ULONG vlan = (ULONG)(ULONG_PTR)NET_BUFFER_LIST_INFO(t->Nbl, Ieee8021QNetBufferListInfo);
                 ULONG_PTR cancel = direction == HV_DIRECTION_SEND ?
                     (ULONG_PTR)NDIS_GET_NET_BUFFER_LIST_CANCEL_ID(nbl) : 0;
-                result = HvClassify((ULONG_PTR)t, a->Id, t->Epoch, direction, vlan, cancel);
+                result = HvClassify((ULONG_PTR)t, a->InterfaceIndex, direction, cancel);
             }
             NdisReleaseRWLock(a->ClassificationLock, &state);
         }
@@ -565,7 +563,7 @@ _Use_decl_annotations_
 void HvCancelSend(NDIS_HANDLE context, PVOID cancel) {
     HV_ADAPTER* a = context;
     NdisAcquireSpinLock(&a->Lock); ++a->Active; NdisReleaseSpinLock(&a->Lock);
-    HvCancel(a->Id, (ULONG_PTR)cancel);
+    HvCancel(a->InterfaceIndex, (ULONG_PTR)cancel);
     NdisFCancelSendNetBufferLists(a->Filter, cancel);
     ReleaseActive(a, 1);
 }
@@ -596,8 +594,7 @@ void HvReturn(NDIS_HANDLE context, PNET_BUFFER_LIST chain, ULONG flags) {
 static void Invalidate(HV_ADAPTER* a) {
     LOCK_STATE_EX state;
     NdisAcquireRWLockWrite(a->ClassificationLock, &state, 0);
-    NdisAcquireSpinLock(&a->Lock); ++a->Epoch; NdisReleaseSpinLock(&a->Lock);
-    HvInvalidate(a->Id, TRUE);
+    HvInvalidate(a->InterfaceIndex, TRUE);
     NdisReleaseRWLock(a->ClassificationLock, &state);
     HvDrain(); // No NDIS call under the classification/policy locks.
 }
@@ -789,7 +786,7 @@ NDIS_STATUS HvFilterAttach(NDIS_HANDLE filter, NDIS_HANDLE context, PNDIS_FILTER
         !TargetAdapter(p, &interfaceGuid)) return NDIS_STATUS_NOT_SUPPORTED;
     a = ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(*a), TAG);
     if (a == NULL) return NDIS_STATUS_RESOURCES;
-    a->Filter = filter; a->Epoch = 1;
+    a->Filter = filter; a->InterfaceIndex = p->BaseMiniportIfIndex;
     a->Id = (UINT64)InterlockedIncrement64(&NextAdapter);
     CaptureAttachInfo(a, p, &interfaceGuid);
     NdisAllocateSpinLock(&a->Lock); InitializeListHead(&a->Tokens); ExInitializeRundownProtection(&a->OidRundown);
@@ -808,7 +805,7 @@ NDIS_STATUS HvFilterAttach(NDIS_HANDLE filter, NDIS_HANDLE context, PNDIS_FILTER
     nbPool.PoolTag = TAG;
     a->NbPool = NdisAllocateNetBufferPool(filter, &nbPool);
     if (a->NbPool == NULL) goto FreeNblPool;
-    if (!HvAttach(a->Id, p->BaseMiniportIfIndex)) goto FreeNbPool;
+    if (!HvAttach(a->InterfaceIndex)) goto FreeNbPool;
     attributes.Header.Type = NDIS_OBJECT_TYPE_FILTER_ATTRIBUTES;
     attributes.Header.Revision = NDIS_FILTER_ATTRIBUTES_REVISION_1;
     attributes.Header.Size = NDIS_SIZEOF_FILTER_ATTRIBUTES_REVISION_1;
@@ -820,7 +817,7 @@ NDIS_STATUS HvFilterAttach(NDIS_HANDLE filter, NDIS_HANDLE context, PNDIS_FILTER
         KeReleaseSpinLock(&AdapterInfoLock, irql);
         return status;
     }
-    HvDetach(a->Id);
+    HvDetach(a->InterfaceIndex);
 FreeNbPool:
     NdisFreeNetBufferPool(a->NbPool);
 FreeNblPool:
@@ -833,7 +830,7 @@ FreeLock:
 _Use_decl_annotations_
 NDIS_STATUS HvFilterRestart(NDIS_HANDLE context, PNDIS_FILTER_RESTART_PARAMETERS parameters) {
     HV_ADAPTER* a = context;
-    if (!HvRestart(a->Id)) return NDIS_STATUS_FAILURE;
+    if (!HvRestart(a->InterfaceIndex)) return NDIS_STATUS_FAILURE;
     CaptureRestartInfo(a, parameters);
     SetFilterRunning(a, TRUE);
     return NDIS_STATUS_SUCCESS;
@@ -865,7 +862,7 @@ void HvFilterDetach(NDIS_HANDLE context) {
     RemoveEntryList(&a->AdapterLink); --AdapterCount;
     KeReleaseSpinLock(&AdapterInfoLock, irql);
     ExWaitForRundownProtectionRelease(&a->OidRundown);
-    HvDetach(a->Id);
+    HvDetach(a->InterfaceIndex);
     NdisFreeNetBufferPool(a->NbPool); NdisFreeNetBufferListPool(a->NblPool);
     NdisFreeRWLock(a->ClassificationLock); NdisFreeSpinLock(&a->Lock); ExFreePoolWithTag(a, TAG);
 }

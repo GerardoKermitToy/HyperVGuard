@@ -38,7 +38,7 @@ const fn ctl_code(function: u32) -> u32 {
 #[repr(u8)]
 pub enum Verdict {
     Accept = 2,
-    // Only TCP/UDP can use per-interface tuple caches. Accept hits refresh idle TTL.
+    // Four tuple caches per interface: TCP/UDP x IPv4/IPv6. Accept hits refresh idle TTL.
     PermanentAccept = 3,
     Block = 4,
     PermanentBlock = 5,

@@ -30,16 +30,23 @@ mod driver {
         .hash()
     }
     pub(super) fn settle(caches: &mut Caches, now: u64) {
-        while caches.ipv4.previous.capacity != 0 || caches.ipv6.previous.capacity != 0 {
-            let mut work = CacheWork::empty();
-            caches.maintain(now, &mut work);
+        // Offline setup only: finish insertion-side migration before timing.
+        for cache in &mut caches.ipv4 {
+            while cache.previous.capacity != 0 {
+                cache.migrate(now, &mut CacheWork::empty());
+            }
+        }
+        for cache in &mut caches.ipv6 {
+            while cache.previous.capacity != 0 {
+                cache.migrate(now, &mut CacheWork::empty());
+            }
         }
     }
     pub(super) fn capacity<const N: usize>(caches: &Caches) -> usize {
         if N == 4 {
-            caches.ipv4.current.capacity
+            caches.ipv4.iter().map(|c| c.current.capacity).sum()
         } else {
-            caches.ipv6.current.capacity
+            caches.ipv6.iter().map(|c| c.current.capacity).sum()
         }
     }
 }
@@ -433,7 +440,6 @@ impl<const N: usize> Store<N> {
 fn check<L: Lookup>(store: &mut L, entries: &[Connection], misses: &[Connection]) {
     for (i, c) in entries.iter().enumerate() {
         let mut other = *c;
-        other.protocol = if c.protocol == 6 { 17 } else { 6 };
         other.direction = Direction::Inbound;
         assert_eq!(store.read(c, NOW), Some(i % 2 == 0));
         assert_eq!(store.read(&other, NOW), Some(i % 2 == 0));
@@ -487,7 +493,7 @@ fn connection<const N: usize>(id: u32, shared: bool, seed: u64) -> Connection {
     let mut rng = Rng(seed ^ u64::from(id));
     let mut c = Connection::EMPTY;
     c.ipv6 = N == 16;
-    c.protocol = if id.is_multiple_of(2) { 6 } else { 17 };
+    c.protocol = 6; // Compare one protocol table, including the frozen baseline.
     if shared {
         if N == 4 {
             c.local_ip[..4].copy_from_slice(&[10, 24, 0, (id % 64 + 1) as u8]);
@@ -560,9 +566,8 @@ fn workloads(
                 } else {
                     entries[index]
                 };
-                // Some probes use the other transport/path: neither is identity.
+                // Opposite directions still share this TCP table and tuple.
                 if i % 3 == 0 {
-                    connection.protocol = if connection.protocol == 6 { 17 } else { 6 };
                     connection.direction = Direction::Inbound;
                 }
                 Query {
@@ -861,12 +866,12 @@ fn main() {
         rows.extend(run::<16>(&config, shared, &mut raw));
     }
     let mut report = BufWriter::new(File::create(&report_path).unwrap());
-    writeln!(report, "# Offline TCP/UDP cache lookup benchmark\n").unwrap();
+    writeln!(report, "# Offline TCP cache lookup benchmark\n").unwrap();
     writeln!(report, "- {} unique entries **per IP family and address distribution**; {} probes per sample, {} rounds.", config.entries, config.queries, config.rounds).unwrap();
     writeln!(report, "- Dataset/order seed: `{}`. `RandomState` intentionally uses its own OS-generated hash seeds.", config.seed).unwrap();
     writeln!(report, "- One selected interface cache, one thread pinned to {affinity}. No device, driver loading, or network traffic.").unwrap();
     writeln!(report, "- Actual `policy/src/cache.rs` compiled directly, without lookup modifications. The frozen pre-adaptation cache is `legacy_linear`. Current+previous migration is settled before measurement.").unwrap();
-    writeln!(report, "- All candidates: TCP/UDP guard, normalized IP/port tuple construction, full equality, expiry check; apply refreshes only accepts. Entries are 50% allow, 50% deny.").unwrap();
+    writeln!(report, "- All candidates: TCP/UDP guard, normalized IP/port tuple construction, full equality, expiry check; apply refreshes only accepts. Datasets use TCP only so every comparison stays within one protocol scope. Entries are 50% allow, 50% deny.").unwrap();
     writeln!(report, "- Random shuffled full-working-set hits, misses, 90/10 mix; hot set up to 4096 entries. Shared distribution: 64 local/251 remote addresses, fixed prefixes, unique port pairs.").unwrap();
     writeln!(report, "- `hit_read` is read-only; all other workloads use mutable verdict lookup/TTL logic. Hash computation is included; no prehashed probes.").unwrap();
     writeln!(report, "- Generation, allocation, insertion, growth, and correctness checks excluded from lookup timing. Every existing/missing tuple checked before timing; timed checksums and zero allocations asserted.").unwrap();

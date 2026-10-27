@@ -9,7 +9,7 @@ traffic. The production cache is not replaced by this example.
 
 | Output name | Implementation |
 |---|---|
-| `driver_grouped` | Actual `no_std` driver cache: separate control bytes, 16-byte SSE2 fingerprint groups on x64 (eight-byte scalar fallback elsewhere), triangular group probing, and the selected word hash. IPv4/IPv6 tables remain separate. |
+| `driver_grouped` | Actual `no_std` driver cache: separate control bytes, 16-byte SSE2 fingerprint groups on x64 (eight-byte scalar fallback elsewhere), triangular group probing, and the selected word hash. TCP/UDP and IPv4/IPv6 tables remain separate. |
 | `legacy_linear` | Frozen pre-adaptation driver cache in `cache_lookup_bench/linear_cache.rs`, with its original linear probing and hash. Benchmark-only; never linked into the driver. |
 | `hashmap_randomstate` | `std::collections::HashMap<Key, Decision>` with the standard randomized `RandomState` hasher. |
 | `hashmap_driver_hash` | Standard `HashMap` with the exact current driver tuple hash; full tuple equality is retained. |
@@ -32,7 +32,7 @@ bytes; a mirrored control prefix supports wrapped group loads. Private
 entry layout keeps the tuple and verdict adjacent without shifting the payload
 base by the control header. A hit retains its bucket address through TTL handling. Seven-bit matches
 always receive a full tuple comparison. Growth starts at 75% live/used load;
-migration and expiry scanning retain the 32-slot work budget per table/pass.
+migration advances only on insertion, at most 32 old-table slots per step. Expiry cleanup is a full pass with policy-lock release between ranges of at most 256 slots per table.
 Only the controls require initialization outside the policy lock. Entry payloads
 are initialized before publishing a full fingerprint; their hashes are recomputed
 only when migrating. Windows x64 uses baseline integer SSE2 only, with compiler/ABI state preservation,
@@ -74,9 +74,10 @@ never overwritten. Outputs:
 Each lookup starts from a normalized `Connection`. All candidates perform the
 TCP/UDP admission check, create the same local-IP/local-port/remote-IP/remote-port
 key, compare the complete tuple, and check expiration. Applied hits extend only
-allow decisions using saturating TTL addition. TCP/UDP and opposite directions
-can intentionally reuse the same normalized tuple. One interface cache has
-already been selected; interface lookup, packet parsing, NDIS operations, the
+allow decisions using saturating TTL addition. Comparisons use **TCP only**, so the
+frozen legacy cache and tuple-only standard containers operate within the same
+protocol scope. Opposite directions can reuse the same normalized tuple; the
+production driver separates TCP from UDP. One interface has already been selected; interface lookup, packet parsing, NDIS operations, the
 policy lock, bandwidth accounting, and packet/event capture are not measured.
 
 Each table contains 50% allow and 50% deny decisions. Workloads are:
@@ -100,7 +101,7 @@ Both current and frozen-legacy caches finish incremental growth before steady-st
 Reported speedups use `legacy_linear` as the baseline.
 `HashMap` reserves the final capacity before population. Construction times are
 reported as context only, not as a fair insertion/growth comparison. No measured
-lookup allocates memory. Expiration boundaries, protocol/direction reuse, exact
+lookup allocates memory. Expiration boundaries, direction reuse within TCP, exact
 answers for all existing/missing tuples, and saturating accept refresh are checked
 before timing. Every timed sample verifies its consumed answer checksum.
 
