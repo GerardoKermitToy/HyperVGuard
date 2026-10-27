@@ -166,6 +166,7 @@ impl<T> List<T> {
     /// # Safety
     /// The handle must name a live node in this list, with no outstanding
     /// references to its value. Ownership transfers without allocation or free.
+    #[cfg(test)]
     pub(crate) unsafe fn move_to(&mut self, handle: Handle<T>, other: &mut Self) {
         let node = handle.0.as_ptr();
         unsafe {

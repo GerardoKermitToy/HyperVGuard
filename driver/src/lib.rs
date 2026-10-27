@@ -8,7 +8,7 @@ compile_error!("The driver supports Windows x64 only.");
 
 extern crate alloc;
 
-use alloc::vec::Vec;
+use alloc::{boxed::Box, vec::Vec};
 use core::{
     alloc::{GlobalAlloc, Layout},
     cell::UnsafeCell,
@@ -17,7 +17,7 @@ use core::{
 };
 use hyperv_policy::{
     cache::{CLEANUP_SLOTS_PER_BATCH, CacheAllocator, CacheWork},
-    engine::{Action, Engine, Finish, Submission, allocate_record},
+    engine::{Action, BandwidthTable, Engine, Finish, Submission, allocate_record},
     packet::{self, NdisPath, Packet, SNAPSHOT},
 };
 use hyperv_protocol::{self as wire, Command};
@@ -139,6 +139,24 @@ fn drain() {
             break;
         }
     }
+}
+fn report_bandwidth() {
+    let mut table = Box::new(BandwidthTable::new());
+    if !with_state(|e| e.begin_bandwidth(&mut table)) {
+        return;
+    }
+    let epoch = table.epoch();
+    table.report(
+        |data| match with_state(|e| e.queue_bandwidth(epoch, data)) {
+            Ok(()) => true,
+            Err(data) => {
+                drop(data);
+                false
+            }
+        },
+    );
+    let _ = with_state(|e| e.finish_bandwidth(&mut table));
+    reclaim_retired();
 }
 /// # Safety
 /// Only the kernel loader may call this with valid DRIVER_OBJECT/UNICODE_STRING.
@@ -449,10 +467,7 @@ pub unsafe extern "C" fn HvWrite(data: *const u8, len: u32) -> i32 {
                 reclaim_retired();
             }
             Command::GetLogs => {} // Log records are already queued.
-            Command::GetBandwidth => {
-                with_state(|e| e.bandwidth());
-                reclaim_retired();
-            }
+            Command::GetBandwidth => report_bandwidth(),
             Command::MemoryStats => with_state(|e| e.memory_stats()),
             Command::CleanEnded => {
                 reclaim_retired();

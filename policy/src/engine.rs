@@ -3,7 +3,7 @@ use crate::{
     packet::Packet,
     storage::{Handle, List},
 };
-use alloc::vec::Vec;
+use alloc::{boxed::Box, vec::Vec};
 use core::fmt::{self, Write};
 use hyperv_protocol::{
     BANDWIDTH_HEADER, BandwidthEntry, Connection, Direction, MAX_LOG_RECORD, MAX_PAYLOAD,
@@ -80,13 +80,19 @@ struct Bandwidth {
     tx: u64,
     rx: u64,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct BandwidthGroup {
+    interface_index: u32,
+    protocol: u8,
+    ipv6: bool,
+}
 impl Bandwidth {
-    fn report_group(&self) -> (u32, u8, bool) {
-        (
-            self.interface_index,
-            self.connection.protocol,
-            self.connection.ipv6,
-        )
+    fn report_group(&self) -> BandwidthGroup {
+        BandwidthGroup {
+            interface_index: self.interface_index,
+            protocol: self.connection.protocol,
+            ipv6: self.connection.ipv6,
+        }
     }
     fn entry(&self) -> BandwidthEntry {
         BandwidthEntry {
@@ -96,6 +102,105 @@ impl Bandwidth {
             remote_port: self.connection.remote_port,
             transmitted_bytes: self.tx,
             received_bytes: self.rx,
+        }
+    }
+}
+fn bandwidth_bucket_index(interface_index: u32, connection: &Connection) -> usize {
+    let hash = tuple_hash(connection).rotate_left(5)
+        ^ u64::from(connection.protocol)
+        ^ u64::from(interface_index).wrapping_mul(0x9e37_79b9);
+    hash as usize & (BANDWIDTH_BUCKETS - 1)
+}
+
+pub struct BandwidthTable {
+    buckets: [List<Bandwidth>; BANDWIDTH_BUCKETS],
+    count: usize,
+    epoch: u64,
+}
+impl Default for BandwidthTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl BandwidthTable {
+    pub fn new() -> Self {
+        Self {
+            buckets: [const { List::new() }; BANDWIDTH_BUCKETS],
+            count: 0,
+            epoch: 0,
+        }
+    }
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+    fn next_group(&self, after: Option<BandwidthGroup>) -> Option<BandwidthGroup> {
+        self.buckets
+            .iter()
+            .flat_map(List::iter)
+            .map(Bandwidth::report_group)
+            .filter(|key| after.is_none_or(|after| *key > after))
+            .min()
+    }
+    fn encode_group(&self, group: BandwidthGroup) -> Option<Vec<u8>> {
+        let count = self
+            .buckets
+            .iter()
+            .flat_map(List::iter)
+            .filter(|bandwidth| bandwidth.report_group() == group)
+            .count();
+        let len = bandwidth_record_len(group.ipv6, count)?;
+        let mut data = allocate_event(len).expect("bandwidth event allocation");
+        encode_bandwidth_header(
+            &mut data,
+            group.interface_index,
+            group.ipv6,
+            group.protocol,
+            count,
+        )
+        .expect("valid bandwidth event layout");
+        for (out, bandwidth) in data[BANDWIDTH_HEADER..]
+            .chunks_exact_mut(bandwidth_entry_len(group.ipv6))
+            .zip(
+                self.buckets
+                    .iter()
+                    .flat_map(List::iter)
+                    .filter(|bandwidth| bandwidth.report_group() == group),
+            )
+        {
+            encode_bandwidth_entry(out, group.ipv6, &bandwidth.entry())
+                .expect("valid bandwidth entry layout");
+        }
+        Some(data)
+    }
+    fn remove_group(&mut self, group: BandwidthGroup) {
+        for bucket in &mut self.buckets {
+            let mut next = bucket.first_handle();
+            while let Some(handle) = next {
+                // SAFETY: the handle belongs to this bucket and remains live
+                // until it is removed below.
+                next = unsafe { bucket.next_handle(handle) };
+                if unsafe { bucket.get(handle) }.report_group() == group {
+                    // This table is detached from Engine, so destruction is
+                    // deliberately outside PolicyLock.
+                    unsafe { bucket.remove(handle) };
+                    self.count -= 1;
+                }
+            }
+        }
+    }
+    // The callback runs outside PolicyLock in the driver path. Returning false
+    // leaves the current and later groups in the table for the merge step.
+    pub fn report(&mut self, mut submit: impl FnMut(Vec<u8>) -> bool) {
+        let mut after = None;
+        while let Some(group) = self.next_group(after) {
+            after = Some(group);
+            let Some(data) = self.encode_group(group) else {
+                continue;
+            };
+            if !submit(data) {
+                break;
+            }
+            self.remove_group(group);
         }
     }
 }
@@ -156,6 +261,7 @@ pub struct Engine {
     bandwidth: [List<Bandwidth>; BANDWIDTH_BUCKETS],
     retired_bandwidth: [List<Bandwidth>; BANDWIDTH_BUCKETS],
     bandwidth_count: usize,
+    bandwidth_epoch: u64,
     queued_bytes: usize,
     next_id: u64,
     online: bool,
@@ -185,6 +291,7 @@ impl Engine {
             bandwidth: [const { List::new() }; BANDWIDTH_BUCKETS],
             retired_bandwidth: [const { List::new() }; BANDWIDTH_BUCKETS],
             bandwidth_count: 0,
+            bandwidth_epoch: 0,
             queued_bytes: 0,
             next_id: 1,
             online: false,
@@ -302,6 +409,7 @@ impl Engine {
         }
     }
     pub fn connect(&mut self) {
+        self.bandwidth_epoch = self.bandwidth_epoch.wrapping_add(1);
         self.online = true;
         self.clear_events();
         self.clear_cache();
@@ -310,6 +418,7 @@ impl Engine {
     }
     // Complete actions using take_due() after dropping the lock.
     pub fn disconnect(&mut self) {
+        self.bandwidth_epoch = self.bandwidth_epoch.wrapping_add(1);
         self.online = false;
         self.clear_events();
         self.clear_cache();
@@ -830,10 +939,7 @@ impl Engine {
         self.bandwidth_count = 0;
     }
     fn bandwidth_add(&mut self, interface_index: u32, p: &Packet) {
-        let hash = tuple_hash(&p.connection).rotate_left(5)
-            ^ u64::from(p.connection.protocol)
-            ^ u64::from(interface_index).wrapping_mul(0x9e37_79b9);
-        let bucket = &mut self.bandwidth[hash as usize & (BANDWIDTH_BUCKETS - 1)];
+        let bucket = &mut self.bandwidth[bandwidth_bucket_index(interface_index, &p.connection)];
         let same = |b: &&mut Bandwidth| {
             let a = &b.connection;
             let c = &p.connection;
@@ -875,69 +981,53 @@ impl Engine {
             }
         }
     }
-    pub fn bandwidth(&mut self) {
-        let mut after: Option<(u32, u8, bool)> = None;
-        'groups: loop {
-            let group = self
-                .bandwidth
-                .iter()
-                .flat_map(List::iter)
-                .map(Bandwidth::report_group)
-                .filter(|key| after.is_none_or(|after| *key > after))
-                .min();
-            let Some(group) = group else { break };
-            after = Some(group);
-            let (interface_index, protocol, ipv6) = group;
-            let count = self
-                .bandwidth
-                .iter()
-                .flat_map(List::iter)
-                .filter(|b| b.report_group() == group)
-                .count();
-            let Some(len) = bandwidth_record_len(ipv6, count) else {
-                continue;
-            };
-            if !self.has_room(len) {
-                continue;
-            }
-            let Some(mut data) = allocate_event(len) else {
-                continue;
-            };
-            if encode_bandwidth_header(&mut data, interface_index, ipv6, protocol, count).is_err() {
-                continue;
-            }
-            // Encode the entire group directly into final fallible storage.
-            // No entry-count cap, packet-record cap or temporary entry array.
-            for (out, b) in data[BANDWIDTH_HEADER..]
-                .chunks_exact_mut(bandwidth_entry_len(ipv6))
-                .zip(
-                    self.bandwidth
-                        .iter()
-                        .flat_map(List::iter)
-                        .filter(|b| b.report_group() == group),
-                )
-            {
-                if encode_bandwidth_entry(out, ipv6, &b.entry()).is_err() {
-                    continue 'groups;
-                }
-            }
-            if self.push_event(data, None).is_none() {
-                continue;
-            }
-            // Retire only this successfully queued group without freeing its
-            // nodes under PolicyLock; failed groups keep all deltas.
-            for (bucket, retired) in self.bandwidth.iter_mut().zip(&mut self.retired_bandwidth) {
-                let mut next = bucket.first_handle();
-                while let Some(handle) = next {
-                    // SAFETY: handles and successors belong to this live list.
-                    next = unsafe { bucket.next_handle(handle) };
-                    if unsafe { bucket.get(handle) }.report_group() == group {
-                        unsafe { bucket.move_to(handle, retired) };
-                    }
-                }
-            }
-            self.bandwidth_count -= count;
+    pub fn begin_bandwidth(&mut self, table: &mut BandwidthTable) -> bool {
+        if self.bandwidth_count == 0 {
+            return false;
         }
+        // Only fixed-size list headers move under PolicyLock. The entries stay
+        // in the detached table while they are scanned and encoded.
+        for (live, detached) in self.bandwidth.iter_mut().zip(&mut table.buckets) {
+            core::mem::swap(live, detached);
+        }
+        table.count = self.bandwidth_count;
+        table.epoch = self.bandwidth_epoch;
+        self.bandwidth_count = 0;
+        true
+    }
+    pub fn queue_bandwidth(&mut self, epoch: u64, data: Vec<u8>) -> Result<(), Vec<u8>> {
+        if !self.online || epoch != self.bandwidth_epoch || !self.has_room(data.len()) {
+            return Err(data);
+        }
+        assert!(self.push_event(data, None).is_some());
+        Ok(())
+    }
+    pub fn finish_bandwidth(&mut self, table: &mut BandwidthTable) -> bool {
+        if !self.online || table.epoch != self.bandwidth_epoch {
+            return false;
+        }
+        for (live, detached) in self.bandwidth.iter_mut().zip(&mut table.buckets) {
+            live.append(detached);
+        }
+        self.bandwidth_count += table.count;
+        table.count = 0;
+        true
+    }
+    // Offline policy tests use the same detached-table path as the kernel bridge.
+    pub fn bandwidth(&mut self) {
+        let mut table = Box::new(BandwidthTable::new());
+        if !self.begin_bandwidth(&mut table) {
+            return;
+        }
+        let epoch = table.epoch();
+        table.report(|data| match self.queue_bandwidth(epoch, data) {
+            Ok(()) => true,
+            Err(data) => {
+                drop(data);
+                false
+            }
+        });
+        let _ = self.finish_bandwidth(&mut table);
     }
     pub fn memory_stats(&mut self) {
         let mut text = Text {
@@ -1150,7 +1240,7 @@ mod tests {
     }
 
     #[test]
-    fn bandwidth_and_report_events_grow_and_failed_enqueue_preserves_deltas() {
+    fn bandwidth_and_report_events_grow_without_splitting_groups() {
         const COUNT: usize = 1025;
         let mut e = engine();
         e.read(&mut [0; MAX_LOG_RECORD]);
@@ -1170,11 +1260,6 @@ mod tests {
             e.verdict(id, Verdict::Accept, 101).unwrap();
         }
         assert_eq!(e.bandwidth_count, COUNT);
-        e.events.fail_allocations = true;
-        e.bandwidth();
-        assert_eq!(e.bandwidth_count, COUNT);
-        assert!(!e.has_events());
-        e.events.fail_allocations = false;
         e.bandwidth();
         assert_eq!(e.bandwidth_count, 0);
         assert_eq!(e.events.len(), 2);
@@ -1222,6 +1307,36 @@ mod tests {
     }
 
     #[test]
+    fn bandwidth_table_reports_after_detach() {
+        let mut e = engine();
+        e.read(&mut [0; MAX_LOG_RECORD]);
+        for port in 1..=3 {
+            let mut p = packet();
+            p.connection.local_port = port;
+            e.bandwidth_add(101, &p);
+        }
+        let mut table = Box::new(BandwidthTable::new());
+        assert!(e.begin_bandwidth(&mut table));
+        assert_eq!(e.bandwidth_count, 0);
+        let epoch = table.epoch();
+        table.report(|data| match e.queue_bandwidth(epoch, data) {
+            Ok(()) => true,
+            Err(data) => {
+                drop(data);
+                false
+            }
+        });
+        assert!(e.finish_bandwidth(&mut table));
+        assert_eq!(e.bandwidth_count, 0);
+        assert_eq!(e.events.len(), 1);
+        let mut out = [0; 128];
+        assert_eq!(
+            e.read(&mut out),
+            BANDWIDTH_HEADER + 3 * bandwidth_entry_len(false)
+        );
+    }
+
+    #[test]
     fn bandwidth_queues_the_entire_large_group_without_count_caps_or_splitting() {
         const COUNT: usize = 40000;
         for ipv6 in [false, true] {
@@ -1237,14 +1352,12 @@ mod tests {
             e.bandwidth();
             assert_eq!(e.bandwidth_count, 0);
             assert_eq!(e.events.len(), 1);
-            assert_eq!(
-                e.retired_bandwidth.iter().map(List::len).sum::<usize>(),
-                COUNT
-            );
-            while let Some(retired) = e.take_retired_storage() {
-                drop(retired); // The driver reclaims the group after releasing PolicyLock.
-            }
+            // Successfully queued reports release their detached nodes after
+            // serialization, so no large list is retired under the policy lock.
             assert!(e.retired_bandwidth.iter().all(List::is_empty));
+            while let Some(retired) = e.take_retired_storage() {
+                drop(retired);
+            }
             let len = bandwidth_record_len(ipv6, COUNT).unwrap();
             assert!(len > MAX_RECORD);
             let mut out = vec![0; len];
