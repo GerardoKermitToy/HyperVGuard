@@ -13,6 +13,7 @@ pub const MAX_PENDING: usize = 256;
 pub const MAX_EVENTS: usize = 512;
 pub const MAX_EVENT_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_ADAPTERS: usize = hyperv_protocol::ADAPTER_INFO_MAX_ADAPTERS;
+const _: () = assert!(MAX_ADAPTERS <= u32::BITS as usize);
 const MAX_BANDWIDTH: usize = 256;
 const NO_SLOT: u16 = u16::MAX;
 
@@ -175,9 +176,10 @@ impl Stats {
 pub struct Engine {
     adapters: [Adapter; MAX_ADAPTERS],
     pending: [Pending; MAX_PENDING],
+    pending_count: usize,
     interfaces: [InterfaceCache; MAX_ADAPTERS],
+    cache_candidates: u32,
     cache_allocator: CacheAllocator,
-    cache_cursor: usize,
     events: [Event; MAX_EVENTS],
     bandwidth: [Bandwidth; MAX_BANDWIDTH],
     head: usize,
@@ -209,9 +211,10 @@ impl Engine {
                 running: false,
             }; MAX_ADAPTERS],
             pending: [Pending::EMPTY; MAX_PENDING],
+            pending_count: 0,
             interfaces: [const { InterfaceCache::empty() }; MAX_ADAPTERS],
+            cache_candidates: 0,
             cache_allocator: allocator,
-            cache_cursor: 0,
             events: [const { Event::EMPTY }; MAX_EVENTS],
             bandwidth: [Bandwidth::EMPTY; MAX_BANDWIDTH],
             head: 0,
@@ -220,7 +223,7 @@ impl Engine {
             next_id: 1,
             online: false,
             fail_closed: false,
-            timeout: 2000,
+            timeout: 8000,
             cache_ttl: 60000,
             stats: Stats::EMPTY,
         }
@@ -247,7 +250,19 @@ impl Engine {
         self.online
     }
     pub fn pending_count(&self) -> usize {
-        self.pending.iter().filter(|p| p.id != 0).count()
+        self.pending_count
+    }
+    pub fn cache_candidates(&self) -> u32 {
+        self.cache_candidates
+    }
+    fn update_cache_candidates(&mut self, slot: usize) {
+        let interface = &self.interfaces[slot];
+        let bit = 1 << slot;
+        if !interface.dirty && interface.caches.has_entries() {
+            self.cache_candidates |= bit;
+        } else {
+            self.cache_candidates &= !bit;
+        }
     }
     fn clear_events(&mut self) {
         for event in &mut self.events {
@@ -307,6 +322,7 @@ impl Engine {
         };
         let cache = &mut self.interfaces[cache_slot];
         if cache.users == 0 {
+            self.cache_candidates &= !(1 << cache_slot);
             cache.interface_index = interface_index;
             cache.dirty = cache.caches.bytes() != 0;
             if !cache.dirty {
@@ -338,6 +354,7 @@ impl Engine {
         if let Some(s) = self.adapters.iter_mut().find(|s| s.id == id) {
             s.epoch = s.epoch.saturating_add(1);
             self.interfaces[s.cache_slot].dirty = true;
+            self.cache_candidates &= !(1 << s.cache_slot);
             if pause || s.epoch == u64::MAX {
                 s.running = false;
             }
@@ -362,6 +379,7 @@ impl Engine {
     // Immediately disable all old tables; retire one pair at a time outside the
     // driver lock rather than returning a large per-interface array on its stack.
     pub fn clear_cache(&mut self) {
+        self.cache_candidates = 0;
         for interface in &mut self.interfaces {
             interface.dirty = interface.caches.bytes() != 0;
         }
@@ -371,23 +389,42 @@ impl Engine {
         interface.dirty = false;
         Some(interface.caches.clear())
     }
-    pub fn clean_with_work(&mut self, now: u64, work: &mut CacheWork) {
-        // One interface per pass. Insertions also migrate/sweep their own table.
-        for _ in 0..MAX_ADAPTERS {
-            let slot = self.cache_cursor;
-            self.cache_cursor = (slot + 1) % MAX_ADAPTERS;
-            let interface = &mut self.interfaces[slot];
-            if !interface.dirty && interface.caches.bytes() != 0 {
-                interface.caches.maintain(now, work);
-                break;
-            }
+    pub fn cache_cleanup_slots(&self, slot: usize) -> usize {
+        if slot >= MAX_ADAPTERS || self.cache_candidates & (1 << slot) == 0 {
+            return 0;
         }
+        self.interfaces[slot].caches.cleanup_slots()
     }
+    pub fn clean_range_with_work(
+        &mut self,
+        slot: usize,
+        start: usize,
+        now: u64,
+        work: &mut CacheWork,
+    ) -> bool {
+        if slot >= MAX_ADAPTERS || self.cache_candidates & (1 << slot) == 0 {
+            return false;
+        }
+        self.interfaces[slot]
+            .caches
+            .maintain_range(start, now, work);
+        self.update_cache_candidates(slot);
+        self.cache_candidates & (1 << slot) != 0
+    }
+    // Host helper. The kernel worker uses ranges to release PolicyLock between
+    // batches while completing every candidate bank in the same cleanup run.
     pub fn clean(&mut self, now: u64) {
         while let Some(retired) = self.take_retired_caches() {
             drop(retired);
         }
-        self.clean_with_work(now, &mut CacheWork::empty());
+        let mut candidates = self.cache_candidates;
+        while candidates != 0 {
+            let slot = candidates.trailing_zeros() as usize;
+            candidates &= candidates - 1;
+            let mut work = CacheWork::empty();
+            self.interfaces[slot].caches.maintain(now, &mut work);
+            self.update_cache_candidates(slot);
+        }
     }
     fn cache_bank(&self, key: &Key, packet: &Packet) -> Option<usize> {
         if !packet.cacheable
@@ -574,12 +611,14 @@ impl Engine {
             key,
             packet,
         };
+        self.pending_count += 1;
         self.stats.queued = self.stats.queued.saturating_add(1);
         Submission::Pending(id)
     }
     fn claim(&mut self, slot: usize, finish: Finish) -> Action {
         let p = self.pending[slot];
         self.pending[slot].id = 0;
+        self.pending_count -= 1;
         self.account(&p.packet, finish == Finish::Allow);
         Action {
             token: p.token,
@@ -611,7 +650,8 @@ impl Engine {
         }
         if verdict.permanent()
             && let Some(bank) = self.cache_bank(&p.key, &p.packet)
-            && !self.interfaces[bank].caches.insert(
+        {
+            if !self.interfaces[bank].caches.insert(
                 &p.packet.connection,
                 Decision {
                     allow: verdict.allows(),
@@ -619,10 +659,11 @@ impl Engine {
                 },
                 now,
                 work,
-            )
-        {
-            self.stats.cache_allocation_failures =
-                self.stats.cache_allocation_failures.saturating_add(1);
+            ) {
+                self.stats.cache_allocation_failures =
+                    self.stats.cache_allocation_failures.saturating_add(1);
+            }
+            self.update_cache_candidates(bank);
         }
         Ok(self.claim(
             slot,
@@ -636,6 +677,9 @@ impl Engine {
     // Taking one item at a time avoids putting a MAX_PENDING action array on the
     // small kernel stack. A concurrent new request can never match an old epoch.
     pub fn take_due(&mut self, now: u64) -> Option<Action> {
+        if self.pending_count == 0 {
+            return None;
+        }
         for i in 0..MAX_PENDING {
             let p = self.pending[i];
             if p.id == 0 {
@@ -817,6 +861,7 @@ mod tests {
     use std::{boxed::Box, vec};
     fn engine() -> Box<Engine> {
         let mut e = Box::new(Engine::new());
+        e.configure(2000, 60000, false); // Explicit short deadline for existing fixtures.
         assert!(e.attach(1, 101));
         assert!(e.restart(1));
         e.connect();
@@ -851,6 +896,193 @@ mod tests {
             _ => panic!("expected pending"),
         }
     }
+    #[test]
+    fn default_pending_deadline_is_eight_seconds() {
+        let mut e = Box::new(Engine::new());
+        assert!(e.attach(1, 101));
+        assert!(e.restart(1));
+        e.connect();
+        let k = key(&e, 1);
+        let id = submit(&mut e, k, 1);
+        assert!(e.take_due(2100).is_none());
+        assert!(e.take_due(8099).is_none());
+        assert!(e.verdict(id, Verdict::Accept, 8100).is_err());
+        assert_eq!(
+            e.take_due(8100),
+            Some(Action {
+                token: 1,
+                finish: Finish::Allow
+            })
+        );
+        assert_eq!(e.pending_count(), 0);
+    }
+
+    #[test]
+    fn one_cleanup_run_scans_all_candidate_interfaces_and_both_families() {
+        let mut e = engine();
+        assert!(e.attach(2, 102));
+        assert!(e.restart(2));
+        for adapter in [1, 2] {
+            for ipv6 in [false, true] {
+                for port in 0..1025 {
+                    let mut p = packet();
+                    p.flow.ipv6 = ipv6;
+                    p.connection.ipv6 = ipv6;
+                    p.flow.source_port = port;
+                    p.orient(NdisPath::Receive);
+                    let k = Key {
+                        adapter,
+                        epoch: e.epoch(adapter).unwrap(),
+                        flow: p.flow,
+                        ..Key::EMPTY
+                    };
+                    let Submission::Pending(id) = e.submit(k, p, 1, 0, 100, record(&p)) else {
+                        panic!()
+                    };
+                    e.verdict(id, Verdict::PermanentDrop, 101).unwrap();
+                    e.read(&mut [0; 512]);
+                }
+            }
+        }
+        let mut candidates = e.cache_candidates();
+        assert_eq!(candidates.count_ones(), 2);
+        let mut batches = 0;
+        while candidates != 0 {
+            let slot = candidates.trailing_zeros() as usize;
+            candidates &= candidates - 1;
+            let slots = e.cache_cleanup_slots(slot);
+            assert!(slots > crate::cache::CLEANUP_SLOTS_PER_BATCH);
+            for start in (0..slots).step_by(crate::cache::CLEANUP_SLOTS_PER_BATCH) {
+                let mut work = CacheWork::empty();
+                let active = e.clean_range_with_work(slot, start, 60101, &mut work);
+                drop(work);
+                batches += 1;
+                if !active {
+                    break;
+                }
+            }
+        }
+        assert!(batches > 2);
+        assert_eq!(e.cache_candidates(), 0);
+        assert_eq!(e.cache_counts(), (0, 0));
+        assert_eq!(e.cache_bytes(), 0);
+        assert_eq!(e.cache_cleanup_slots(MAX_ADAPTERS), 0);
+        assert!(!e.clean_range_with_work(MAX_ADAPTERS, 0, 60101, &mut CacheWork::empty()));
+    }
+
+    #[test]
+    fn pending_candidates_follow_verdict_timeout_cancel_and_invalidation() {
+        let mut e = engine();
+        assert_eq!(e.pending_count(), 0);
+        assert_eq!(e.cache_candidates(), 0);
+        assert!(e.take_due(u64::MAX).is_none());
+        let k = key(&e, 1);
+        let first = submit(&mut e, k, 1);
+        let second = submit(&mut e, k, 2);
+        assert_eq!(e.pending_count(), 2);
+        e.verdict(first, Verdict::Accept, 101).unwrap();
+        assert_eq!(e.pending_count(), 1);
+        assert!(e.verdict(first, Verdict::Accept, 101).is_err());
+        assert!(e.take_due(2099).is_none());
+        assert_eq!(e.take_due(2100).unwrap().token, 2);
+        assert_eq!(e.pending_count(), 0);
+        assert!(e.verdict(second, Verdict::Accept, 2100).is_err());
+        assert!(e.take_due(u64::MAX).is_none());
+        let send = Key {
+            path: NdisPath::Send,
+            ..k
+        };
+        submit(&mut e, send, 3);
+        assert_eq!(e.cancel(1, 42).unwrap().finish, Finish::Cancel);
+        assert_eq!(e.pending_count(), 0);
+        submit(&mut e, k, 4);
+        assert!(e.cancel(1, 42).is_none());
+        assert_eq!(e.pending_count(), 1);
+        e.invalidate(1, true);
+        assert_eq!(e.take_due(101).unwrap().finish, Finish::Drop);
+        assert_eq!(e.pending_count(), 0);
+        assert_eq!(e.cache_candidates(), 0);
+    }
+
+    #[test]
+    fn cache_candidates_track_nonempty_interfaces_and_expiry() {
+        let mut e = engine();
+        e.configure(2000, 1000, false);
+        assert!(e.attach(2, 102));
+        assert!(e.restart(2));
+        for adapter in [1, 2] {
+            let k = Key {
+                adapter,
+                epoch: e.epoch(adapter).unwrap(),
+                ..key(&e, 1)
+            };
+            let id = submit(&mut e, k, adapter as usize);
+            e.verdict(id, Verdict::PermanentDrop, 101).unwrap();
+        }
+        assert_eq!(e.pending_count(), 0);
+        assert_eq!(e.cache_candidates().count_ones(), 2);
+        e.invalidate(1, true);
+        assert_eq!(e.cache_candidates().count_ones(), 1);
+        for _ in 0..4 {
+            e.clean(1101);
+        }
+        assert_eq!(e.cache_candidates(), 0);
+        assert_eq!(e.cache_counts(), (0, 0));
+        assert_eq!(e.cache_bytes(), 0);
+        e.clean(u64::MAX);
+        assert_eq!(e.cache_candidates(), 0);
+    }
+
+    #[test]
+    fn pending_timeout_does_not_sweep_cache_entries() {
+        let mut e = engine();
+        e.configure(2000, 1000, false);
+        let k = key(&e, 1);
+        let id = submit(&mut e, k, 1);
+        e.verdict(id, Verdict::PermanentDrop, 101).unwrap();
+        let mut p = packet();
+        p.flow.source_port = 123;
+        p.orient(NdisPath::Receive);
+        let other = Key { flow: p.flow, ..k };
+        assert!(matches!(
+            e.submit(other, p, 2, 0, 100, record(&p)),
+            Submission::Pending(_)
+        ));
+        assert_eq!(e.take_due(3000).unwrap().token, 2);
+        assert!(e.take_due(3000).is_none());
+        assert_eq!(e.pending_count(), 0);
+        assert_eq!(e.cache_counts(), (1, 0));
+        assert_ne!(e.cache_candidates(), 0);
+        for _ in 0..4 {
+            e.clean(3000);
+        }
+        assert_eq!(e.cache_candidates(), 0);
+    }
+
+    #[test]
+    fn failed_cache_insertion_and_session_reset_disable_cache_candidates() {
+        let mut e = engine();
+        let k = key(&e, 1);
+        let id = submit(&mut e, k, 1);
+        e.verdict_with_work(id, Verdict::PermanentAccept, 101, &mut CacheWork::empty())
+            .unwrap();
+        assert_eq!(e.pending_count(), 0);
+        assert_eq!(e.cache_candidates(), 0);
+        assert_eq!(e.stats().cache_allocation_failures, 1);
+        let id = submit(&mut e, k, 2);
+        e.verdict(id, Verdict::PermanentAccept, 101).unwrap();
+        assert_ne!(e.cache_candidates(), 0);
+        e.clear_cache();
+        assert_eq!(e.cache_candidates(), 0);
+        let id = submit(&mut e, k, 3);
+        e.verdict(id, Verdict::PermanentAccept, 101).unwrap();
+        assert_ne!(e.cache_candidates(), 0);
+        e.disconnect();
+        assert_eq!(e.cache_candidates(), 0);
+        e.connect();
+        assert_eq!(e.cache_candidates(), 0);
+    }
+
     #[test]
     fn connection_indices_follow_each_adapter_across_paths_and_slot_reuse() {
         let mut e = engine();

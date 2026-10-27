@@ -223,7 +223,8 @@ int MonitorMain(int argc, wchar_t** argv) {
                 "TCP/UDP cache only: separate IPv4/IPv6 tables per host interface; key=local/remote IP+port.\n"
                 "TCP/UDP and both directions share matching normalized tuples.\n"
                 "Default cache TTL: 60 s; TCP/UDP PermanentAccept refreshes on matching cache hits; PermanentBlock/Drop use fixed TTL.\n"
-                "Pending timeout: 2 s by default, fail-open by default.\n"
+                "Pending timeout: 8 s by default, checked every 1 s while pending; fail-open by default.\n"
+                "Driver cache cleanup: full pass every 10 s while entries exist; no monitor cleanup polling.\n"
                 "Bandwidth: tx/rx=admitted guest outbound/inbound IP bytes, no PID; clean-ended only sweeps TTLs.\n"
                 "No synthetic END events; UpdateV4/UpdateV6 and redirects are unsupported.\n");
     if (!opt.send_verdicts) {
@@ -244,7 +245,7 @@ int MonitorMain(int argc, wchar_t** argv) {
         std::printf("Delaying %s by %u ms (no PID suspension).\n",
                     opt.match.present ? "matching automatic verdicts" : "each automatic verdict",
                     opt.verdict_delay_ms);
-        if (opt.verdict_delay_ms >= 2000) {
+        if (opt.verdict_delay_ms >= 8000) {
             std::printf("WARNING: delay reaches/exceeds the default pending timeout; verdicts may arrive too late.\n");
         }
     }
@@ -390,7 +391,6 @@ int MonitorMain(int argc, wchar_t** argv) {
     const ULONGLONG started = GetTickCount64();
     const ULONGLONG deadline = started + static_cast<ULONGLONG>(opt.duration_s) * 1000;
     ULONGLONG next_poll = started;
-    ULONGLONG next_cleanup = started + 30'000;
     auto poll = [&]() {
         const ULONGLONG now = GetTickCount64();
         const bool duration_elapsed = opt.duration_s != 0 && now >= deadline;
@@ -404,11 +404,6 @@ int MonitorMain(int argc, wchar_t** argv) {
         next_poll = now + opt.poll_ms;
         report_filtered_devices();
         std::string command_error;
-        if (now >= next_cleanup) {
-            if (!driver.RequestCleanEndedConnections(command_error))
-                Emit("[WARN] CleanEndedConnections failed: %s\n", command_error.c_str());
-            next_cleanup = now + 30'000;
-        }
         if (opt.memory_stats && !driver.RequestMemoryStats(command_error))
             Emit("[WARN] PrintMemoryStats failed: %s\n", command_error.c_str());
         if (!driver.RequestLogs(command_error))

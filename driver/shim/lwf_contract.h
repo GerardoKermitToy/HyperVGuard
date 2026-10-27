@@ -8,6 +8,9 @@
 #define HV_MAX_NB 64u
 #define HV_MAX_COPY_BYTES (256u * 1024u)
 #define HV_MAX_COPY_POOL_BYTES (16u * 1024u * 1024u)
+#define HV_DEFAULT_DECISION_TIMEOUT_MS 8000
+#define HV_PENDING_CHECK_MS 1000
+#define HV_CACHE_CHECK_MS 10000
 
 typedef enum _HV_FINISH_ROUTE {
     HvRouteSend,
@@ -25,6 +28,13 @@ static int HvSetFilterRunning(unsigned char* state, int running) {
     int previous = *state != 0;
     *state = (unsigned char)(running != 0);
     return (*state != 0) - previous;
+}
+// Caller serializes candidate transitions with the policy lock. Return +1 to
+// arm, -1 to cancel, or zero to leave a running/idle timer untouched.
+static int HvSetMaintenanceArmed(unsigned char* armed, int candidates) {
+    int previous = *armed != 0;
+    *armed = (unsigned char)(candidates != 0);
+    return (*armed != 0) - previous;
 }
 static int HvCopyFits(unsigned int count, unsigned int total, unsigned int length) {
     return count < HV_MAX_NB && length != 0 && total <= HV_MAX_COPY_BYTES &&

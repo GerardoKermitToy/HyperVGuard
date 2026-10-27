@@ -16,7 +16,7 @@ use core::{
     panic::PanicInfo,
 };
 use hyperv_policy::{
-    cache::{CacheAllocator, CacheWork},
+    cache::{CLEANUP_SLOTS_PER_BATCH, CacheAllocator, CacheWork},
     engine::{Action, Engine, Finish, Key, Submission, allocate_record},
     packet::{self, NdisPath, Packet, SNAPSHOT},
 };
@@ -34,7 +34,8 @@ unsafe extern "C" {
     fn hv_initialize(driver: Handle, registry: Handle) -> i32;
     fn hv_lock() -> usize;
     fn hv_unlock(irql: usize);
-    fn hv_read_state(ready: u32, online: u32);
+    fn hv_publish_state(ready: u32, online: u32, pending: u32, cached: u32);
+    fn hv_request_cache_cleanup();
     fn hv_now() -> u64;
     fn hv_allocate(size: usize) -> *mut u8;
     fn hv_free(data: *mut u8, size: usize);
@@ -93,9 +94,14 @@ fn with_state<R>(f: impl FnOnce(&mut Engine) -> R) -> R {
         let irql = hv_lock();
         let engine = &mut *STATE.0.get();
         let result = f(engine);
-        // Publish the level while still locked: a new read cannot miss enqueue,
-        // partial-read, timeout, or disconnect changes. This only schedules work.
-        hv_read_state(engine.has_events() as u32, engine.is_online() as u32);
+        // Publish read readiness and O(1) maintenance candidates while locked.
+        // Only level transitions arm/cancel timers; no NDIS calls occur here.
+        hv_publish_state(
+            engine.has_events() as u32,
+            engine.is_online() as u32,
+            (engine.pending_count() != 0) as u32,
+            (engine.cache_candidates() != 0) as u32,
+        );
         hv_unlock(irql);
         result
     }
@@ -170,13 +176,29 @@ pub extern "C" fn HvDetach(id: u64) {
 pub extern "C" fn HvDrain() {
     drain();
 }
+fn clean_caches() {
+    // Fixed cutoff and bounds finish a full pass without chasing new insertions.
+    // Migration only moves entries still live at a later time, so concurrent
+    // growth cannot hide an entry expired at this cutoff in its new table.
+    let now = unsafe { hv_now() };
+    let mut candidates = with_state(|e| e.cache_candidates());
+    while candidates != 0 {
+        let slot = candidates.trailing_zeros() as usize;
+        candidates &= candidates - 1;
+        let slots = with_state(|e| e.cache_cleanup_slots(slot));
+        for start in (0..slots).step_by(CLEANUP_SLOTS_PER_BATCH) {
+            let mut work = CacheWork::empty();
+            let active = with_state(|e| e.clean_range_with_work(slot, start, now, &mut work));
+            drop(work); // Retired buffers are always freed outside PolicyLock.
+            if !active {
+                break;
+            }
+        }
+    }
+}
 #[unsafe(no_mangle)]
-pub extern "C" fn HvTick() {
-    reclaim_caches();
-    let mut work = CacheWork::empty();
-    with_state(|e| e.clean_with_work(unsafe { hv_now() }, &mut work));
-    drop(work);
-    drain();
+pub extern "C" fn HvCleanCaches() {
+    clean_caches();
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn HvConnect() {
@@ -432,9 +454,10 @@ pub unsafe extern "C" fn HvWrite(data: *const u8, len: u32) -> i32 {
             Command::MemoryStats => with_state(|e| e.memory_stats()),
             Command::CleanEnded => {
                 reclaim_caches();
-                let mut work = CacheWork::empty();
-                with_state(|e| e.clean_with_work(unsafe { hv_now() }, &mut work));
-                drop(work);
+                if with_state(|e| e.cache_candidates() != 0) {
+                    // The shim coalesces explicit requests with periodic work.
+                    unsafe { hv_request_cache_cleanup() };
+                }
             }
         }
         rest = next;

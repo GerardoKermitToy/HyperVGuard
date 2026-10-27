@@ -69,6 +69,8 @@ if(NOT result STREQUAL "0" OR NOT output MATCHES "direction=0 outbound, 1 inboun
    NOT output MATCHES "never wait for driver startup" OR
    NOT output MATCHES "complete logical IP packet" OR
    NOT output MATCHES "up to 1 MiB, no truncation" OR
+   NOT output MATCHES "pending timeout defaults to 8 s" OR
+   NOT output MATCHES "Delays >= 8000 ms" OR
    NOT output MATCHES "Connection events carry no process/thread identity" OR
    output MATCHES "--filter-pid|PID=0|possibly shortened" OR
    output MATCHES "HyperVXNdisFilterPipe|Bridge:|winrpc|named-pipe" OR

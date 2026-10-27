@@ -39,6 +39,28 @@ int main() {
         CHECK(active == 0);
     }
 
+    CHECK(HV_DEFAULT_DECISION_TIMEOUT_MS == 8000);
+    CHECK(HV_PENDING_CHECK_MS == 1000);
+    CHECK(HV_CACHE_CHECK_MS == 10000);
+    unsigned char pending_timer = 0, cache_timer = 0;
+    CHECK(HvSetMaintenanceArmed(&pending_timer, 0) == 0);
+    CHECK(HvSetMaintenanceArmed(&cache_timer, 0) == 0);
+    CHECK(HvSetMaintenanceArmed(&pending_timer, 1) == 1);
+    CHECK(pending_timer == 1 && cache_timer == 0);
+    CHECK(HvSetMaintenanceArmed(&cache_timer, 1) == 1);
+    // Packet/candidate updates must not reset an already running timer.
+    for (unsigned i = 0; i < 1000; ++i) {
+        CHECK(HvSetMaintenanceArmed(&pending_timer, 1) == 0);
+        CHECK(HvSetMaintenanceArmed(&cache_timer, 1) == 0);
+    }
+    CHECK(HvSetMaintenanceArmed(&pending_timer, 0) == -1);
+    CHECK(pending_timer == 0 && cache_timer == 1);
+    CHECK(HvSetMaintenanceArmed(&pending_timer, 0) == 0);
+    CHECK(HvSetMaintenanceArmed(&cache_timer, 0) == -1);
+    CHECK(HvSetMaintenanceArmed(&cache_timer, 0) == 0);
+    CHECK(HvSetMaintenanceArmed(&pending_timer, 1) == 1);
+    CHECK(HvSetMaintenanceArmed(&pending_timer, 0) == -1);
+
     CHECK(HvCopyFits(0, 0, 1));
     CHECK(HvCopyFits(HV_MAX_NB - 1, 0, HV_MAX_COPY_BYTES));
     CHECK(!HvCopyFits(HV_MAX_NB, 0, 1));
@@ -61,6 +83,6 @@ int main() {
     }
     CHECK(HvFinishRoute(HV_DIRECTION_RECEIVE, 0, 0) == HvRouteReturnReceive);
     CHECK(HvFinishRoute(HV_DIRECTION_RECEIVE, 1, 0) == HvRouteFreeReceive);
-    std::puts("PASS LWF target gate, running-device transitions, copy bounds and ownership routes");
+    std::puts("PASS LWF target gate, running/maintenance transitions, copy bounds and ownership routes");
     return 0;
 }

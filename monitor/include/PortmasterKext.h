@@ -232,11 +232,12 @@ public:
     // growing IPv4/IPv6 tables per interface; key=local/remote IP+port only.
     // TCP/UDP and both directions share matching tuples; OOM skips insertion.
     // Default TTL is 60 seconds: PermanentAccept hits refresh it; Block/Drop do not.
-    // Pending verdict timeout is 2 seconds by default, with fail-open behavior.
+    // Pending verdict timeout is 8 seconds by default, with fail-open behavior.
     bool SendVerdict(uint64_t id, Verdict verdict, std::string& error);
     bool RequestLogs(std::string& error);
     bool RequestBandwidthStats(std::string& error);
     bool RequestMemoryStats(std::string& error);
+    // Requests a full asynchronous expiry sweep; it does not migrate tables.
     bool RequestCleanEndedConnections(std::string& error);
     bool RequestClearCache(std::string& error);
 

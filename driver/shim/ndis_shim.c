@@ -47,7 +47,7 @@ extern ULONG HvRestart(UINT64);
 extern void HvInvalidate(UINT64, ULONG);
 extern void HvDetach(UINT64);
 extern void HvDrain(void);
-extern void HvTick(void);
+extern void HvCleanCaches(void);
 extern void HvConnect(void);
 extern void HvDisconnect(void);
 extern void HvCancel(UINT64, ULONG_PTR);
@@ -69,8 +69,9 @@ static ULONG AdapterCount;
 static FAST_MUTEX IoMutex;
 static PFILE_OBJECT Client;
 static volatile LONG Stopping;
-static KTIMER Timer;
-static KDPC TimerDpc;
+static KTIMER PendingTimer, CacheTimer;
+static KDPC PendingTimerDpc, CacheTimerDpc;
+static UCHAR PendingTimerArmed, CacheTimerArmed;
 static volatile LONG64 NextAdapter;
 static volatile LONG64 EventPoolBytes;
 static volatile LONG FilteredDeviceCount;
@@ -103,9 +104,10 @@ static IO_CSQ ReadCsq;
 static LIST_ENTRY ReadIrps;
 static KSPIN_LOCK ReadLock;
 static PFILE_OBJECT ReadClient;
-static EX_RUNDOWN_REF ReadRundown;
-static PIO_WORKITEM ReadWorkItem;
+static EX_RUNDOWN_REF ReadRundown, CacheRundown;
+static PIO_WORKITEM ReadWorkItem, CacheWorkItem;
 static volatile LONG ReadPending, ReadReady, ReadOnline, ReadScheduled;
+static volatile LONG CacheScheduled;
 static IO_CSQ_INSERT_IRP_EX ReadInsert;
 static IO_CSQ_REMOVE_IRP ReadRemove;
 static IO_CSQ_PEEK_NEXT_IRP ReadPeek;
@@ -113,6 +115,7 @@ static IO_CSQ_ACQUIRE_LOCK HvReadQueueAcquire;
 static IO_CSQ_RELEASE_LOCK HvReadQueueRelease;
 static IO_CSQ_COMPLETE_CANCELED_IRP ReadCancelled;
 static IO_WORKITEM_ROUTINE ReadWorker;
+static IO_WORKITEM_ROUTINE CacheWorker;
 
 static void CompleteRead(PIRP irp, NTSTATUS status, ULONG bytes) {
     irp->IoStatus.Status = status;
@@ -175,10 +178,39 @@ static void ScheduleRead(void) {
         IoQueueWorkItem(ReadWorkItem, ReadWorker, DelayedWorkQueue, NULL);
     else ExReleaseRundownProtection(&ReadRundown);
 }
-// Called only with PolicyLock held. No copying, completion, or NDIS calls here.
-void hv_read_state(ULONG ready, ULONG online) {
+// Coalesce timer and explicit requests; only one full cache pass may run.
+void hv_request_cache_cleanup(void) {
+    if (Stopping || CacheWorkItem == NULL) return;
+    if (!ExAcquireRundownProtection(&CacheRundown)) return;
+    if (InterlockedCompareExchange(&CacheScheduled, 1, 0) == 0)
+        IoQueueWorkItem(CacheWorkItem, CacheWorker, DelayedWorkQueue, NULL);
+    else ExReleaseRundownProtection(&CacheRundown);
+}
+_Use_decl_annotations_
+static void CacheWorker(PDEVICE_OBJECT device, PVOID context) {
+    UNREFERENCED_PARAMETER(device); UNREFERENCED_PARAMETER(context);
+    if (!Stopping) HvCleanCaches();
+    InterlockedExchange(&CacheScheduled, 0);
+    ExReleaseRundownProtection(&CacheRundown);
+}
+static void UpdateMaintenanceTimer(PKTIMER timer, PKDPC dpc, UCHAR* armed,
+    LONG interval, BOOLEAN candidates) {
+    int transition = HvSetMaintenanceArmed(armed, !Stopping && candidates);
+    if (transition > 0) {
+        LARGE_INTEGER due;
+        due.QuadPart = -(LONGLONG)interval * 10000;
+        KeSetTimerEx(timer, due, interval, dpc);
+    } else if (transition < 0) KeCancelTimer(timer);
+}
+// Called only with PolicyLock held. Constant-time candidate publication; timers
+// start/stop only on transitions, never reset on each packet or cache hit.
+void hv_publish_state(ULONG ready, ULONG online, ULONG pending, ULONG cached) {
     if (ReadReady != (LONG)ready) InterlockedExchange(&ReadReady, (LONG)ready);
     if (ReadOnline != (LONG)online) InterlockedExchange(&ReadOnline, (LONG)online);
+    UpdateMaintenanceTimer(&PendingTimer, &PendingTimerDpc, &PendingTimerArmed,
+        HV_PENDING_CHECK_MS, pending != 0);
+    UpdateMaintenanceTimer(&CacheTimer, &CacheTimerDpc, &CacheTimerArmed,
+        HV_CACHE_CHECK_MS, cached != 0);
     ScheduleRead();
 }
 _Use_decl_annotations_
@@ -909,9 +941,15 @@ NTSTATUS HvDispatch(PDEVICE_OBJECT device, PIRP irp) {
     irp->IoStatus.Status = status; irp->IoStatus.Information = transferred;
     IoCompleteRequest(irp, IO_NO_INCREMENT); return status;
 }
-static VOID TickDpc(PKDPC dpc, PVOID context, PVOID arg1, PVOID arg2) {
+static VOID PendingDpc(PKDPC dpc, PVOID context, PVOID arg1, PVOID arg2) {
     UNREFERENCED_PARAMETER(dpc); UNREFERENCED_PARAMETER(context);
-    UNREFERENCED_PARAMETER(arg1); UNREFERENCED_PARAMETER(arg2); HvTick();
+    UNREFERENCED_PARAMETER(arg1); UNREFERENCED_PARAMETER(arg2);
+    if (!Stopping) HvDrain();
+}
+static VOID CacheDpc(PKDPC dpc, PVOID context, PVOID arg1, PVOID arg2) {
+    UNREFERENCED_PARAMETER(dpc); UNREFERENCED_PARAMETER(context);
+    UNREFERENCED_PARAMETER(arg1); UNREFERENCED_PARAMETER(arg2);
+    hv_request_cache_cleanup();
 }
 static ULONG ReadDword(HANDLE key, PCWSTR name, ULONG fallback) {
     UNICODE_STRING value;
@@ -968,7 +1006,7 @@ static void ReadConfiguration(PUNICODE_STRING registry) {
     if (!NT_SUCCESS(ZwOpenKey(&service, KEY_READ, &attributes))) return;
     InitializeObjectAttributes(&attributes, &name, OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, service, NULL);
     if (NT_SUCCESS(ZwOpenKey(&parameters, KEY_READ, &attributes))) {
-        HvConfigure(ReadDword(parameters,L"DecisionTimeoutMs",2000),
+        HvConfigure(ReadDword(parameters,L"DecisionTimeoutMs",HV_DEFAULT_DECISION_TIMEOUT_MS),
             ReadDword(parameters,L"CacheTtlMs",60000), ReadDword(parameters,L"FailClosed",0));
         ZwClose(parameters);
     }
@@ -1021,11 +1059,13 @@ NTSTATUS hv_initialize(PDRIVER_OBJECT driver, PUNICODE_STRING registry) {
     NDIS_STRING link = RTL_CONSTANT_STRING(L"\\DosDevices\\HyperVXNdisFilter");
     UNICODE_STRING sddl = RTL_CONSTANT_STRING(L"D:P(A;;GA;;;SY)(A;;GA;;;BA)");
     NDIS_STATUS status;
-    LARGE_INTEGER due;
     KeInitializeSpinLock(&PolicyLock); ExInitializeFastMutex(&IoMutex);
+    KeInitializeTimer(&PendingTimer); KeInitializeDpc(&PendingTimerDpc, PendingDpc, NULL);
+    KeInitializeTimer(&CacheTimer); KeInitializeDpc(&CacheTimerDpc, CacheDpc, NULL);
     KeInitializeSpinLock(&AdapterInfoLock); InitializeListHead(&Adapters);
     KeInitializeSpinLock(&ReadLock); InitializeListHead(&ReadIrps);
     ExInitializeRundownProtection(&ReadRundown);
+    ExInitializeRundownProtection(&CacheRundown);
     status = IoCsqInitializeEx(&ReadCsq, ReadInsert, ReadRemove, ReadPeek,
         HvReadQueueAcquire, HvReadQueueRelease, ReadCancelled);
     if (!NT_SUCCESS(status)) return status;
@@ -1058,15 +1098,16 @@ NTSTATUS hv_initialize(PDRIVER_OBJECT driver, PUNICODE_STRING registry) {
     status = NdisRegisterDeviceEx(DriverHandle, &attributes, &ControlDevice, &DeviceHandle);
     if (status != NDIS_STATUS_SUCCESS) {NdisFDeregisterFilterDriver(DriverHandle); DriverHandle = NULL; return status;}
     ReadWorkItem = IoAllocateWorkItem(ControlDevice);
-    if (ReadWorkItem == NULL) {
+    CacheWorkItem = IoAllocateWorkItem(ControlDevice);
+    if (ReadWorkItem == NULL || CacheWorkItem == NULL) {
+        if (ReadWorkItem != NULL) {IoFreeWorkItem(ReadWorkItem); ReadWorkItem = NULL;}
+        if (CacheWorkItem != NULL) {IoFreeWorkItem(CacheWorkItem); CacheWorkItem = NULL;}
         NdisDeregisterDeviceEx(DeviceHandle); NdisFDeregisterFilterDriver(DriverHandle);
         DriverHandle = NULL; return STATUS_INSUFFICIENT_RESOURCES;
     }
     ScheduleRead();
     ControlDevice->Flags |= DO_BUFFERED_IO;
     ControlDevice->Flags &= ~DO_DEVICE_INITIALIZING;
-    KeInitializeTimer(&Timer); KeInitializeDpc(&TimerDpc, TickDpc, NULL);
-    due.QuadPart = -500000; KeSetTimerEx(&Timer, due, 50, &TimerDpc);
     SignalDriverReady(); // Publish only after the control device and timer are ready.
     return STATUS_SUCCESS;
 }
@@ -1077,9 +1118,11 @@ void HvUnload(PDRIVER_OBJECT driver) {
     ExAcquireFastMutex(&IoMutex); InterlockedExchange(&Stopping, TRUE);
     SetReadClient(NULL); HvDisconnect(); Client = NULL; ExReleaseFastMutex(&IoMutex);
     CancelReads(NULL);
+    KeCancelTimer(&PendingTimer); KeCancelTimer(&CacheTimer); KeFlushQueuedDpcs();
     ExWaitForRundownProtectionRelease(&ReadRundown);
+    ExWaitForRundownProtectionRelease(&CacheRundown);
     IoFreeWorkItem(ReadWorkItem); ReadWorkItem = NULL;
-    KeCancelTimer(&Timer); KeFlushQueuedDpcs();
+    IoFreeWorkItem(CacheWorkItem); CacheWorkItem = NULL;
     NdisFDeregisterFilterDriver(DriverHandle);
     NdisDeregisterDeviceEx(DeviceHandle);
     if (ReadyEvent != NULL) {ObDereferenceObject(ReadyEvent); ReadyEvent = NULL;}

@@ -4,6 +4,7 @@ use hyperv_protocol::Connection;
 
 const INITIAL_CAPACITY: usize = 128;
 const WORK_PER_PASS: usize = 32;
+pub const CLEANUP_SLOTS_PER_BATCH: usize = 256;
 #[path = "cache/group.rs"]
 mod group;
 use group::{Group, WIDTH as GROUP_WIDTH};
@@ -369,7 +370,6 @@ struct Cache<const N: usize> {
     current: Table<N>,
     previous: Table<N>,
     migrate: usize,
-    sweep: usize,
 }
 impl<const N: usize> Cache<N> {
     const fn new() -> Self {
@@ -377,7 +377,6 @@ impl<const N: usize> Cache<N> {
             current: Table::new(),
             previous: Table::new(),
             migrate: 0,
-            sweep: 0,
         }
     }
     fn len(&self) -> usize {
@@ -454,7 +453,6 @@ impl<const N: usize> Cache<N> {
                     };
                     self.previous = mem::replace(&mut self.current, new);
                     self.migrate = 0;
-                    self.sweep = 0;
                 }
             }
         }
@@ -465,10 +463,10 @@ impl<const N: usize> Cache<N> {
             && self.len() < capacity / 4 * 3
             && self.current.used < capacity / 4 * 3
             && self.current.insert(entry, hash);
-        self.maintain(now, work);
+        self.migrate(now, work);
         inserted
     }
-    fn maintain(&mut self, now: u64, work: &mut CacheWork) {
+    fn migrate(&mut self, now: u64, work: &mut CacheWork) {
         let end = self
             .migrate
             .saturating_add(WORK_PER_PASS)
@@ -491,19 +489,41 @@ impl<const N: usize> Cache<N> {
             self.previous.retire(work);
             self.migrate = 0;
         }
-        let capacity = self.current.capacity;
-        if capacity != 0 {
-            for _ in 0..WORK_PER_PASS.min(capacity) {
-                let index = self.sweep;
-                if self.current.is_full(index) && self.current.entry(index).expires <= now {
-                    self.current.remove(index);
+    }
+    fn cleanup_slots(&self) -> usize {
+        self.current.capacity.max(self.previous.capacity)
+    }
+    fn maintain_range(&mut self, start: usize, now: u64, work: &mut CacheWork) {
+        // Scan control groups, reading expiry only for initialized entries. The
+        // caller releases PolicyLock between ranges, not between timer ticks.
+        for table in [&mut self.current, &mut self.previous] {
+            let end = start
+                .saturating_add(CLEANUP_SLOTS_PER_BATCH)
+                .min(table.capacity);
+            for base in (start..end).step_by(GROUP_WIDTH) {
+                let width = (end - base).min(GROUP_WIDTH);
+                let mut occupied = !table.group(base).available() & ((1u32 << width) - 1);
+                while occupied != 0 {
+                    let index = base + occupied.trailing_zeros() as usize;
+                    if table.entry(index).expires <= now {
+                        table.remove(index);
+                    }
+                    occupied &= occupied - 1;
                 }
-                self.sweep = (index + 1) & (capacity - 1);
             }
-            if self.len() == 0 {
-                self.current.retire(work);
-                self.sweep = 0;
-            }
+        }
+        if self.previous.len == 0 {
+            self.previous.retire(work);
+            self.migrate = 0;
+        }
+        // Keep a destination for insertion-side migration while old entries live.
+        if self.current.len == 0 && self.previous.capacity == 0 {
+            self.current.retire(work);
+        }
+    }
+    fn maintain(&mut self, now: u64, work: &mut CacheWork) {
+        for start in (0..self.cleanup_slots()).step_by(CLEANUP_SLOTS_PER_BATCH) {
+            self.maintain_range(start, now, work);
         }
     }
     fn bytes(&self) -> usize {
@@ -615,9 +635,19 @@ impl Caches {
             )
         }
     }
+    pub(crate) fn cleanup_slots(&self) -> usize {
+        self.ipv4.cleanup_slots().max(self.ipv6.cleanup_slots())
+    }
+    pub(crate) fn maintain_range(&mut self, start: usize, now: u64, work: &mut CacheWork) {
+        self.ipv4.maintain_range(start, now, work);
+        self.ipv6.maintain_range(start, now, work);
+    }
     pub(crate) fn maintain(&mut self, now: u64, work: &mut CacheWork) {
         self.ipv4.maintain(now, work);
         self.ipv6.maintain(now, work);
+    }
+    pub(crate) fn has_entries(&self) -> bool {
+        self.ipv4.len() != 0 || self.ipv6.len() != 0
     }
     pub fn counts(&self) -> (usize, usize) {
         (self.ipv4.len(), self.ipv6.len())

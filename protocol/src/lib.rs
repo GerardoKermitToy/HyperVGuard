@@ -76,6 +76,7 @@ pub enum Command {
     GetLogs,
     GetBandwidth,
     MemoryStats,
+    // Requests a full asynchronous cache-expiry sweep, never table migration.
     CleanEnded,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
