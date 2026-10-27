@@ -257,8 +257,11 @@ pub fn parse(
                 if tcp_len < 20 || transport + tcp_len > ip_len {
                     return Err(ParseError::Malformed);
                 }
-            } else if be16(ip, transport + 4) < 8 && !offload {
-                return Err(ParseError::Malformed);
+            } else {
+                let udp_len = usize::from(be16(ip, transport + 4));
+                if udp_len < 8 || (!offload && udp_len > ip_len.saturating_sub(transport)) {
+                    return Err(ParseError::Malformed);
+                }
             }
             p.flow.source_port = be16(ip, transport);
             p.flow.destination_port = be16(ip, transport + 2);
@@ -468,6 +471,9 @@ mod tests {
         b = udp();
         b[38..40].copy_from_slice(&1u16.to_be_bytes());
         assert!(parse(&b, 64, 64, false).is_err());
+        b = udp();
+        b[38..40].copy_from_slice(&100u16.to_be_bytes());
+        assert_eq!(parse(&b, 64, 64, false).unwrap_err(), ParseError::Malformed);
         b = udp();
         b[16..18].copy_from_slice(&100u16.to_be_bytes());
         assert!(parse(&b, 64, 64, false).is_err());
