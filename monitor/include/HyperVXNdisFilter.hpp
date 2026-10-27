@@ -38,6 +38,7 @@ public:
     // Four permanent caches per interface: TCP/UDP, each IPv4/IPv6; key=IP+port tuple.
     // TCP/UDP stay separate; both directions share normalized tuples within one table.
     // PermanentAccept hits refresh idle TTL; PermanentBlock/Drop keep fixed TTL.
+    // Driver fallback defaults to drop without a controller or on an unanswered 8 s deadline.
     enum class Verdict : uint8_t { Accept = 2, PermanentAccept, Block, PermanentBlock, Drop, PermanentDrop };
     enum class Command : uint8_t { ClearCache = 4, GetLogs, GetBandwidthStats, PrintMemoryStats, CleanEndedConnections };
 

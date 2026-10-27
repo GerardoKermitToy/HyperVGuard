@@ -1004,7 +1004,7 @@ static void ReadConfiguration(PUNICODE_STRING registry) {
     InitializeObjectAttributes(&attributes, &name, OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, service, NULL);
     if (NT_SUCCESS(ZwOpenKey(&parameters, KEY_READ, &attributes))) {
         HvConfigure(ReadDword(parameters,L"DecisionTimeoutMs",HV_DEFAULT_DECISION_TIMEOUT_MS),
-            ReadDword(parameters,L"CacheTtlMs",60000), ReadDword(parameters,L"FailClosed",0));
+            ReadDword(parameters,L"CacheTtlMs",60000), ReadDword(parameters,L"FailClosed",HV_DEFAULT_FAIL_CLOSED));
         ZwClose(parameters);
     }
     ZwClose(service);

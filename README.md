@@ -26,7 +26,7 @@ The separate [offline cache lookup benchmark](policy/examples/README.md) compare
 
 ## Install
 
-Use an **elevated Administrator/SYSTEM console**, stop the monitor, and have local recovery access: network reconfiguration may interrupt connectivity. If already installed, use `Uninstall.exe` first; the installer does not replace a live driver.
+Use an **elevated Administrator/SYSTEM console**, stop the monitor, and have local recovery access: network reconfiguration may interrupt connectivity. **The running filter is fail-closed by default: target-interface IP traffic is dropped while no userspace controller is connected.** If already installed, use `Uninstall.exe` first; the installer does not replace a live driver.
 
 ```bash
 ./dist/Install.exe
@@ -76,7 +76,7 @@ Each `[CONN v4]` / `[CONN v6]` header prints `interface_index=N` immediately aft
 
 `--match` selects the remote endpoint in both directions; unmatched events receive PermanentAccept. `--filter-ip` only filters output, not verdicts. A blocking verdict without `--match` applies to every event and can disconnect the host-vNIC path.
 
-The monitor never installs, unbinds, or uninstalls the filter. Exiting closes the policy session; the LWF remains installed and bound. Use `--help` for all options without opening the device.
+The monitor never installs, unbinds, or uninstalls the filter. Exiting closes the policy session; the LWF remains installed and bound and drops target-interface IP traffic by default until a controller reconnects. Use `--help` for all options without opening the device.
 
 ## Remove
 
@@ -294,7 +294,7 @@ IP arrays contain network-order address bytes. IPv4 uses the first four bytes; t
 
 No TCP RST or ICMP rejection is generated. `Undecided=0`, `Undeterminable=1`, `RedirectNameServer=8`, `RedirectTunnel=9`, `Failed=10`, and `RedirectSplitTunnel=11` are not accepted as verdicts.
 
-Pending decisions have a **8000 ms default deadline**, measured from classification, not from when an application reads the event. The driver checks timeouts every **1 second only while pending NBLs exist**, so fallback may run up to roughly one additional check interval after the deadline, plus DPC scheduling delay. Verdicts are still checked against the actual deadline and applied immediately when valid; they do not wait for the timer. The default fallback is **fail-open** on missing controller, disconnect/shutdown, timeout, or policy queue pressure. Pause/invalidated attachments, malformed packets, unsupported copy metadata, and unsafe ownership/copy-allocation cases can still be dropped regardless of fail-open.
+Pending decisions have a **8000 ms default deadline**, measured from classification, not from when an application reads the event. The driver checks timeouts every **1 second only while pending NBLs exist**, so fallback may run up to roughly one additional check interval after the deadline, plus DPC scheduling delay. Verdicts are still checked against the actual deadline and applied immediately when valid; they do not wait for the timer. The default fallback is **fail-closed (drop)** on missing controller, disconnect/shutdown, timeout, or policy/event-allocation pressure. Without a controller, IP packets are dropped immediately; with a controller online, an uncached packet waits for a userspace verdict until its deadline and is dropped if unanswered. A valid cached PermanentAccept is still an explicit userspace decision and may admit matching traffic while that session remains online. Disconnect/shutdown clears those cached decisions. Non-IP control-frame bypass is unchanged. Pause/invalidated attachments, malformed packets, unsupported copy metadata, and unsafe ownership/copy-allocation cases always drop, even if fail-open is explicitly configured.
 
 A permanent decision is a **TTL cache entry for TCP/UDP only**, not lifetime socket permission. **Every host `interface_index` has four independent, dynamically growing hash tables: TCP/IPv4, UDP/IPv4, TCP/IPv6, and UDP/IPv6.** There is no configured maximum entry count and no capacity-driven eviction of live decisions. Other IP protocols (including ICMP/ICMPv6) never create or use permanent entries: a permanent verdict applies only to that NBL, and the next packet still needs a decision.
 
@@ -316,7 +316,7 @@ Fragments, offloaded/incomplete transport headers, and multi-NB batches cannot s
 
 Pending policy context identifies its NDIS interface **only by `interface_index`**; verdict processing stores or checks no adapter/module ID, epoch, path, or VLAN. Each attached index must be nonzero and unique. Pause/detach explicitly invalidates existing pending IDs for that index before draining their tokens, so restarting or reusing the index cannot revive an old request. The opaque C-shim token retains the original NBL owner and send/receive completion route; that ownership metadata is not a verdict identity or cache guard. Send cancellation uses an optional cancellation ID scoped to the interface; receive tokens are not send-cancellable. Diagnostic `module_id` remains available in adapter snapshots only.
 
-Optional service `Parameters` values, all `REG_DWORD`, are read when the SYS loads: `DecisionTimeoutMs=8000` (clamped to 100–60000), `CacheTtlMs=60000` (1000–300000), and `FailClosed=0` (nonzero changes the controller/timeout/queue fallback to drop). These are driver configuration, not protocol commands.
+Optional service `Parameters` values, all `REG_DWORD`, are read when the SYS loads: `DecisionTimeoutMs=8000` (clamped to 100–60000), `CacheTtlMs=60000` (1000–300000), and `FailClosed=1` (the default; an explicit `0` opts into fail-open for controller/timeout/queue fallback). These are driver configuration, not protocol commands.
 
 Late, duplicate, unknown, cancelled, or already-completed IDs are harmless no-ops: a successful verdict write is **not an acknowledgement that the NBL still existed**. Such writes do not create cache entries. There is no per-verdict response record.
 

@@ -70,6 +70,9 @@ if(NOT result STREQUAL "0" OR NOT output MATCHES "direction=0 outbound, 1 inboun
    NOT output MATCHES "complete logical IP packet" OR
    NOT output MATCHES "up to 1 MiB, no truncation" OR
    NOT output MATCHES "pending timeout defaults to 8 s" OR
+   NOT output MATCHES "fail-closed by default" OR
+   NOT output MATCHES "unanswered packets are dropped" OR
+   output MATCHES "fail-open by default" OR
    NOT output MATCHES "Delays >= 8000 ms" OR
    NOT output MATCHES "four tables per interface" OR
    NOT output MATCHES "TCP and UDP use separate caches" OR

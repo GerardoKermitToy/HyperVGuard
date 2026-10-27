@@ -191,7 +191,7 @@ impl Engine {
             queued_bytes: 0,
             next_id: 1,
             online: false,
-            fail_closed: false,
+            fail_closed: true,
             timeout: 8000,
             cache_ttl: 60000,
             stats: Stats::EMPTY,
@@ -823,8 +823,12 @@ mod tests {
     use crate::packet::NdisPath;
     use std::{boxed::Box, vec};
     fn engine() -> Box<Engine> {
+        let mut e = default_engine();
+        e.configure(2000, 60000, false); // Explicit fail-open/short deadline for these fixtures.
+        e
+    }
+    fn default_engine() -> Box<Engine> {
         let mut e = Box::new(Engine::new());
-        e.configure(2000, 60000, false); // Explicit short deadline for existing fixtures.
         assert!(e.attach(101));
         assert!(e.restart(101));
         e.connect();
@@ -850,16 +854,188 @@ mod tests {
         }
     }
     #[test]
-    fn default_pending_deadline_is_eight_seconds() {
-        let mut e = Box::new(Engine::new());
-        assert!(e.attach(101));
-        assert!(e.restart(101));
-        e.connect();
-        let k = 101;
-        let id = submit(&mut e, k, 1);
+    fn default_pending_deadline_is_eight_seconds_and_drops_unanswered_packets() {
+        let mut e = default_engine();
+        let id = submit(&mut e, 101, 1);
         assert!(e.take_due(2100).is_none());
         assert!(e.take_due(8099).is_none());
-        assert!(e.verdict(id, Verdict::Accept, 8100).is_err());
+        assert!(e.verdict(id, Verdict::PermanentAccept, 8100).is_err());
+        assert!(e.cache_plan(id, Verdict::PermanentAccept, 8100).is_none());
+        assert_eq!(
+            e.take_due(8100),
+            Some(Action {
+                token: 1,
+                finish: Finish::Drop
+            })
+        );
+        assert_eq!(e.pending_count(), 0);
+        assert_eq!(e.cache_counts(), (0, 0));
+        assert_eq!(e.stats().timeouts, 1);
+    }
+
+    #[test]
+    fn default_fallback_drops_ip_traffic_without_a_controller() {
+        let mut e = Box::new(Engine::new());
+        assert_eq!(e.fallback(), Finish::Drop);
+        assert!(e.attach(101));
+        assert!(e.restart(101));
+        for ipv6 in [false, true] {
+            for protocol in [1, 6, 17, 58] {
+                for path in [NdisPath::Send, NdisPath::Receive] {
+                    let mut p = packet();
+                    p.flow.ipv6 = ipv6;
+                    p.connection.ipv6 = ipv6;
+                    p.flow.protocol = protocol;
+                    p.connection.protocol = protocol;
+                    p.orient(path);
+                    assert!(!e.wants_event(101, &p, 100));
+                    assert_eq!(
+                        e.preflight(101, &p, 1, 100),
+                        Err(Action {
+                            token: 1,
+                            finish: Finish::Drop
+                        })
+                    );
+                    assert_eq!(
+                        e.submit(101, p, 2, None, 100, None),
+                        Submission::Finish(Action {
+                            token: 2,
+                            finish: Finish::Drop
+                        })
+                    );
+                }
+            }
+        }
+        assert_eq!(e.pending_count(), 0);
+        assert!(!e.has_events());
+        assert_eq!(e.stats().allowed, 0);
+    }
+
+    #[test]
+    fn default_disconnect_drops_pending_and_clears_prior_allow_cache() {
+        let mut e = default_engine();
+        let id = submit(&mut e, 101, 1);
+        e.verdict(id, Verdict::PermanentAccept, 101).unwrap();
+        assert_eq!(
+            e.preflight(101, &packet(), 1, 102),
+            Err(Action {
+                token: 1,
+                finish: Finish::Allow
+            })
+        );
+        let mut p = packet();
+        p.flow.source_port = 12345;
+        p.orient(NdisPath::Receive);
+        let Submission::Pending(pending) = e.submit(101, p, 2, None, 102, record(&p)) else {
+            panic!()
+        };
+        e.disconnect();
+        assert_eq!(e.cache_counts(), (0, 0));
+        assert!(!e.has_events());
+        assert!(e.verdict(pending, Verdict::PermanentAccept, 103).is_err());
+        assert_eq!(
+            e.take_due(103),
+            Some(Action {
+                token: 2,
+                finish: Finish::Drop
+            })
+        );
+        assert_eq!(
+            e.submit(101, packet(), 3, None, 103, None),
+            Submission::Finish(Action {
+                token: 3,
+                finish: Finish::Drop
+            })
+        );
+        assert_eq!(e.pending_count(), 0);
+        e.connect();
+        assert!(e.wants_event(101, &packet(), 104));
+    }
+
+    #[test]
+    fn default_queue_and_capture_pressure_drop_without_losing_tokens() {
+        let mut e = default_engine();
+        assert_eq!(
+            e.submit(101, packet(), 1, None, 100, None),
+            Submission::Finish(Action {
+                token: 1,
+                finish: Finish::Drop
+            })
+        );
+        assert_eq!(e.pending_count(), 0);
+        for token in 1..=MAX_PENDING {
+            submit(&mut e, 101, token);
+        }
+        assert_eq!(
+            e.submit(101, packet(), 999, None, 100, record(&packet())),
+            Submission::Finish(Action {
+                token: 999,
+                finish: Finish::Drop
+            })
+        );
+        assert_eq!(e.pending_count(), MAX_PENDING);
+        let mut count = 0;
+        while let Some(action) = e.take_due(8100) {
+            assert_eq!(action.finish, Finish::Drop);
+            count += 1;
+        }
+        assert_eq!(count, MAX_PENDING);
+        assert_eq!(e.pending_count(), 0);
+        assert_eq!(e.stats().overflow, 2);
+        assert_eq!(e.stats().allowed, 0);
+        assert_eq!(e.stats().dropped, MAX_PENDING as u64 + 2);
+    }
+
+    #[test]
+    fn default_fail_closed_applies_timely_userspace_verdicts() {
+        for verdict in [
+            Verdict::Accept,
+            Verdict::PermanentAccept,
+            Verdict::Block,
+            Verdict::PermanentBlock,
+            Verdict::Drop,
+            Verdict::PermanentDrop,
+        ] {
+            let mut e = default_engine();
+            assert_eq!(e.fallback(), Finish::Drop);
+            let id = submit(&mut e, 101, 1);
+            assert_eq!(
+                e.verdict(id, verdict, 8099),
+                Ok(Action {
+                    token: 1,
+                    finish: if verdict.allows() {
+                        Finish::Allow
+                    } else {
+                        Finish::Drop
+                    },
+                })
+            );
+            assert_eq!(e.pending_count(), 0);
+            if verdict.permanent() {
+                assert_eq!(
+                    e.preflight(101, &packet(), 2, 8100),
+                    Err(Action {
+                        token: 2,
+                        finish: if verdict.allows() {
+                            Finish::Allow
+                        } else {
+                            Finish::Drop
+                        },
+                    })
+                );
+            } else {
+                assert!(e.wants_event(101, &packet(), 8100));
+            }
+        }
+    }
+
+    #[test]
+    fn fail_open_requires_an_explicit_configuration_override() {
+        let mut e = default_engine();
+        assert_eq!(e.fallback(), Finish::Drop);
+        e.configure(8000, 60000, false);
+        assert_eq!(e.fallback(), Finish::Allow);
+        let id = submit(&mut e, 101, 1);
         assert_eq!(
             e.take_due(8100),
             Some(Action {
@@ -867,7 +1043,24 @@ mod tests {
                 finish: Finish::Allow
             })
         );
-        assert_eq!(e.pending_count(), 0);
+        assert!(e.verdict(id, Verdict::PermanentAccept, 8100).is_err());
+        submit(&mut e, 101, 2);
+        e.disconnect();
+        assert_eq!(
+            e.take_due(101),
+            Some(Action {
+                token: 2,
+                finish: Finish::Allow
+            })
+        );
+        assert_eq!(
+            e.submit(101, packet(), 3, None, 102, None),
+            Submission::Finish(Action {
+                token: 3,
+                finish: Finish::Allow
+            })
+        );
+        assert_eq!(e.cache_counts(), (0, 0));
     }
 
     #[test]

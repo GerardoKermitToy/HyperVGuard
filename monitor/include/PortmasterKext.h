@@ -232,7 +232,8 @@ public:
     // four growing tables per interface: TCP/UDP, each IPv4/IPv6; key=IP+port only.
     // TCP/UDP stay separate; both directions share tuples within one table. OOM skips insertion.
     // Default TTL is 60 seconds: PermanentAccept hits refresh it; Block/Drop do not.
-    // Pending verdict timeout is 8 seconds by default, with fail-open behavior.
+    // Pending verdict timeout is 8 seconds by default; missing verdicts default to drop.
+    // Missing/disconnected controller and policy queue pressure also default to drop.
     bool SendVerdict(uint64_t id, Verdict verdict, std::string& error);
     bool RequestLogs(std::string& error);
     bool RequestBandwidthStats(std::string& error);

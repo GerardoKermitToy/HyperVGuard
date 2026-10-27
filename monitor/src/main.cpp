@@ -223,12 +223,12 @@ int MonitorMain(int argc, wchar_t** argv) {
                 "TCP/UDP cache only: four tables per host interface, TCP/UDP x IPv4/IPv6; key=IP+port.\n"
                 "TCP and UDP use separate caches; both directions share tuples within each.\n"
                 "Default cache TTL: 60 s; TCP/UDP PermanentAccept refreshes on matching cache hits; PermanentBlock/Drop use fixed TTL.\n"
-                "Pending timeout: 8 s by default, checked every 1 s while pending; fail-open by default.\n"
+                "Pending timeout: 8 s by default, checked every 1 s while pending; fail-closed by default.\n"
                 "Driver cache cleanup: full pass every 10 s while entries exist; no monitor cleanup polling.\n"
                 "Bandwidth: tx/rx=admitted guest outbound/inbound IP bytes, no PID; clean-ended only sweeps TTLs.\n"
                 "No synthetic END events; UpdateV4/UpdateV6 and redirects are unsupported.\n");
     if (!opt.send_verdicts) {
-        std::printf("NOT answering events (--no-verdicts); pending packets can wait until timeout.\n");
+        std::printf("NOT answering events (--no-verdicts); pending packets are dropped on timeout by default.\n");
     } else if (opt.has_alt && opt.match.present) {
         std::printf("Answering remote endpoint %s%s with %s, everything else with PermanentAccept.\n",
                     opt.match.ip.c_str(),

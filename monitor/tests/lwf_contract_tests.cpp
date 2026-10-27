@@ -40,6 +40,7 @@ int main() {
     }
 
     CHECK(HV_DEFAULT_DECISION_TIMEOUT_MS == 8000);
+    CHECK(HV_DEFAULT_FAIL_CLOSED == 1);
     CHECK(HV_PENDING_CHECK_MS == 1000);
     CHECK(HV_CACHE_CHECK_MS == 10000);
     unsigned char pending_timer = 0, cache_timer = 0;

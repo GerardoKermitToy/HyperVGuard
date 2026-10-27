@@ -34,6 +34,7 @@ const fn ctl_code(function: u32) -> u32 {
     (40000 << 16) | (3 << 14) | (function << 2)
 }
 
+// Driver fallback defaults to drop for missing/disconnected userspace, timeout or queue pressure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Verdict {
