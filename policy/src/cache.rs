@@ -135,6 +135,14 @@ impl<const N: usize> Tuple<N> {
     }
 }
 
+pub(crate) fn tuple_hash(connection: &Connection) -> u64 {
+    if connection.ipv6 {
+        Tuple::<16>::from_connection(connection).hash()
+    } else {
+        Tuple::<4>::from_connection(connection).hash()
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct Decision {
     pub allow: bool,
@@ -547,9 +555,6 @@ impl Caches {
             ipv6: [const { Cache::new() }; 2],
             allocator,
         }
-    }
-    pub(crate) const fn global() -> Self {
-        Self::new(CacheAllocator::GLOBAL)
     }
     pub(crate) fn clear(&mut self) -> Self {
         mem::replace(self, Self::new(self.allocator))

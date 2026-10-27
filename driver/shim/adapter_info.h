@@ -8,11 +8,13 @@
 #define HV_ADAPTER_INFO_VERSION 1u
 #define HV_ADAPTER_INFO_HEADER_SIZE 16u
 #define HV_ADAPTER_INFO_ENTRY_SIZE 1760u
-#define HV_ADAPTER_INFO_MAX_ADAPTERS 32u
+// Arithmetic wire/DWORD-size bound only, not an attachment/admission quota.
+#define HV_ADAPTER_INFO_MAX_ADAPTERS ((UINT32_MAX - HV_ADAPTER_INFO_HEADER_SIZE) / HV_ADAPTER_INFO_ENTRY_SIZE)
 #define HV_ADAPTER_INFO_NAME_CAPACITY 256u
 #define HV_ADAPTER_INFO_MAC_CAPACITY 32u
 #define HV_ADAPTER_INFO_MAX_SIZE (HV_ADAPTER_INFO_HEADER_SIZE + \
     HV_ADAPTER_INFO_MAX_ADAPTERS * HV_ADAPTER_INFO_ENTRY_SIZE)
+#define HV_ADAPTER_INFO_MAX_STAGING_ATTEMPTS 8u
 
 #define HV_ADAPTER_RUNNING 0x01u
 #define HV_ADAPTER_GENERAL_VALID 0x02u
@@ -74,6 +76,23 @@ static inline void HvInfoWrite64(uint8_t* out, uint64_t value) {
 static inline uint32_t HvAdapterInfoSize(uint32_t count) {
     return count <= HV_ADAPTER_INFO_MAX_ADAPTERS ?
         HV_ADAPTER_INFO_HEADER_SIZE + count * HV_ADAPTER_INFO_ENTRY_SIZE : 0;
+}
+typedef enum _HV_ADAPTER_INFO_ACTION {
+    HvAdapterInfoTooSmall,
+    HvAdapterInfoCountOverflow,
+    HvAdapterInfoHeaderOnly,
+    HvAdapterInfoGrowStaging,
+    HvAdapterInfoEncode
+} HV_ADAPTER_INFO_ACTION;
+// Plan from one lock-protected observation. Staging growth must never masquerade
+// as insufficient user capacity; otherwise an unchanged-capacity retry can loop.
+static inline HV_ADAPTER_INFO_ACTION HvPlanAdapterInfo(uint64_t count, uint32_t capacity,
+    uint64_t stagedCount, uint32_t* required) {
+    if (capacity < HV_ADAPTER_INFO_HEADER_SIZE) return HvAdapterInfoTooSmall;
+    if (count > HV_ADAPTER_INFO_MAX_ADAPTERS) return HvAdapterInfoCountOverflow;
+    *required = HvAdapterInfoSize((uint32_t)count);
+    if (capacity < *required) return HvAdapterInfoHeaderOnly;
+    return stagedCount < count ? HvAdapterInfoGrowStaging : HvAdapterInfoEncode;
 }
 static inline void HvEncodeAdapterInfoHeader(uint8_t* out, uint32_t count, uint32_t running) {
     HvInfoWrite32(out, HV_ADAPTER_INFO_VERSION);

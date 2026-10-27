@@ -17,7 +17,9 @@ pub const IOCTL_ADAPTER_INFO: u32 = ctl_code(0x803);
 pub const ADAPTER_INFO_VERSION: u32 = 1;
 pub const ADAPTER_INFO_HEADER_SIZE: usize = 16;
 pub const ADAPTER_INFO_ENTRY_SIZE: usize = 1760;
-pub const ADAPTER_INFO_MAX_ADAPTERS: usize = 32;
+// Arithmetic DWORD response bound only, not a configured attachment quota.
+pub const ADAPTER_INFO_MAX_ADAPTERS: usize =
+    (u32::MAX as usize - ADAPTER_INFO_HEADER_SIZE) / ADAPTER_INFO_ENTRY_SIZE;
 pub const ADAPTER_INFO_NAME_CAPACITY: usize = 256;
 pub const ADAPTER_INFO_MAC_CAPACITY: usize = 32;
 pub const ADAPTER_INFO_MAX_SIZE: usize =
@@ -298,7 +300,20 @@ mod tests {
         assert_eq!(IOCTL_SHUTDOWN, 0x9c40_e004);
         assert_eq!(IOCTL_FILTERED_DEVICE_COUNT, 0x9c40_e008);
         assert_eq!(IOCTL_ADAPTER_INFO, 0x9c40_e00c);
-        assert_eq!(ADAPTER_INFO_MAX_SIZE, 56_336);
+        assert_eq!(ADAPTER_INFO_MAX_ADAPTERS, 2_440_322);
+        assert_eq!(ADAPTER_INFO_MAX_SIZE, 4_294_966_736);
+        assert_eq!(u32::try_from(ADAPTER_INFO_MAX_SIZE), Ok(4_294_966_736));
+        assert!(
+            u32::try_from(
+                ADAPTER_INFO_HEADER_SIZE as u64
+                    + (ADAPTER_INFO_MAX_ADAPTERS as u64 + 1) * ADAPTER_INFO_ENTRY_SIZE as u64
+            )
+            .is_err()
+        );
+        assert_eq!(
+            ADAPTER_INFO_HEADER_SIZE + 33 * ADAPTER_INFO_ENTRY_SIZE,
+            58_096
+        );
         assert_eq!(
             ADAPTER_INFO_ENTRY_SIZE,
             224 + 3 * 2 * ADAPTER_INFO_NAME_CAPACITY

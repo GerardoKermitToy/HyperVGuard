@@ -20,8 +20,10 @@
 // buffer and each owning-decoder allocation without affecting the Run thread.
 namespace allocation {
 thread_local ptrdiff_t remaining = -1;
+thread_local size_t fail_size = 0;
 thread_local bool failed = false;
-bool ShouldFail() noexcept {
+bool ShouldFail(size_t size) noexcept {
+    if (fail_size && size == fail_size) { fail_size = 0; failed = true; return true; }
     if (remaining < 0) return false;
     if (remaining > 0) { --remaining; return false; }
     remaining = -1; failed = true;
@@ -34,9 +36,16 @@ struct FailAfter {
     ~FailAfter() { remaining = previous; failed = previous_failed; }
     bool Triggered() const noexcept { return failed; }
 };
+struct FailSize {
+    size_t previous = fail_size;
+    bool previous_failed = failed;
+    explicit FailSize(size_t size) { fail_size = size; failed = false; }
+    ~FailSize() { fail_size = previous; failed = previous_failed; }
+    bool Triggered() const noexcept { return failed; }
+};
 }
 void* operator new(size_t size) {
-    if (!allocation::ShouldFail()) if (void* p = std::malloc(size ? size : 1)) return p;
+    if (!allocation::ShouldFail(size)) if (void* p = std::malloc(size ? size : 1)) return p;
     throw std::bad_alloc();
 }
 void* operator new[](size_t size) { return ::operator new(size); }
@@ -92,6 +101,11 @@ struct Operation {
     uint8_t* buffer = nullptr;
     DWORD capacity = 0;
 };
+struct AdapterReply {
+    Bytes bytes;
+    DWORD error = ERROR_SUCCESS, reported = UINT32_MAX;
+    bool pending = false;
+};
 struct State {
     std::mutex mutex;
     std::unordered_map<OVERLAPPED*, Operation> operations;
@@ -100,6 +114,10 @@ struct State {
     HANDLE startup_seen = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
     HANDLE driver_ready = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
     Bytes queued, written, adapter_info;
+    std::vector<AdapterReply> adapter_replies;
+    std::vector<DWORD> adapter_capacities;
+    size_t adapter_reply_index = 0;
+    bool legacy_adapter_info = false;
     DWORD adapter_info_error = ERROR_SUCCESS;
     std::vector<DWORD> open_errors;
     size_t offset = 0;
@@ -118,6 +136,8 @@ void Reset() {
     state.adapter_info.assign(HV_ADAPTER_INFO_HEADER_SIZE, 0);
     HvEncodeAdapterInfoHeader(state.adapter_info.data(), 0, 0);
     state.adapter_info_error = ERROR_SUCCESS;
+    state.adapter_replies.clear(); state.adapter_capacities.clear();
+    state.adapter_reply_index = 0; state.legacy_adapter_info = false;
     state.reads = state.cancels = state.opens = state.closes = state.adapter_queries = 0;
     state.empty_read = state.short_control = state.wrong_version = state.fail_open = state.secure_ready = false;
     state.first_buffer = nullptr; state.stop_on_read = nullptr;
@@ -185,17 +205,32 @@ BOOL DeviceIoControl(HANDLE, DWORD code, LPVOID input, DWORD input_size, LPVOID 
     if (input || input_size) { ::SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
     if (code == 0x9c40e00cu) {
         ++state.adapter_queries;
-        if (!output || capacity != HV_ADAPTER_INFO_MAX_SIZE || !ov) {
+        if (!output || capacity < HV_ADAPTER_INFO_HEADER_SIZE || !ov) {
             ::SetLastError(ERROR_INVALID_PARAMETER); return FALSE;
         }
+        state.adapter_capacities.push_back(capacity);
         if (state.adapter_info_error) { ::SetLastError(state.adapter_info_error); return FALSE; }
-        const DWORD size = static_cast<DWORD>(state.adapter_info.size());
-        const size_t copied = (std::min)(state.adapter_info.size(), static_cast<size_t>(capacity));
-        if (copied) std::memcpy(output, state.adapter_info.data(), copied);
+        const AdapterReply* reply = state.adapter_reply_index < state.adapter_replies.size() ?
+            &state.adapter_replies[state.adapter_reply_index++] : nullptr;
+        const auto& bytes = reply ? reply->bytes : state.adapter_info;
+        DWORD error = reply ? reply->error : ERROR_SUCCESS;
+        DWORD size = reply && reply->reported != UINT32_MAX ? reply->reported : static_cast<DWORD>(bytes.size());
+        if (!reply && capacity < bytes.size()) {
+            if (state.legacy_adapter_info) { ::SetLastError(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
+            size = HV_ADAPTER_INFO_HEADER_SIZE; error = ERROR_MORE_DATA;
+        }
+        if (error && error != ERROR_MORE_DATA && !(reply && reply->pending)) {
+            ::SetLastError(error); return FALSE;
+        }
+        const size_t copied = (std::min)({bytes.size(), static_cast<size_t>(size), static_cast<size_t>(capacity)});
+        if (copied) std::memcpy(output, bytes.data(), copied);
         state.operations[ov] = {};
-        // A malformed fake may claim more bytes than fit, but never overwrite.
-        Complete(ov, size);
-        *actual = size;
+        // Malformed fakes can claim too many bytes, never overwrite. Immediate
+        // MORE_DATA intentionally needs GetOverlappedResult to discover size.
+        Complete(ov, size, error);
+        *actual = error == ERROR_MORE_DATA ? 0 : size;
+        if (reply && reply->pending) { ::SetLastError(ERROR_IO_PENDING); return FALSE; }
+        if (error) { ::SetLastError(error); return FALSE; }
         return TRUE;
     }
     uint8_t bytes[4]{};
@@ -403,7 +438,10 @@ bool TestAdapterInfoCodec() {
     static_assert(Client::MaxAdapters == HV_ADAPTER_INFO_MAX_ADAPTERS);
     static_assert(Client::AdapterNameCapacity == HV_ADAPTER_INFO_NAME_CAPACITY);
     static_assert(Client::AdapterMacCapacity == HV_ADAPTER_INFO_MAC_CAPACITY);
-    static_assert(Client::MaxAdapterInfoSize == HV_ADAPTER_INFO_MAX_SIZE && Client::MaxAdapterInfoSize == 56336);
+    static_assert(Client::MaxAdapterInfoSize == HV_ADAPTER_INFO_MAX_SIZE && Client::MaxAdapterInfoSize == 4294966736u);
+    static_assert(Client::InitialAdapterInfoSize == 56336);
+    static_assert(Client::MaxAdapters == 2440322u);
+    static_assert(static_cast<uint64_t>(Client::MaxAdapterInfoSize) + Client::AdapterInfoEntrySize > UINT32_MAX);
     static_assert(Client::AdapterRunning == HV_ADAPTER_RUNNING && Client::AdapterGeneralValid == HV_ADAPTER_GENERAL_VALID);
     static_assert(Client::AdapterConnectorValid == HV_ADAPTER_CONNECTOR_VALID);
     static_assert(Client::AdapterInstanceNameTruncated == HV_ADAPTER_INSTANCE_NAME_TRUNCATED);
@@ -435,14 +473,14 @@ bool TestAdapterInfoCodec() {
     }
     CHECK(Client::DecodeAdapterInfo(AdapterResponse(), snapshot) == ERROR_SUCCESS);
     CHECK(snapshot.running_count == 0 && snapshot.adapters.empty());
-    std::vector<HV_ADAPTER_INFO> maximum;
-    for (uint32_t i = 0; i < HV_ADAPTER_INFO_MAX_ADAPTERS; ++i)
-        maximum.push_back(AdapterFixture(i, i % 2 ? 0 : HV_ADAPTER_RUNNING));
-    maximum.back() = fixtures[1];
-    const auto full = AdapterResponse(maximum);
-    CHECK(full.size() == Client::MaxAdapterInfoSize);
+    std::vector<HV_ADAPTER_INFO> many;
+    for (uint32_t i = 0; i < 97; ++i)
+        many.push_back(AdapterFixture(i, i % 2 ? 0 : HV_ADAPTER_RUNNING));
+    many.back() = fixtures[1];
+    const auto full = AdapterResponse(many);
+    CHECK(full.size() == HvAdapterInfoSize(97) && full.size() > Client::InitialAdapterInfoSize);
     CHECK(Client::DecodeAdapterInfo(full, snapshot) == ERROR_SUCCESS);
-    CHECK(MatchesSnapshot(snapshot, maximum) && snapshot.running_count == 16);
+    CHECK(MatchesSnapshot(snapshot, many) && snapshot.running_count == 48);
     return true;
 }
 bool TestAdapterInfoMalformed() {
@@ -465,7 +503,7 @@ bool TestAdapterInfoMalformed() {
     CHECK(reject({})); // Null/empty input, before any header load.
     for (size_t length = 0; length < good.size(); ++length) CHECK(reject(Client::Bytes(good).first(length)));
     auto bad = good; bad.push_back(0); CHECK(reject(bad));
-    CHECK(reject(Bytes(Client::MaxAdapterInfoSize + 1)));
+    CHECK(reject32(8, Client::MaxAdapters + 1)); // Arithmetic overflow, without a multi-GiB allocation.
     for (uint32_t value : {0u, 2u, 0xffffffffu}) CHECK(reject32(0, value));
     for (uint32_t value : {0u, 1759u, 1761u, 0xffffffffu}) CHECK(reject32(4, value));
     for (uint32_t value : {0u, 1u, 33u, 0xffffffffu}) CHECK(reject32(8, value));
@@ -515,7 +553,7 @@ bool TestAdapterInfoQuery() {
         CHECK(client.GetAdapterInfo(snapshot) == error && unchanged());
     }
     testio::state.adapter_info_error = ERROR_SUCCESS;
-    std::vector<Bytes> malformed{{}, Bytes(good.begin(), good.begin() + 15), good, good, Bytes(Client::MaxAdapterInfoSize + 1)};
+    std::vector<Bytes> malformed{{}, Bytes(good.begin(), good.begin() + 15), good, good, Bytes(Client::InitialAdapterInfoSize + 1)};
     malformed[2].pop_back(); malformed[3].push_back(0);
     const auto add_bad32 = [&](size_t offset, uint32_t value) {
         malformed.push_back(good); Put(malformed.back(), offset, value, 4);
@@ -536,6 +574,85 @@ bool TestAdapterInfoQuery() {
     CHECK(client.GetAdapterInfo(snapshot) == ERROR_INVALID_HANDLE && unchanged());
     return true;
 }
+bool TestAdapterInfoGrowth() {
+    testio::Reset();
+    auto& state = testio::state;
+    const auto header = [](uint32_t count, uint32_t running = 0) {
+        Bytes bytes(HV_ADAPTER_INFO_HEADER_SIZE);
+        HvEncodeAdapterInfoHeader(bytes.data(), count, running);
+        return bytes;
+    };
+    const std::vector<HV_ADAPTER_INFO> kept{AdapterFixture(99, HV_ADAPTER_RUNNING)};
+    const auto small = AdapterResponse(kept);
+    std::vector<HV_ADAPTER_INFO> many;
+    for (uint32_t i = 0; i < 97; ++i) many.push_back(AdapterFixture(i, i % 2 ? 0 : HV_ADAPTER_RUNNING));
+    const auto full = AdapterResponse(many);
+    Client client;
+    CHECK(client.Open() == ERROR_SUCCESS);
+    Client::AdapterSnapshot snapshot;
+    state.adapter_info = small; state.legacy_adapter_info = true;
+    CHECK(client.GetAdapterInfo(snapshot) == ERROR_SUCCESS && MatchesSnapshot(snapshot, kept));
+    CHECK(state.adapter_capacities == std::vector<DWORD>{56336}); // Earlier schema-1 SYS compatibility.
+    state.legacy_adapter_info = false; state.adapter_info = full; state.adapter_capacities.clear();
+    CHECK(client.GetAdapterInfo(snapshot) == ERROR_SUCCESS && MatchesSnapshot(snapshot, many));
+    CHECK(state.adapter_capacities == std::vector<DWORD>({56336u, HvAdapterInfoSize(97)}));
+    CHECK(state.operations.empty());
+
+    state.adapter_replies = {{header(40), ERROR_MORE_DATA}, {header(97), ERROR_MORE_DATA, 16, true}, {full}};
+    state.adapter_reply_index = 0; state.adapter_capacities.clear();
+    CHECK(client.GetAdapterInfo(snapshot) == ERROR_SUCCESS && MatchesSnapshot(snapshot, many));
+    CHECK(state.adapter_capacities == std::vector<DWORD>({56336u, HvAdapterInfoSize(40), HvAdapterInfoSize(97)}));
+    state.adapter_replies = {{header(97), ERROR_MORE_DATA}, {small}}; state.adapter_reply_index = 0;
+    CHECK(client.GetAdapterInfo(snapshot) == ERROR_SUCCESS && MatchesSnapshot(snapshot, kept)); // Detach during retry.
+    const auto* original = snapshot.adapters.data();
+    const auto unchanged = [&] { return snapshot.adapters.data() == original &&
+        state.operations.empty() && MatchesSnapshot(snapshot, kept); };
+    const auto reject = [&](std::vector<testio::AdapterReply> replies, DWORD expected = ERROR_INVALID_DATA) {
+        state.adapter_replies = std::move(replies); state.adapter_reply_index = 0;
+        return client.GetAdapterInfo(snapshot) == expected && unchanged();
+    };
+    for (auto bytes : {header(0), header(32), header(Client::MaxAdapters + 1), header(40, 41)})
+        CHECK(reject({{std::move(bytes), ERROR_MORE_DATA}}));
+    auto bad = header(40); Put(bad, 0, 2, 4);
+    CHECK(reject({{bad, ERROR_MORE_DATA}}));
+    bad = header(40); Put(bad, 4, 1761, 4);
+    CHECK(reject({{bad, ERROR_MORE_DATA}}));
+    for (DWORD size : {0u, 15u, 17u, 56337u}) CHECK(reject({{header(40), ERROR_MORE_DATA, size}}));
+    CHECK(reject({{header(40), ERROR_MORE_DATA}, {header(40), ERROR_MORE_DATA}}));
+    CHECK(reject({{small, ERROR_SUCCESS, 56337}}));
+    CHECK(reject({{header(40)}})); // Success cannot contain only a nonempty snapshot header.
+    bad = full; bad.pop_back();
+    CHECK(reject({{header(97), ERROR_MORE_DATA}, {bad}}));
+    for (DWORD error : {DWORD{ERROR_NOT_SUPPORTED}, DWORD{ERROR_ACCESS_DENIED}, DWORD{ERROR_INSUFFICIENT_BUFFER}}) {
+        CHECK(reject({{{}, error}}, error));
+        CHECK(reject({{header(40), ERROR_MORE_DATA}, {{}, error, 0, true}}, error));
+    }
+    std::vector<testio::AdapterReply> churn;
+    for (uint32_t i = 0; i < 8; ++i) churn.push_back({header(40 + i), ERROR_MORE_DATA});
+    state.adapter_capacities.clear();
+    CHECK(reject(std::move(churn), ERROR_RETRY) && state.adapter_capacities.size() == 8);
+
+    state.adapter_replies = {{header(Client::MaxAdapters), ERROR_MORE_DATA}}; state.adapter_reply_index = 0;
+    {
+        allocation::FailSize fail(Client::MaxAdapterInfoSize);
+        CHECK(client.GetAdapterInfo(snapshot) == ERROR_NOT_ENOUGH_MEMORY && fail.Triggered() && unchanged());
+    } // Arithmetic maximum is accepted, but no actual multi-GiB allocation is made.
+    state.adapter_replies.clear(); state.adapter_reply_index = 0; state.adapter_capacities.clear();
+    {
+        allocation::FailSize fail(full.size());
+        CHECK(client.GetAdapterInfo(snapshot) == ERROR_NOT_ENOUGH_MEMORY && fail.Triggered() && unchanged());
+    }
+    CHECK(state.adapter_capacities.size() == 1); // Failed only after reaping the growth header.
+    state.adapter_info = AdapterResponse(std::span<const HV_ADAPTER_INFO>(many).first(2));
+    {
+        static_assert(2 * sizeof(Client::AdapterInfo) < 4096); // Below MSVC's large-allocation alignment threshold.
+        allocation::FailSize fail(2 * sizeof(Client::AdapterInfo));
+        CHECK(client.GetAdapterInfo(snapshot) == ERROR_NOT_ENOUGH_MEMORY && fail.Triggered() && unchanged());
+    }
+    CHECK(client.Close() == ERROR_SUCCESS && unchanged());
+    return true;
+}
+
 bool TestAdapterInfoAllocationFailures() {
     const std::vector<HV_ADAPTER_INFO> kept{AdapterFixture(99, HV_ADAPTER_RUNNING)};
     const std::vector<HV_ADAPTER_INFO> fixtures{
@@ -987,6 +1104,7 @@ int main() {
         {"owning adapter snapshots, binary identity, UTF-16 names, wide scalars and maximum bounds", TestAdapterInfoCodec},
         {"adapter snapshot validation rejects malformed lengths, versions, flags, counts, MAC and names without changing output", TestAdapterInfoMalformed},
         {"adapter-information IOCTL empty/multiadapter replies, unsupported/errors and malformed responses preserve output", TestAdapterInfoQuery},
+        {"adapter-information growth negotiation, >32 adapters, churn, arithmetic bounds and OOM preserve output", TestAdapterInfoGrowth},
         {"adapter-information raw-buffer and owning-decoder allocation failures preserve output", TestAdapterInfoAllocationFailures},
         {"interleaved adapter indices survive fragmented/coalesced IPv4/IPv6 streams", TestAdapterIndices},
         {"borrowed packed connection headers/payloads, 1 MiB packets, chunked/coalesced reads and poisoned-stream reset", TestCodecAndStream},

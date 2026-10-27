@@ -36,12 +36,20 @@ constexpr uint32_t kIoctlAdapterInfo = MakeCtlCode(0x803);
 constexpr uint32_t kAdapterInfoVersion = 1;
 constexpr size_t kAdapterInfoHeaderSize = 16;
 constexpr size_t kAdapterInfoEntrySize = 1760;
-constexpr size_t kMaxAdapters = 32;
+// Arithmetic limit of the DWORD-sized IOCTL response, not an adapter quota.
+constexpr size_t kMaxAdapters = (UINT32_MAX - kAdapterInfoHeaderSize) / kAdapterInfoEntrySize;
 constexpr size_t kAdapterNameCapacity = 256;
 constexpr size_t kMaxAdapterInfoSize = kAdapterInfoHeaderSize + kMaxAdapters * kAdapterInfoEntrySize;
+// A starting allocation, not a count limit; also works with earlier schema-1 SYS builds.
+constexpr size_t kInitialAdapterInfoSize = kAdapterInfoHeaderSize + 32 * kAdapterInfoEntrySize;
 
 bool DecodeFilteredDeviceCount(const uint8_t* bytes, size_t length,
                                uint32_t& out, std::string& error);
+// Accepts the fixed 16-byte header (also at the start of a full response).
+// Validates schema/count/running and computes the checked complete byte size.
+// Leaves required_size unchanged on failure.
+bool DecodeAdapterInfoHeader(const uint8_t* bytes, size_t length,
+                             uint32_t& required_size, std::string& error);
 bool DecodeAdapterInfo(const uint8_t* bytes, size_t length,
                        AdapterSnapshot& out, std::string& error);
 

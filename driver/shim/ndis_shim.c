@@ -8,7 +8,8 @@
 
 #define TAG 'gVHH'
 #define CACHE_TAG 'cVHH'
-#define MAX_TOKENS 2048
+#define INFO_TAG 'iVHH'
+// Shared by packet records and dynamic policy/NBL ownership metadata.
 #define MAX_EVENT_POOL_BYTES (16u * 1024u * 1024u)
 #define VERSION_IOCTL CTL_CODE(40000, 0x800, METHOD_BUFFERED, FILE_READ_DATA | FILE_WRITE_DATA)
 #define SHUTDOWN_IOCTL CTL_CODE(40000, 0x801, METHOD_BUFFERED, FILE_READ_DATA | FILE_WRITE_DATA)
@@ -31,10 +32,10 @@ struct _HV_ADAPTER {
     NDIS_SPIN_LOCK Lock;
     PNDIS_RW_LOCK_EX ClassificationLock;
     EX_RUNDOWN_REF OidRundown;
-    LIST_ENTRY Tokens, AdapterLink;
+    LIST_ENTRY Tokens[HV_TOKEN_BUCKET_COUNT], AdapterLink;
     HV_ADAPTER_INFO Info; // Protected by AdapterInfoLock; no borrowed NDIS pointers.
     UINT64 Id; // Diagnostic module ID only; policy uses InterfaceIndex.
-    LONG Active, TokenCount;
+    UINT64 Active; // Callback guards plus retained/forwarded NBL ownership.
     ULONG CopyBytes, InterfaceIndex;
     BOOLEAN Running, PausePending;
 };
@@ -64,7 +65,7 @@ static KSPIN_LOCK PolicyLock;
 // adapter admission lock precedes this lock; queries never take adapter locks.
 static KSPIN_LOCK AdapterInfoLock;
 static LIST_ENTRY Adapters;
-static ULONG AdapterCount;
+static UINT64 AdapterCount;
 static FAST_MUTEX IoMutex;
 static PFILE_OBJECT Client;
 static volatile LONG Stopping;
@@ -73,7 +74,7 @@ static KDPC PendingTimerDpc, CacheTimerDpc;
 static UCHAR PendingTimerArmed, CacheTimerArmed;
 static volatile LONG64 NextAdapter;
 static volatile LONG64 EventPoolBytes;
-static volatile LONG FilteredDeviceCount;
+static volatile LONG64 FilteredDeviceCount;
 static NDIS_STRING Friendly = RTL_CONSTANT_STRING(L"HyperVXNdisFilter Rust Host Adapter LWF");
 static NDIS_STRING Unique = RTL_CONSTANT_STRING(L"{6E76EAD1-7BCB-49C4-9547-D3E6B3488F71}");
 static NDIS_STRING ServiceName = RTL_CONSTANT_STRING(L"HyperVXNdisFilter");
@@ -95,17 +96,18 @@ FILTER_CANCEL_OID_REQUEST HvCancelOid;
 FILTER_NET_PNP_EVENT HvPnp;
 FILTER_STATUS HvStatus;
 static BOOLEAN TargetAdapter(PNDIS_FILTER_ATTACH_PARAMETERS p, GUID* interfaceGuid);
+__declspec(noreturn) void hv_bugcheck(void);
 
-// A bounded cancel-safe queue. NDIS only schedules the reader; buffered copies
-// and IRP completions run outside the policy/NDIS locks on a system work item.
-#define MAX_PENDING_READS 16
+// A byte-budgeted cancel-safe queue. NDIS only schedules the reader; buffered
+// copies and IRP completions run outside policy/NDIS locks on a system work item.
 static IO_CSQ ReadCsq;
 static LIST_ENTRY ReadIrps;
 static KSPIN_LOCK ReadLock;
 static PFILE_OBJECT ReadClient;
 static EX_RUNDOWN_REF ReadRundown, CacheRundown;
 static PIO_WORKITEM ReadWorkItem, CacheWorkItem;
-static volatile LONG ReadPending, ReadReady, ReadOnline, ReadScheduled;
+static UINT64 ReadQueueBytes; // Protected by ReadLock; includes original read lengths.
+static volatile LONG ReadPending, ReadReady, ReadOnline, ReadScheduled; // ReadPending is a boolean.
 static volatile LONG CacheScheduled;
 static IO_CSQ_INSERT_IRP_EX ReadInsert;
 static IO_CSQ_REMOVE_IRP ReadRemove;
@@ -116,6 +118,21 @@ static IO_CSQ_COMPLETE_CANCELED_IRP ReadCancelled;
 static IO_WORKITEM_ROUTINE ReadWorker;
 static IO_WORKITEM_ROUTINE CacheWorker;
 
+static BOOLEAN ReadCost(PIRP irp, UINT64* out) {
+    PMDL mdl;
+    UINT64 mdlBytes = 0, cost;
+    for (mdl = irp->MdlAddress; mdl != NULL; mdl = mdl->Next) {
+        UINT64 pages = ((UINT64)MmGetMdlByteOffset(mdl) + MmGetMdlByteCount(mdl) + PAGE_SIZE - 1) / PAGE_SIZE;
+        UINT64 bytes;
+        if (!HvMultiplyU64(pages, sizeof(PFN_NUMBER), &bytes) ||
+            !HvAddU64(bytes, sizeof(MDL), &bytes) || !HvAddU64(mdlBytes, bytes, &mdlBytes)) return FALSE;
+    }
+    if (!HvQueuedReadCost(IoGetCurrentIrpStackLocation(irp)->Parameters.Read.Length,
+        sizeof(IRP), (UCHAR)irp->StackCount, sizeof(IO_STACK_LOCATION), mdlBytes,
+        sizeof(IO_CSQ_IRP_CONTEXT), &cost) || cost > MAXULONG_PTR) return FALSE;
+    *out = cost;
+    return TRUE;
+}
 static void CompleteRead(PIRP irp, NTSTATUS status, ULONG bytes) {
     irp->IoStatus.Status = status;
     irp->IoStatus.Information = bytes;
@@ -127,16 +144,20 @@ static NTSTATUS ReadInsert(PIO_CSQ csq, PIRP irp, PVOID context) {
     UNREFERENCED_PARAMETER(csq); UNREFERENCED_PARAMETER(context);
     if (Stopping || ReadClient != IoGetCurrentIrpStackLocation(irp)->FileObject || !ReadOnline)
         return STATUS_DEVICE_NOT_CONNECTED;
-    if (ReadPending >= MAX_PENDING_READS) return STATUS_DEVICE_BUSY;
+    // DriverContext[0] keeps the original cost across worker reinsertion. CSQ
+    // owns DriverContext[3]; neither a 64 KiB completion nor removal changes cost.
+    if (!HvReserveBytes(&ReadQueueBytes, (ULONG_PTR)irp->Tail.Overlay.DriverContext[0],
+        HV_MAX_QUEUED_READ_BYTES)) return STATUS_DEVICE_BUSY;
     InsertTailList(&ReadIrps, &irp->Tail.Overlay.ListEntry);
-    InterlockedIncrement(&ReadPending);
+    InterlockedExchange(&ReadPending, 1);
     return STATUS_SUCCESS;
 }
 _Use_decl_annotations_
 static void ReadRemove(PIO_CSQ csq, PIRP irp) {
     UNREFERENCED_PARAMETER(csq);
     RemoveEntryList(&irp->Tail.Overlay.ListEntry);
-    InterlockedDecrement(&ReadPending);
+    if (!HvReleaseBytes(&ReadQueueBytes, (ULONG_PTR)irp->Tail.Overlay.DriverContext[0])) hv_bugcheck();
+    InterlockedExchange(&ReadPending, !IsListEmpty(&ReadIrps));
 }
 _Use_decl_annotations_
 static PIRP ReadPeek(PIO_CSQ csq, PIRP irp, PVOID context) {
@@ -289,22 +310,30 @@ static ULONG SendCompleteFlags(void) {
 static ULONG ReturnFlags(void) {
     return KeGetCurrentIrql() == DISPATCH_LEVEL ? NDIS_RETURN_FLAGS_DISPATCH_LEVEL : 0;
 }
-static void ReleaseActive(HV_ADAPTER* a, LONG count) {
+// Called with the adapter lock held. Ownership cannot be saturated or wrapped;
+// an impossible representational overflow is fatal rather than losing rundown.
+static void RetainActiveLocked(HV_ADAPTER* a) {
+    if (!HvAddU64(a->Active, 1, &a->Active)) hv_bugcheck();
+}
+static void ReleaseActive(HV_ADAPTER* a, UINT64 count) {
     BOOLEAN complete = FALSE;
     NDIS_HANDLE filter = a->Filter;
     NdisAcquireSpinLock(&a->Lock);
-    NT_ASSERT(a->Active >= count);
-    a->Active -= count;
+    if (!HvReleaseBytes(&a->Active, count)) hv_bugcheck();
     if (a->Active == 0 && a->PausePending) { a->PausePending = FALSE; complete = TRUE; }
     NdisReleaseSpinLock(&a->Lock);
     // Last access to a: PauseComplete may synchronously cause detach/free.
     if (complete) NdisFPauseComplete(filter);
 }
 static void SetFilterRunning(HV_ADAPTER* a, BOOLEAN running) {
-    LONG count;
+    LONG64 count;
+    int delta;
     NdisAcquireSpinLock(&a->Lock);
     KeAcquireSpinLockAtDpcLevel(&AdapterInfoLock);
-    count = InterlockedAdd(&FilteredDeviceCount, HvSetFilterRunning(&a->Running, running));
+    delta = HvSetFilterRunning(&a->Running, running);
+    if (FilteredDeviceCount < 0 || (delta < 0 && FilteredDeviceCount == 0) ||
+        (delta > 0 && FilteredDeviceCount == MAXLONGLONG)) hv_bugcheck();
+    count = InterlockedAdd64(&FilteredDeviceCount, delta);
     if (running) a->Info.Flags |= HV_ADAPTER_RUNNING;
     else a->Info.Flags &= ~HV_ADAPTER_RUNNING;
     KeReleaseSpinLockFromDpcLevel(&AdapterInfoLock);
@@ -316,7 +345,7 @@ static BOOLEAN BeginIo(HV_ADAPTER* a) {
     BOOLEAN running;
     NdisAcquireSpinLock(&a->Lock);
     running = a->Running;
-    ++a->Active; // callback guard also protects rejects while pausing
+    RetainActiveLocked(a); // Callback guard also protects rejects while pausing.
     NdisReleaseSpinLock(&a->Lock);
     return running;
 }
@@ -410,24 +439,31 @@ Fail:
     FreeReceiveCopy(a, copy, bytes);
     return NULL;
 }
+static PLIST_ENTRY TokenBucket(HV_ADAPTER* a, PNET_BUFFER_LIST nbl, ULONG direction) {
+    return &a->Tokens[HvTokenBucketIndex((ULONG_PTR)nbl, direction)];
+}
+static BOOLEAN TokensEmpty(HV_ADAPTER* a) {
+    ULONG i;
+    for (i = 0; i < HV_TOKEN_BUCKET_COUNT; ++i) if (!IsListEmpty(&a->Tokens[i])) return FALSE;
+    return TRUE;
+}
 static void ReleaseToken(HV_TOKEN* t) {
     HV_ADAPTER* a = t->Adapter;
-    NdisAcquireSpinLock(&a->Lock); --a->TokenCount; NdisReleaseSpinLock(&a->Lock);
-    ExFreePoolWithTag(t, TAG);
+    hv_free(t, sizeof(*t));
     ReleaseActive(a, 1);
 }
 static HV_TOKEN* CreateToken(HV_ADAPTER* a, PNET_BUFFER_LIST nbl, NDIS_PORT_NUMBER port,
     ULONG flags, ULONG direction, BOOLEAN resources) {
     HV_TOKEN* t;
     NdisAcquireSpinLock(&a->Lock);
-    if (!a->Running || a->TokenCount >= MAX_TOKENS) { NdisReleaseSpinLock(&a->Lock); return NULL; }
-    ++a->TokenCount; ++a->Active;
+    if (!a->Running) { NdisReleaseSpinLock(&a->Lock); return NULL; }
+    RetainActiveLocked(a);
     NdisReleaseSpinLock(&a->Lock);
-    t = ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(*t), TAG);
-    if (t == NULL) {
-        NdisAcquireSpinLock(&a->Lock); --a->TokenCount; NdisReleaseSpinLock(&a->Lock);
-        ReleaseActive(a, 1); return NULL;
-    }
+    // Tokens are dynamic, charged to the same byte budget as policy metadata
+    // and event records. Allocation failure preserves the existing drop path.
+    t = hv_allocate(sizeof(*t));
+    if (t == NULL) { ReleaseActive(a, 1); return NULL; }
+    RtlZeroMemory(t, sizeof(*t));
     t->Adapter = a; t->Nbl = nbl; t->Port = port; t->Flags = flags;
     t->Direction = direction;
     if (resources) {
@@ -437,7 +473,9 @@ static HV_TOKEN* CreateToken(HV_ADAPTER* a, PNET_BUFFER_LIST nbl, NDIS_PORT_NUMB
         // The new storage has no shared-memory/header-split/queue assertions.
         t->Flags = 0;
     }
-    NdisAcquireSpinLock(&a->Lock); InsertTailList(&a->Tokens, &t->Link); NdisReleaseSpinLock(&a->Lock);
+    NdisAcquireSpinLock(&a->Lock);
+    InsertTailList(TokenBucket(a, t->Nbl, direction), &t->Link);
+    NdisReleaseSpinLock(&a->Lock);
     return t;
 }
 void hv_finish(ULONG_PTR token, ULONG finish) {
@@ -498,8 +536,9 @@ ULONG hv_snapshot(PNET_BUFFER nb, ULONG_PTR token, UCHAR* out, ULONG cap,
 static HV_TOKEN* TakeForwarded(HV_ADAPTER* a, PNET_BUFFER_LIST nbl, ULONG direction) {
     HV_TOKEN* t = NULL;
     LIST_ENTRY* entry;
+    LIST_ENTRY* bucket = TokenBucket(a, nbl, direction);
     NdisAcquireSpinLock(&a->Lock);
-    for (entry = a->Tokens.Flink; entry != &a->Tokens; entry = entry->Flink) {
+    for (entry = bucket->Flink; entry != bucket; entry = entry->Flink) {
         HV_TOKEN* found = CONTAINING_RECORD(entry, HV_TOKEN, Link);
         if (found->Nbl == nbl && found->Direction == direction && found->Forwarded) {
             t = found; RemoveEntryList(entry); break;
@@ -548,7 +587,7 @@ void HvSend(NDIS_HANDLE context, PNET_BUFFER_LIST chain, NDIS_PORT_NUMBER port, 
 _Use_decl_annotations_
 void HvSendComplete(NDIS_HANDLE context, PNET_BUFFER_LIST chain, ULONG flags) {
     HV_ADAPTER* a = context;
-    NdisAcquireSpinLock(&a->Lock); ++a->Active; NdisReleaseSpinLock(&a->Lock);
+    NdisAcquireSpinLock(&a->Lock); RetainActiveLocked(a); NdisReleaseSpinLock(&a->Lock);
     while (chain != NULL) {
         PNET_BUFFER_LIST nbl = chain;
         HV_TOKEN* t;
@@ -562,7 +601,7 @@ void HvSendComplete(NDIS_HANDLE context, PNET_BUFFER_LIST chain, ULONG flags) {
 _Use_decl_annotations_
 void HvCancelSend(NDIS_HANDLE context, PVOID cancel) {
     HV_ADAPTER* a = context;
-    NdisAcquireSpinLock(&a->Lock); ++a->Active; NdisReleaseSpinLock(&a->Lock);
+    NdisAcquireSpinLock(&a->Lock); RetainActiveLocked(a); NdisReleaseSpinLock(&a->Lock);
     HvCancel(a->InterfaceIndex, (ULONG_PTR)cancel);
     NdisFCancelSendNetBufferLists(a->Filter, cancel);
     ReleaseActive(a, 1);
@@ -579,7 +618,7 @@ void HvReceive(NDIS_HANDLE context, PNET_BUFFER_LIST chain, NDIS_PORT_NUMBER por
 _Use_decl_annotations_
 void HvReturn(NDIS_HANDLE context, PNET_BUFFER_LIST chain, ULONG flags) {
     HV_ADAPTER* a = context;
-    NdisAcquireSpinLock(&a->Lock); ++a->Active; NdisReleaseSpinLock(&a->Lock);
+    NdisAcquireSpinLock(&a->Lock); RetainActiveLocked(a); NdisReleaseSpinLock(&a->Lock);
     while (chain != NULL) {
         PNET_BUFFER_LIST nbl = chain;
         HV_TOKEN* t;
@@ -727,26 +766,69 @@ static void CaptureRestartInfo(HV_ADAPTER* a, PNDIS_FILTER_RESTART_PARAMETERS p)
     KeReleaseSpinLock(&AdapterInfoLock, irql);
 }
 static NTSTATUS QueryAdapterInfo(UCHAR* out, ULONG capacity, ULONG_PTR* transferred) {
-    PLIST_ENTRY entry;
-    KIRQL irql;
-    ULONG size, offset = HV_ADAPTER_INFO_HEADER_SIZE;
-    NTSTATUS status = STATUS_SUCCESS;
-    KeAcquireSpinLock(&AdapterInfoLock, &irql);
-    size = HvAdapterInfoSize(AdapterCount);
-    if (size == 0) status = STATUS_INSUFFICIENT_RESOURCES;
-    else if (capacity < size) status = STATUS_BUFFER_TOO_SMALL;
-    else if (out == NULL) status = STATUS_INVALID_PARAMETER;
-    else {
-        HvEncodeAdapterInfoHeader(out, AdapterCount, (ULONG)FilteredDeviceCount);
+    HV_ADAPTER_INFO* snapshot = NULL;
+    UINT64 allocatedCount = 0;
+    ULONG attempt, i, count = 0, running = 0;
+    uint32_t size = 0;
+    NTSTATUS status = STATUS_RETRY;
+    if (capacity < HV_ADAPTER_INFO_HEADER_SIZE) return STATUS_BUFFER_TOO_SMALL;
+    if (out == NULL) return STATUS_INVALID_PARAMETER;
+    // Allocate only the observed count, outside the diagnostic spin lock. Retry
+    // staging growth under attachment churn; this bounds attempts, not adapters.
+    for (attempt = 0; attempt < HV_ADAPTER_INFO_MAX_STAGING_ATTEMPTS; ++attempt) {
+        PLIST_ENTRY entry;
+        KIRQL irql;
+        HV_ADAPTER_INFO_ACTION action;
+        KeAcquireSpinLock(&AdapterInfoLock, &irql);
+        action = HvPlanAdapterInfo(AdapterCount, capacity, allocatedCount, &size);
+        if (action == HvAdapterInfoCountOverflow) {
+            status = STATUS_INTEGER_OVERFLOW;
+            KeReleaseSpinLock(&AdapterInfoLock, irql);
+            break;
+        }
+        count = (ULONG)AdapterCount;
+        running = (ULONG)FilteredDeviceCount;
+        NT_ASSERT(running <= count && size != 0 && action != HvAdapterInfoTooSmall);
+        if (action == HvAdapterInfoHeaderOnly) {
+            // METHOD_BUFFERED warnings return this header even on a failed
+            // DeviceIoControl/GetOverlappedResult (Win32 ERROR_MORE_DATA).
+            HvEncodeAdapterInfoHeader(out, count, running);
+            *transferred = HV_ADAPTER_INFO_HEADER_SIZE;
+            status = STATUS_BUFFER_OVERFLOW;
+            KeReleaseSpinLock(&AdapterInfoLock, irql);
+            break;
+        }
+        if (action == HvAdapterInfoGrowStaging) {
+            UINT64 bytes;
+            KeReleaseSpinLock(&AdapterInfoLock, irql);
+            if (snapshot != NULL) { ExFreePoolWithTag(snapshot, INFO_TAG); snapshot = NULL; }
+            if (!HvMultiplyU64(count, sizeof(*snapshot), &bytes) || bytes > MAXULONG_PTR) {
+                status = STATUS_INTEGER_OVERFLOW;
+                break;
+            }
+            snapshot = ExAllocatePool2(POOL_FLAG_NON_PAGED | POOL_FLAG_UNINITIALIZED, (SIZE_T)bytes, INFO_TAG);
+            if (snapshot == NULL) { status = STATUS_INSUFFICIENT_RESOURCES; break; }
+            allocatedCount = count;
+            continue;
+        }
+        // Lifetime, metadata and running_count are one consistent snapshot.
+        // Copying the list is still O(count) under this lock; encoding every
+        // integer/name is deliberately deferred until after releasing it.
+        count = 0;
         for (entry = Adapters.Flink; entry != &Adapters; entry = entry->Flink) {
             HV_ADAPTER* a = CONTAINING_RECORD(entry, HV_ADAPTER, AdapterLink);
-            HvEncodeAdapterInfo(out + offset, &a->Info);
-            offset += HV_ADAPTER_INFO_ENTRY_SIZE;
+            RtlCopyMemory(&snapshot[count++], &a->Info, sizeof(*snapshot));
         }
-        NT_ASSERT(offset == size);
+        NT_ASSERT(count == AdapterCount);
+        KeReleaseSpinLock(&AdapterInfoLock, irql);
+        HvEncodeAdapterInfoHeader(out, count, running);
+        for (i = 0; i < count; ++i)
+            HvEncodeAdapterInfo(out + HV_ADAPTER_INFO_HEADER_SIZE + (SIZE_T)i * HV_ADAPTER_INFO_ENTRY_SIZE, &snapshot[i]);
         *transferred = size;
+        status = STATUS_SUCCESS;
+        break;
     }
-    KeReleaseSpinLock(&AdapterInfoLock, irql);
+    if (snapshot != NULL) ExFreePoolWithTag(snapshot, INFO_TAG);
     return status;
 }
 _Use_decl_annotations_
@@ -779,6 +861,7 @@ NDIS_STATUS HvFilterAttach(NDIS_HANDLE filter, NDIS_HANDLE context, PNDIS_FILTER
     NDIS_STATUS status = NDIS_STATUS_RESOURCES;
     GUID interfaceGuid;
     KIRQL irql;
+    ULONG bucket;
     UNREFERENCED_PARAMETER(context);
     // No fallback by friendly name, media type or wildcard. Missing/stale target
     // configuration means no adapter attaches; optional LWFs are bypassed by NDIS.
@@ -789,7 +872,9 @@ NDIS_STATUS HvFilterAttach(NDIS_HANDLE filter, NDIS_HANDLE context, PNDIS_FILTER
     a->Filter = filter; a->InterfaceIndex = p->BaseMiniportIfIndex;
     a->Id = (UINT64)InterlockedIncrement64(&NextAdapter);
     CaptureAttachInfo(a, p, &interfaceGuid);
-    NdisAllocateSpinLock(&a->Lock); InitializeListHead(&a->Tokens); ExInitializeRundownProtection(&a->OidRundown);
+    NdisAllocateSpinLock(&a->Lock);
+    for (bucket = 0; bucket < HV_TOKEN_BUCKET_COUNT; ++bucket) InitializeListHead(&a->Tokens[bucket]);
+    ExInitializeRundownProtection(&a->OidRundown);
     a->ClassificationLock = NdisAllocateRWLock(filter);
     if (a->ClassificationLock == NULL) goto FreeLock;
     nblPool.Header.Type = NDIS_OBJECT_TYPE_DEFAULT;
@@ -812,8 +897,8 @@ NDIS_STATUS HvFilterAttach(NDIS_HANDLE filter, NDIS_HANDLE context, PNDIS_FILTER
     status = NdisFSetAttributes(filter, a, &attributes);
     if (status == NDIS_STATUS_SUCCESS) {
         KeAcquireSpinLock(&AdapterInfoLock, &irql);
-        InsertTailList(&Adapters, &a->AdapterLink); ++AdapterCount;
-        NT_ASSERT(AdapterCount <= HV_ADAPTER_INFO_MAX_ADAPTERS);
+        if (!HvAddU64(AdapterCount, 1, &AdapterCount)) hv_bugcheck();
+        InsertTailList(&Adapters, &a->AdapterLink);
         KeReleaseSpinLock(&AdapterInfoLock, irql);
         return status;
     }
@@ -857,9 +942,10 @@ _Use_decl_annotations_
 void HvFilterDetach(NDIS_HANDLE context) {
     HV_ADAPTER* a = context;
     KIRQL irql;
-    NT_ASSERT(!a->Running && a->Active == 0 && IsListEmpty(&a->Tokens) && a->CopyBytes == 0);
+    if (a->Running || a->Active != 0 || !TokensEmpty(a) || a->CopyBytes != 0) hv_bugcheck();
     KeAcquireSpinLock(&AdapterInfoLock, &irql);
-    RemoveEntryList(&a->AdapterLink); --AdapterCount;
+    RemoveEntryList(&a->AdapterLink);
+    if (!HvReleaseBytes(&AdapterCount, 1)) hv_bugcheck();
     KeReleaseSpinLock(&AdapterInfoLock, irql);
     ExWaitForRundownProtectionRelease(&a->OidRundown);
     HvDetach(a->InterfaceIndex);
@@ -892,8 +978,14 @@ NTSTATUS HvDispatch(PDEVICE_OBJECT device, PIRP irp) {
             ULONG n = min(stack->Parameters.Read.Length, 65536);
             if (n && irp->AssociatedIrp.SystemBuffer == NULL) status = STATUS_INVALID_PARAMETER;
             else if (n != 0) {
-                if (!ExAcquireRundownProtection(&ReadRundown)) status = STATUS_DEVICE_NOT_CONNECTED;
-                else queueRead = TRUE;
+                UINT64 cost;
+                if (!ReadCost(irp, &cost)) status = STATUS_INTEGER_OVERFLOW;
+                else if (!ExAcquireRundownProtection(&ReadRundown)) status = STATUS_DEVICE_NOT_CONNECTED;
+                else {
+                    // Preserve the full requested SystemBuffer cost, not n.
+                    irp->Tail.Overlay.DriverContext[0] = (PVOID)(ULONG_PTR)cost;
+                    queueRead = TRUE;
+                }
             }
         } else if (stack->MajorFunction == IRP_MJ_WRITE) {
             status = HvWrite(irp->AssociatedIrp.SystemBuffer, stack->Parameters.Write.Length);
@@ -910,11 +1002,12 @@ NTSTATUS HvDispatch(PDEVICE_OBJECT device, PIRP irp) {
                 else if (stack->Parameters.DeviceIoControl.OutputBufferLength < sizeof(ULONG)) status = STATUS_BUFFER_TOO_SMALL;
                 else if (irp->AssociatedIrp.SystemBuffer == NULL) status = STATUS_INVALID_PARAMETER;
                 else {
-                    ULONG count = (ULONG)InterlockedCompareExchange(&FilteredDeviceCount, 0, 0);
-                    UCHAR* out = irp->AssociatedIrp.SystemBuffer;
-                    out[0] = (UCHAR)count; out[1] = (UCHAR)(count >> 8);
-                    out[2] = (UCHAR)(count >> 16); out[3] = (UCHAR)(count >> 24);
-                    transferred = sizeof(ULONG);
+                    UINT64 count = (UINT64)InterlockedCompareExchange64(&FilteredDeviceCount, 0, 0);
+                    if (count > MAXULONG) status = STATUS_INTEGER_OVERFLOW;
+                    else {
+                        HvInfoWrite32(irp->AssociatedIrp.SystemBuffer, (ULONG)count);
+                        transferred = sizeof(ULONG);
+                    }
                 }
             } else if (code == ADAPTER_INFO_IOCTL) {
                 if (stack->Parameters.DeviceIoControl.InputBufferLength != 0) status = STATUS_INVALID_PARAMETER;

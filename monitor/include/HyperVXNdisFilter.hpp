@@ -45,9 +45,12 @@ public:
     // Adapter diagnostics use a separate, unframed IOCTL format, not event records.
     static constexpr uint32_t AdapterInfoVersion = 1;
     static constexpr size_t AdapterInfoHeaderSize = 16, AdapterInfoEntrySize = 1760;
-    static constexpr uint32_t MaxAdapters = 32;
+    // DWORD response arithmetic only; there is no configured adapter quota.
+    static constexpr uint32_t MaxAdapters = (UINT32_MAX - AdapterInfoHeaderSize) / AdapterInfoEntrySize;
     static constexpr size_t AdapterNameCapacity = 256, AdapterMacCapacity = 32;
     static constexpr size_t MaxAdapterInfoSize = AdapterInfoHeaderSize + MaxAdapters * AdapterInfoEntrySize;
+    // Initial allocation only, preserving compatibility with earlier schema-1 drivers.
+    static constexpr size_t InitialAdapterInfoSize = AdapterInfoHeaderSize + 32 * AdapterInfoEntrySize;
     static constexpr uint32_t AdapterRunning = 0x01, AdapterGeneralValid = 0x02, AdapterConnectorValid = 0x04;
     static constexpr uint32_t AdapterInstanceNameTruncated = 0x08, AdapterBaseNameTruncated = 0x10;
     static constexpr uint32_t AdapterFilterNameTruncated = 0x20, AdapterLinkStateValid = 0x40, AdapterPauseValid = 0x80;
@@ -202,15 +205,29 @@ public:
         if (!error) out = ReadLe<uint32_t>(bytes);
         return error;
     }
-    // Safe alongside Run's pending read. Failure always leaves out unchanged.
+    // Safe alongside Run's pending read. Modest initial buffer, fallible growth;
+    // eight attempts bound attachment churn, not adapters. Failure leaves out unchanged.
     DWORD GetAdapterInfo(AdapterSnapshot& out) {
-        std::unique_ptr<uint8_t[]> bytes{new (std::nothrow) uint8_t[MaxAdapterInfoSize]};
-        if (!bytes) return ERROR_NOT_ENOUGH_MEMORY;
-        DWORD size = 0;
-        const DWORD error = Control(0x803, bytes.get(), static_cast<DWORD>(MaxAdapterInfoSize), size);
-        if (error) return error;
-        if (size > MaxAdapterInfoSize) return ERROR_INVALID_DATA;
-        return DecodeAdapterInfo({bytes.get(), size}, out);
+        if (device_ == INVALID_HANDLE_VALUE) return ERROR_INVALID_HANDLE;
+        DWORD capacity = static_cast<DWORD>(InitialAdapterInfoSize);
+        std::unique_ptr<uint8_t[]> bytes;
+        for (unsigned attempt = 0; attempt < 8; ++attempt) {
+            bytes.reset(new (std::nothrow) uint8_t[capacity]);
+            if (!bytes) return ERROR_NOT_ENOUGH_MEMORY;
+            DWORD size = 0;
+            const DWORD error = Control(0x803, bytes.get(), capacity, size);
+            if (!error) {
+                if (size > capacity) return ERROR_INVALID_DATA;
+                return DecodeAdapterInfo({bytes.get(), size}, out);
+            }
+            if (error != ERROR_MORE_DATA) return error;
+            DWORD required = 0;
+            if (size != AdapterInfoHeaderSize ||
+                !DecodeAdapterInfoHeader({bytes.get(), size}, required) || required <= capacity)
+                return ERROR_INVALID_DATA;
+            capacity = required;
+        }
+        return ERROR_RETRY;
     }
     DWORD Shutdown() {
         Stop();
@@ -266,15 +283,10 @@ public:
     // Device-independent owning decoder. Malformed responses return INVALID_DATA;
     // allocation failures return NOT_ENOUGH_MEMORY. Neither changes out.
     static DWORD DecodeAdapterInfo(Bytes bytes, AdapterSnapshot& out) {
-        if (!bytes.data() || bytes.size() < AdapterInfoHeaderSize || bytes.size() > MaxAdapterInfoSize)
-            return ERROR_INVALID_DATA;
-        if (ReadLe<uint32_t>(bytes.data()) != AdapterInfoVersion ||
-            ReadLe<uint32_t>(bytes.data() + 4) != AdapterInfoEntrySize) return ERROR_INVALID_DATA;
+        DWORD required = 0;
+        if (!DecodeAdapterInfoHeader(bytes, required) || bytes.size() != required) return ERROR_INVALID_DATA;
         const uint32_t count = ReadLe<uint32_t>(bytes.data() + 8);
         const uint32_t running_count = ReadLe<uint32_t>(bytes.data() + 12);
-        if (count > MaxAdapters || running_count > count ||
-            bytes.size() != AdapterInfoHeaderSize + static_cast<size_t>(count) * AdapterInfoEntrySize)
-            return ERROR_INVALID_DATA;
         try {
             AdapterSnapshot snapshot;
             snapshot.running_count = running_count;
@@ -387,6 +399,15 @@ public:
     };
 
 private:
+    static bool DecodeAdapterInfoHeader(Bytes bytes, DWORD& required) noexcept {
+        if (!bytes.data() || bytes.size() < AdapterInfoHeaderSize ||
+            ReadLe<uint32_t>(bytes.data()) != AdapterInfoVersion ||
+            ReadLe<uint32_t>(bytes.data() + 4) != AdapterInfoEntrySize) return false;
+        const uint32_t count = ReadLe<uint32_t>(bytes.data() + 8);
+        if (count > MaxAdapters || ReadLe<uint32_t>(bytes.data() + 12) > count) return false;
+        required = static_cast<DWORD>(AdapterInfoHeaderSize + static_cast<size_t>(count) * AdapterInfoEntrySize);
+        return true;
+    }
     static bool DecodeAdapterName(const uint8_t* bytes, uint32_t length, std::wstring& out) {
         if (length >= AdapterNameCapacity || ReadLe<uint16_t>(bytes + 2 * length) != 0) return false;
         for (uint32_t i = 0; i < length; ++i)
@@ -463,6 +484,11 @@ private:
                         HANDLE stop = nullptr, ULONGLONG deadline = 0) {
         if (!started) {
             const DWORD error = GetLastError();
+            if (error == ERROR_MORE_DATA) {
+                // A synchronously completed BUFFER_OVERFLOW still owns a
+                // header. Reap it for the authoritative transferred count.
+                return GetOverlappedResult(device, &ov, &bytes, TRUE) ? error : GetLastError();
+            }
             if (error != ERROR_IO_PENDING) return error;
             if (stop) {
                 const HANDLE events[]{stop, ov.hEvent};

@@ -122,11 +122,11 @@ fn finish(a: Action) {
 }
 // Old per-interface cache banks move out one at a time, keeping the kernel
 // stack fixed-size. No cache pool allocation/free occurs under PolicyLock.
-fn reclaim_caches() {
-    for _ in 0..hyperv_policy::engine::MAX_ADAPTERS {
-        let Some(retired) = with_state(|e| e.take_retired_caches()) else {
-            break;
-        };
+fn reclaim_retired() {
+    while let Some(retired) = with_state(|e| e.take_retired_caches()) {
+        drop(retired);
+    }
+    while let Some(retired) = with_state(|e| e.take_retired_storage()) {
         drop(retired);
     }
 }
@@ -154,7 +154,7 @@ pub extern "C" fn HvConfigure(timeout: u32, cache_ttl: u32, fail_closed: u32) {
 #[unsafe(no_mangle)]
 pub extern "C" fn HvAttach(interface_index: u32) -> u32 {
     let result = with_state(|e| e.attach(interface_index) as u32);
-    reclaim_caches();
+    reclaim_retired();
     result
 }
 #[unsafe(no_mangle)]
@@ -164,12 +164,12 @@ pub extern "C" fn HvRestart(interface_index: u32) -> u32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn HvInvalidate(interface_index: u32, pause: u32) {
     with_state(|e| e.invalidate(interface_index, pause != 0));
-    reclaim_caches();
+    reclaim_retired();
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn HvDetach(interface_index: u32) {
     with_state(|e| e.detach(interface_index));
-    reclaim_caches();
+    reclaim_retired();
     drain();
 }
 #[unsafe(no_mangle)]
@@ -181,14 +181,13 @@ fn clean_caches() {
     // Migration only moves entries still live at a later time, so concurrent
     // growth cannot hide an entry expired at this cutoff in its new table.
     let now = unsafe { hv_now() };
-    let mut candidates = with_state(|e| e.cache_candidates());
-    while candidates != 0 {
-        let slot = candidates.trailing_zeros() as usize;
-        candidates &= candidates - 1;
-        let slots = with_state(|e| e.cache_cleanup_slots(slot));
+    let limit = with_state(|e| e.cache_cleanup_limit());
+    let mut after = 0;
+    while let Some((index, slots)) = with_state(|e| e.next_cache_candidate(after, limit)) {
+        after = index;
         for start in (0..slots).step_by(CLEANUP_SLOTS_PER_BATCH) {
             let mut work = CacheWork::empty();
-            let active = with_state(|e| e.clean_range_with_work(slot, start, now, &mut work));
+            let active = with_state(|e| e.clean_range_with_work(index, start, now, &mut work));
             drop(work); // Retired buffers are always freed outside PolicyLock.
             if !active {
                 break;
@@ -203,12 +202,12 @@ pub extern "C" fn HvCleanCaches() {
 #[unsafe(no_mangle)]
 pub extern "C" fn HvConnect() {
     with_state(|e| e.connect());
-    reclaim_caches();
+    reclaim_retired();
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn HvDisconnect() {
     with_state(|e| e.disconnect());
-    reclaim_caches();
+    reclaim_retired();
     drain();
 }
 #[unsafe(no_mangle)]
@@ -387,8 +386,8 @@ pub extern "C" fn HvResourceDrop() {
     with_state(|e| e.resource_drop());
 }
 
-// Synchronous buffered device requests are nonblocking. The user-mode reader
-// waits briefly on empty reads, so no cancel-unsafe IRPs or kernel waiters exist.
+// Nonblocking stream copy for the C shim's cancel-safe read worker. Empty
+// streams stay pending in the shim; Rust never waits or owns a read IRP.
 /// # Safety
 /// `out` is an exclusively writable nonpaged system buffer of at least `len`
 /// bytes, valid for the entire call, supplied by the buffered IRP shim.
@@ -424,7 +423,7 @@ pub unsafe extern "C" fn HvWrite(data: *const u8, len: u32) -> i32 {
         match command {
             Command::Shutdown => {
                 with_state(|e| e.disconnect());
-                reclaim_caches();
+                reclaim_retired();
                 drain();
             }
             Command::Verdict { id, verdict } => {
@@ -445,13 +444,13 @@ pub unsafe extern "C" fn HvWrite(data: *const u8, len: u32) -> i32 {
             }
             Command::ClearCache => {
                 with_state(|e| e.clear_cache());
-                reclaim_caches();
+                reclaim_retired();
             }
             Command::GetLogs => {} // Log records are already queued.
             Command::GetBandwidth => with_state(|e| e.bandwidth()),
             Command::MemoryStats => with_state(|e| e.memory_stats()),
             Command::CleanEnded => {
-                reclaim_caches();
+                reclaim_retired();
                 if with_state(|e| e.cache_candidates() != 0) {
                     // The shim coalesces explicit requests with periodic work.
                     unsafe { hv_request_cache_cleanup() };

@@ -318,7 +318,7 @@ enum Store<const N: usize> {
 impl<const N: usize> Store<N> {
     fn build(kind: usize, entries: &[Connection]) -> Self {
         let mut store = match kind {
-            0 => Self::Driver(driver::Caches::global()),
+            0 => Self::Driver(driver::Caches::new(driver::CacheAllocator::GLOBAL)),
             1 => Self::Legacy(legacy::Caches::global()),
             2 => Self::Random(HashMap::with_capacity(entries.len())),
             3 => Self::DriverHash(DriverMap::with_capacity_and_hasher(

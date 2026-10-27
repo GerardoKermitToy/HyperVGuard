@@ -222,7 +222,9 @@ public:
     // Snapshot of running NDIS modules, not configured/enabled bindings or traffic.
     // Paused modules are excluded; the count does not depend on policy-session state.
     bool GetFilteredDeviceCount(uint32_t& out, std::string& error);
-    // Bounded, versioned snapshot; leaves out unchanged on every failure.
+    // Versioned complete snapshot, with modest initial capacity and fallible growth.
+    // No configured adapter-count quota; retry-bounded under attachment churn.
+    // Leaves out unchanged on every failure.
     bool GetAdapterInfo(AdapterSnapshot& out, std::string& error);
     bool RequestShutdown(std::string& error);
 
@@ -247,7 +249,8 @@ public:
 private:
     bool SendCommand(const uint8_t* data, size_t len, std::string& error);
     bool DeviceControl(uint32_t code, uint8_t* out, uint32_t out_len,
-                       std::string& error, uint32_t* returned = nullptr);
+                       std::string& error, uint32_t* returned = nullptr,
+                       uint32_t* status = nullptr);
     void Dispatch(const uint8_t* record, size_t length, const Handlers& handlers);
     void ReaderLoop(const Handlers& handlers);
 

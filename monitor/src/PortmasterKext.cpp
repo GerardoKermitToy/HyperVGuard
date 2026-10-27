@@ -43,18 +43,23 @@ private:
 };
 
 bool FinishOverlapped(HANDLE device, OVERLAPPED* ov, BOOL started,
-                      const char* what, DWORD& transferred, std::string& error) {
-    if (started == FALSE) {
-        const DWORD status = GetLastError();
-        if (status != ERROR_IO_PENDING) {
-            error = std::string(what) + " failed: " + LastErrorText(status);
-            return false;
-        }
-    }
-    if (GetOverlappedResult(device, ov, &transferred, TRUE) == FALSE) {
-        error = std::string(what) + " failed: " + LastErrorText(GetLastError());
+                      const char* what, DWORD& transferred, std::string& error,
+                      uint32_t* result = nullptr) {
+    auto fail = [&](DWORD status) {
+        if (result != nullptr) *result = status;
+        error = std::string(what) + " failed: " + LastErrorText(status);
         return false;
+    };
+    DWORD immediate = ERROR_SUCCESS;
+    if (started == FALSE) {
+        immediate = GetLastError();
+        if (immediate != ERROR_IO_PENDING && immediate != ERROR_MORE_DATA) return fail(immediate);
     }
+    // BUFFER_OVERFLOW carries the negotiation header even on synchronous
+    // failure. Reap it to obtain the authoritative OVERLAPPED byte count.
+    if (GetOverlappedResult(device, ov, &transferred, TRUE) == FALSE) return fail(GetLastError());
+    if (immediate == ERROR_MORE_DATA) return fail(immediate);
+    if (result != nullptr) *result = ERROR_SUCCESS;
     error.clear();
     return true;
 }
@@ -241,25 +246,27 @@ void Driver::Cleanup() {
 }
 
 bool Driver::DeviceControl(uint32_t code, uint8_t* out, uint32_t out_len,
-                           std::string& error, uint32_t* returned) {
+                           std::string& error, uint32_t* returned, uint32_t* status) {
+    if (returned != nullptr) *returned = 0;
     if (device_ == nullptr) {
+        if (status != nullptr) *status = ERROR_INVALID_HANDLE;
         error = "device not open";
         return false;
     }
     Overlap overlap;
     if (!overlap.valid()) {
-        error = "CreateEvent failed: " + LastErrorText(GetLastError());
+        const DWORD failure = GetLastError();
+        if (status != nullptr) *status = failure;
+        error = "CreateEvent failed: " + LastErrorText(failure);
         return false;
     }
     DWORD transferred = 0;
     const HANDLE device = static_cast<HANDLE>(device_);
     const BOOL ok = DeviceIoControl(device, code, nullptr, 0, out, out_len,
                                     &transferred, overlap.get());
-    if (!FinishOverlapped(device, overlap.get(), ok, "DeviceIoControl", transferred, error)) {
-        return false;
-    }
+    const bool complete = FinishOverlapped(device, overlap.get(), ok, "DeviceIoControl", transferred, error, status);
     if (returned != nullptr) *returned = transferred;
-    return true;
+    return complete;
 }
 
 bool Driver::GetVersion(uint8_t out[4], std::string& error) {
@@ -288,15 +295,34 @@ bool Driver::GetAdapterInfo(AdapterSnapshot& out, std::string& error) {
         error = "device not open";
         return false;
     }
-    std::unique_ptr<uint8_t[]> bytes(new (std::nothrow) uint8_t[wire::kMaxAdapterInfoSize]);
-    if (!bytes) {
-        error = "cannot allocate adapter information buffer";
-        return false;
+    uint32_t capacity = static_cast<uint32_t>(wire::kInitialAdapterInfoSize);
+    std::unique_ptr<uint8_t[]> bytes;
+    // A retry limit bounds unstable attachment churn, not the snapshot count.
+    for (unsigned attempt = 0; attempt < 8; ++attempt) {
+        bytes.reset(new (std::nothrow) uint8_t[capacity]);
+        if (!bytes) {
+            error = "cannot allocate adapter information buffer";
+            return false;
+        }
+        uint32_t returned = 0, status = ERROR_SUCCESS;
+        if (DeviceControl(wire::kIoctlAdapterInfo, bytes.get(), capacity, error, &returned, &status)) {
+            if (returned > capacity) {
+                error = "IOCTL_ADAPTER_INFO returned more bytes than the buffer";
+                return false;
+            }
+            return wire::DecodeAdapterInfo(bytes.get(), returned, out, error);
+        }
+        if (status != ERROR_MORE_DATA) return false;
+        uint32_t required = 0;
+        if (returned != wire::kAdapterInfoHeaderSize ||
+            !wire::DecodeAdapterInfoHeader(bytes.get(), returned, required, error) || required <= capacity) {
+            error = "IOCTL_ADAPTER_INFO returned an invalid growth header";
+            return false;
+        }
+        capacity = required;
     }
-    uint32_t returned = 0;
-    if (!DeviceControl(wire::kIoctlAdapterInfo, bytes.get(),
-                       static_cast<uint32_t>(wire::kMaxAdapterInfoSize), error, &returned)) return false;
-    return wire::DecodeAdapterInfo(bytes.get(), returned, out, error);
+    error = "IOCTL_ADAPTER_INFO attachment count changed too often";
+    return false;
 }
 
 bool Driver::RequestShutdown(std::string& error) {

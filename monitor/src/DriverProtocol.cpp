@@ -42,17 +42,30 @@ bool DecodeFilteredDeviceCount(const uint8_t* bytes, size_t length,
     return true;
 }
 
+bool DecodeAdapterInfoHeader(const uint8_t* bytes, size_t length,
+                             uint32_t& required_size, std::string& error) {
+    if (bytes == nullptr || length < kAdapterInfoHeaderSize ||
+        ReadU32(bytes) != kAdapterInfoVersion || ReadU32(bytes + 4) != kAdapterInfoEntrySize ||
+        ReadU32(bytes + 8) > kMaxAdapters || ReadU32(bytes + 12) > ReadU32(bytes + 8)) {
+        error = "IOCTL_ADAPTER_INFO returned an invalid header";
+        return false;
+    }
+    // Compare before multiplying, so this also remains safe on 32-bit hosts.
+    required_size = static_cast<uint32_t>(kAdapterInfoHeaderSize +
+        static_cast<size_t>(ReadU32(bytes + 8)) * kAdapterInfoEntrySize);
+    error.clear();
+    return true;
+}
+
 bool DecodeAdapterInfo(const uint8_t* bytes, size_t length,
                        AdapterSnapshot& out, std::string& error) {
     auto invalid = [&]() {
         error = "IOCTL_ADAPTER_INFO returned an invalid snapshot";
         return false;
     };
-    if (bytes == nullptr || length < kAdapterInfoHeaderSize || length > kMaxAdapterInfoSize ||
-        ReadU32(bytes) != kAdapterInfoVersion || ReadU32(bytes + 4) != kAdapterInfoEntrySize) return invalid();
+    uint32_t required = 0;
+    if (!DecodeAdapterInfoHeader(bytes, length, required, error) || length != required) return invalid();
     const uint32_t count = ReadU32(bytes + 8), running = ReadU32(bytes + 12);
-    if (count > kMaxAdapters || running > count ||
-        length != kAdapterInfoHeaderSize + count * kAdapterInfoEntrySize) return invalid();
     try {
         AdapterSnapshot snapshot;
         snapshot.running_count = running;

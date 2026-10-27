@@ -1,4 +1,7 @@
-// Offline fixtures: no device, global readiness event, registry or NDIS access.
+// Offline fixtures: every device API is faked; only private unnamed events are real.
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
 #include "DriverProtocol.h"
 #include "RecordOutput.h"
 #include "../../driver/shim/adapter_info.h"
@@ -7,7 +10,144 @@
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <cstdlib>
+#include <cwchar>
+#include <new>
+#include <stdexcept>
 #include <vector>
+
+// Compile the implementation with private device entry points. The static
+// pmkext archive still supplies the independent codec, not a second Driver.
+namespace adapter_test_io {
+HANDLE CreateFileW(LPCWSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
+BOOL CloseHandle(HANDLE);
+BOOL DeviceIoControl(HANDLE, DWORD, LPVOID, DWORD, LPVOID, DWORD, LPDWORD, LPOVERLAPPED);
+BOOL GetOverlappedResult(HANDLE, LPOVERLAPPED, LPDWORD, BOOL);
+BOOL ReadFile(HANDLE, LPVOID, DWORD, LPDWORD, LPOVERLAPPED);
+BOOL WriteFile(HANDLE, LPCVOID, DWORD, LPDWORD, LPOVERLAPPED);
+BOOL CancelIoEx(HANDLE, LPOVERLAPPED);
+}
+#define CreateFileW adapter_test_io::CreateFileW
+#define CloseHandle adapter_test_io::CloseHandle
+#define DeviceIoControl adapter_test_io::DeviceIoControl
+#define GetOverlappedResult adapter_test_io::GetOverlappedResult
+#define ReadFile adapter_test_io::ReadFile
+#define WriteFile adapter_test_io::WriteFile
+#define CancelIoEx adapter_test_io::CancelIoEx
+#include "../src/PortmasterKext.cpp"
+#undef CreateFileW
+#undef CloseHandle
+#undef DeviceIoControl
+#undef GetOverlappedResult
+#undef ReadFile
+#undef WriteFile
+#undef CancelIoEx
+
+namespace allocation {
+thread_local size_t fail_size = 0;
+thread_local bool failed = false;
+struct FailSize {
+    size_t previous = fail_size;
+    bool previous_failed = failed;
+    explicit FailSize(size_t size) { fail_size = size; failed = false; }
+    ~FailSize() { fail_size = previous; failed = previous_failed; }
+};
+}
+void* operator new(size_t size) {
+    if (allocation::fail_size && size == allocation::fail_size) {
+        allocation::fail_size = 0; allocation::failed = true;
+        throw std::bad_alloc();
+    }
+    if (void* p = std::malloc(size ? size : 1)) return p;
+    throw std::bad_alloc();
+}
+void* operator new[](size_t size) { return ::operator new(size); }
+void operator delete(void* p) noexcept { std::free(p); }
+void operator delete[](void* p) noexcept { ::operator delete(p); }
+void operator delete(void* p, size_t) noexcept { ::operator delete(p); }
+void operator delete[](void* p, size_t) noexcept { ::operator delete(p); }
+void* operator new(size_t size, const std::nothrow_t&) noexcept {
+    try { return ::operator new(size); } catch (...) { return nullptr; }
+}
+void* operator new[](size_t size, const std::nothrow_t&) noexcept {
+    try { return ::operator new[](size); } catch (...) { return nullptr; }
+}
+void operator delete(void* p, const std::nothrow_t&) noexcept { ::operator delete(p); }
+void operator delete[](void* p, const std::nothrow_t&) noexcept { ::operator delete(p); }
+
+namespace adapter_test_io {
+struct Reply {
+    std::vector<uint8_t> bytes;
+    DWORD error = ERROR_SUCCESS, reported = UINT32_MAX;
+    bool pending = false;
+};
+struct State {
+    std::vector<uint8_t> snapshot;
+    std::vector<Reply> replies;
+    std::vector<DWORD> capacities;
+    size_t next = 0;
+    OVERLAPPED* active = nullptr;
+    DWORD bytes = 0, error = ERROR_SUCCESS;
+    bool legacy = false;
+} state;
+HANDLE Device() { return reinterpret_cast<HANDLE>(static_cast<uintptr_t>(0x5678)); }
+void Reset(std::vector<uint8_t> snapshot = {}) {
+    if (state.active) throw std::runtime_error("unreaped fake adapter query");
+    state = {};
+    state.snapshot = std::move(snapshot);
+}
+HANDLE CreateFileW(LPCWSTR path, DWORD access, DWORD sharing, LPSECURITY_ATTRIBUTES,
+                   DWORD mode, DWORD flags, HANDLE) {
+    if (std::wcscmp(path, L"\\\\.\\HyperVXNdisFilter") || access != (GENERIC_READ | GENERIC_WRITE) ||
+        sharing || mode != OPEN_EXISTING || !(flags & FILE_FLAG_OVERLAPPED)) {
+        ::SetLastError(ERROR_INVALID_PARAMETER); return INVALID_HANDLE_VALUE;
+    }
+    return Device();
+}
+BOOL CloseHandle(HANDLE handle) { return handle == Device() ? TRUE : ::CloseHandle(handle); }
+BOOL DeviceIoControl(HANDLE handle, DWORD code, LPVOID input, DWORD input_size, LPVOID output,
+                     DWORD capacity, LPDWORD actual, LPOVERLAPPED ov) {
+    if (handle != Device() || input || input_size || !ov || state.active) {
+        ::SetLastError(ERROR_INVALID_PARAMETER); return FALSE;
+    }
+    if (code == pmkext::wire::kIoctlShutdown) {
+        state.active = ov; state.bytes = 0; state.error = ERROR_SUCCESS; *actual = 0; return TRUE;
+    }
+    if (code != pmkext::wire::kIoctlAdapterInfo || !output || capacity < HV_ADAPTER_INFO_HEADER_SIZE) {
+        ::SetLastError(ERROR_NOT_SUPPORTED); return FALSE;
+    }
+    state.capacities.push_back(capacity);
+    const Reply* reply = state.next < state.replies.size() ? &state.replies[state.next++] : nullptr;
+    const auto& bytes = reply ? reply->bytes : state.snapshot;
+    DWORD error = reply ? reply->error : ERROR_SUCCESS;
+    DWORD returned = reply && reply->reported != UINT32_MAX ? reply->reported : static_cast<DWORD>(bytes.size());
+    if (!reply && capacity < bytes.size()) {
+        if (state.legacy) { ::SetLastError(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
+        returned = HV_ADAPTER_INFO_HEADER_SIZE; error = ERROR_MORE_DATA;
+    }
+    if (error && error != ERROR_MORE_DATA && !(reply && reply->pending)) {
+        ::SetLastError(error); return FALSE;
+    }
+    const size_t copied = (std::min)({bytes.size(), static_cast<size_t>(returned), static_cast<size_t>(capacity)});
+    if (copied) std::memcpy(output, bytes.data(), copied);
+    state.active = ov; state.bytes = returned; state.error = error;
+    // Immediate MORE_DATA deliberately reports zero here: the client must reap
+    // the completed OVERLAPPED to obtain the authoritative 16-byte header size.
+    *actual = error == ERROR_MORE_DATA ? 0 : returned;
+    if (reply && reply->pending) { ::SetLastError(ERROR_IO_PENDING); return FALSE; }
+    if (error) { ::SetLastError(error); return FALSE; }
+    return TRUE;
+}
+BOOL GetOverlappedResult(HANDLE handle, LPOVERLAPPED ov, LPDWORD actual, BOOL) {
+    if (handle != Device() || ov != state.active) { ::SetLastError(ERROR_NOT_FOUND); return FALSE; }
+    state.active = nullptr; *actual = state.bytes;
+    if (state.error) { ::SetLastError(state.error); return FALSE; }
+    return TRUE;
+}
+BOOL ReadFile(HANDLE, LPVOID, DWORD, LPDWORD, LPOVERLAPPED) { ::SetLastError(ERROR_NOT_SUPPORTED); return FALSE; }
+BOOL WriteFile(HANDLE, LPCVOID, DWORD, LPDWORD, LPOVERLAPPED) { ::SetLastError(ERROR_NOT_SUPPORTED); return FALSE; }
+BOOL CancelIoEx(HANDLE, LPOVERLAPPED) { ::SetLastError(ERROR_NOT_FOUND); return FALSE; }
+}
 
 #define CHECK(condition) do { if (!(condition)) { \
     std::fprintf(stderr, "line %d: %s\n", __LINE__, #condition); return false; } } while (0)
@@ -71,7 +211,13 @@ std::vector<uint8_t> Encode(unsigned count) {
 }
 
 bool CheckRoundTrip() {
-    CHECK(HvAdapterInfoSize(0) == 16 && HvAdapterInfoSize(32) == 56336 && HvAdapterInfoSize(33) == 0);
+    CHECK(HvAdapterInfoSize(0) == 16 && HvAdapterInfoSize(32) == 56336 && HvAdapterInfoSize(33) == 58096);
+    CHECK(HV_ADAPTER_INFO_MAX_ADAPTERS == 2440322u && HV_ADAPTER_INFO_MAX_SIZE == 4294966736u);
+    CHECK(HvAdapterInfoSize(HV_ADAPTER_INFO_MAX_ADAPTERS) == HV_ADAPTER_INFO_MAX_SIZE);
+    CHECK(HvAdapterInfoSize(HV_ADAPTER_INFO_MAX_ADAPTERS + 1u) == 0);
+    CHECK(HvAdapterInfoSize(UINT32_MAX) == 0);
+    static_assert(pmkext::wire::kInitialAdapterInfoSize == 56336);
+    static_assert(static_cast<uint64_t>(HV_ADAPTER_INFO_MAX_SIZE) + HV_ADAPTER_INFO_ENTRY_SIZE > UINT32_MAX);
     auto bytes = Encode(2);
     CHECK(bytes[0] == 1 && bytes[4] == 0xe0 && bytes[5] == 6 && bytes[8] == 2 && bytes[12] == 1);
     const size_t p = 16;
@@ -102,8 +248,8 @@ bool CheckRoundTrip() {
     CHECK(a.auto_negotiation_flags == 0x808 && a.pause_reason == 0x909 && a.pause_flags == 0xa0a);
     CHECK(a.instance_name == L"Адаптер" && a.base_name == L"\\Device\\test" && a.filter_module_name == L"{1234}");
     CHECK(!(s.adapters[1].flags & pmkext::AdapterInfo::Running));
-    bytes = Encode(32);
-    CHECK(pmkext::wire::DecodeAdapterInfo(bytes.data(), bytes.size(), s, error) && s.adapters.size() == 32);
+    bytes = Encode(97);
+    CHECK(pmkext::wire::DecodeAdapterInfo(bytes.data(), bytes.size(), s, error) && s.adapters.size() == 97);
     bytes = Encode(0);
     CHECK(pmkext::wire::DecodeAdapterInfo(bytes.data(), bytes.size(), s, error) && s.adapters.empty() && s.running_count == 0);
     return true;
@@ -142,6 +288,131 @@ bool CheckMalformed() {
     pmkext::Driver driver;
     CHECK(!driver.GetAdapterInfo(out, error) && error == "device not open");
     CHECK(out.running_count == 77 && out.adapters[0].instance_name == L"unchanged");
+    return true;
+}
+
+std::vector<uint8_t> Header(uint32_t count, uint32_t running = 0) {
+    std::vector<uint8_t> bytes(HV_ADAPTER_INFO_HEADER_SIZE);
+    HvEncodeAdapterInfoHeader(bytes.data(), count, running);
+    return bytes;
+}
+
+bool CheckHeaderBounds() {
+    std::string error;
+    uint32_t required = 123;
+    const auto maximum = Header(HV_ADAPTER_INFO_MAX_ADAPTERS);
+    CHECK(pmkext::wire::DecodeAdapterInfoHeader(maximum.data(), maximum.size(), required, error));
+    CHECK(required == HV_ADAPTER_INFO_MAX_SIZE);
+    for (uint32_t count : {HV_ADAPTER_INFO_MAX_ADAPTERS + 1u, UINT32_MAX}) {
+        auto bad = Header(count);
+        CHECK(!pmkext::wire::DecodeAdapterInfoHeader(bad.data(), bad.size(), required, error));
+        CHECK(required == HV_ADAPTER_INFO_MAX_SIZE && !error.empty());
+    }
+    CHECK(!pmkext::wire::DecodeAdapterInfoHeader(maximum.data(), 15, required, error));
+    CHECK(!pmkext::wire::DecodeAdapterInfoHeader(nullptr, 16, required, error));
+    const auto bad_running = Header(33, 34);
+    CHECK(!pmkext::wire::DecodeAdapterInfoHeader(bad_running.data(), 16, required, error));
+    CHECK(required == HV_ADAPTER_INFO_MAX_SIZE);
+
+    CHECK(HvPlanAdapterInfo(0, 15, 0, &required) == HvAdapterInfoTooSmall);
+    CHECK(required == HV_ADAPTER_INFO_MAX_SIZE);
+    CHECK(HvPlanAdapterInfo(static_cast<uint64_t>(HV_ADAPTER_INFO_MAX_ADAPTERS) + 1, UINT32_MAX,
+                            0, &required) == HvAdapterInfoCountOverflow);
+    CHECK(required == HV_ADAPTER_INFO_MAX_SIZE);
+    CHECK(HvPlanAdapterInfo(0, 16, 0, &required) == HvAdapterInfoEncode && required == 16);
+    CHECK(HvPlanAdapterInfo(1, 16, 0, &required) == HvAdapterInfoHeaderOnly && required == 1776);
+    const uint32_t capacity = HvAdapterInfoSize(100);
+    CHECK(HvPlanAdapterInfo(40, capacity, 0, &required) == HvAdapterInfoGrowStaging);
+    // Deterministic attach race: user capacity already fits, staging does not.
+    CHECK(HvPlanAdapterInfo(97, capacity, 40, &required) == HvAdapterInfoGrowStaging);
+    CHECK(required == HvAdapterInfoSize(97) && required < capacity);
+    CHECK(HvPlanAdapterInfo(97, capacity, 97, &required) == HvAdapterInfoEncode);
+    CHECK(HvPlanAdapterInfo(30, capacity, 97, &required) == HvAdapterInfoEncode); // Detach/shrink.
+    CHECK(HvPlanAdapterInfo(101, capacity, 97, &required) == HvAdapterInfoHeaderOnly && required > capacity);
+    uint64_t staged = 0;
+    for (uint32_t attempt = 0; attempt < HV_ADAPTER_INFO_MAX_STAGING_ATTEMPTS; ++attempt) {
+        CHECK(HvPlanAdapterInfo(40 + attempt, capacity, staged, &required) == HvAdapterInfoGrowStaging);
+        CHECK(required < capacity); // Kernel exhaustion returns RETRY, never a false MORE_DATA.
+        staged = 40 + attempt;
+    }
+    return true;
+}
+
+bool CheckQueries() {
+    using namespace adapter_test_io;
+    const auto kept = Encode(1), many = Encode(97);
+    Reset(Encode(0));
+    pmkext::Driver driver;
+    pmkext::AdapterSnapshot out;
+    std::string error;
+    CHECK(pmkext::wire::DecodeAdapterInfo(kept.data(), kept.size(), out, error));
+    CHECK(driver.Open(error)); // Private fake handle, never the production device.
+    CHECK(driver.GetAdapterInfo(out, error) && out.adapters.empty());
+    state.snapshot = Encode(2); state.legacy = true;
+    CHECK(driver.GetAdapterInfo(out, error) && out.adapters.size() == 2); // Old SYS needs no header probe.
+    CHECK(state.capacities.back() == pmkext::wire::kInitialAdapterInfoSize);
+    state.snapshot = many; state.legacy = false; state.capacities.clear();
+    CHECK(driver.GetAdapterInfo(out, error) && out.adapters.size() == 97 && error.empty());
+    CHECK(state.capacities == std::vector<DWORD>({56336u, static_cast<DWORD>(many.size())}));
+    CHECK(!state.active);
+
+    // A new attachment between header and retry asks for another checked growth.
+    state.replies = {{Header(40), ERROR_MORE_DATA}, {Header(97), ERROR_MORE_DATA, 16, true}, {many}};
+    state.next = 0; state.capacities.clear();
+    CHECK(driver.GetAdapterInfo(out, error) && out.adapters.size() == 97);
+    CHECK(state.capacities == std::vector<DWORD>({56336u, HvAdapterInfoSize(40), HvAdapterInfoSize(97)}));
+    // Detach/shrink between probe and full query is also valid, with an exact shorter snapshot.
+    state.replies = {{Header(97), ERROR_MORE_DATA}, {kept}}; state.next = 0;
+    CHECK(driver.GetAdapterInfo(out, error) && out.adapters.size() == 1);
+    const auto* original = out.adapters.data();
+    const auto unchanged = [&] { return out.adapters.data() == original && out.adapters.size() == 1 &&
+        out.adapters[0].instance_name == L"Адаптер" && out.running_count == 1 && !state.active; };
+    const auto reject = [&](std::vector<Reply> replies) {
+        state.replies = std::move(replies); state.next = 0;
+        return !driver.GetAdapterInfo(out, error) && !error.empty() && unchanged();
+    };
+    for (DWORD code : {DWORD{ERROR_NOT_SUPPORTED}, DWORD{ERROR_ACCESS_DENIED}, DWORD{ERROR_INSUFFICIENT_BUFFER}}) {
+        CHECK(reject({{{}, code}}));
+        CHECK(reject({{Header(40), ERROR_MORE_DATA}, {{}, code, 0, true}}));
+    }
+    for (auto header : {Header(0), Header(32), Header(HV_ADAPTER_INFO_MAX_ADAPTERS + 1u), Header(40, 41)})
+        CHECK(reject({{std::move(header), ERROR_MORE_DATA}}));
+    auto bad = Header(40); HvInfoWrite32(bad.data(), 2);
+    CHECK(reject({{bad, ERROR_MORE_DATA}}));
+    bad = Header(40); HvInfoWrite32(bad.data() + 4, 1759);
+    CHECK(reject({{bad, ERROR_MORE_DATA}}));
+    for (DWORD size : {0u, 15u, 17u, 56337u}) CHECK(reject({{Header(40), ERROR_MORE_DATA, size}}));
+    CHECK(reject({{Header(40), ERROR_MORE_DATA}, {Header(40), ERROR_MORE_DATA}})); // No growth.
+    CHECK(reject({{kept, ERROR_SUCCESS, 56337}})); // Never decode beyond the actual buffer.
+    CHECK(reject({{Header(40)}})); // A successful response must be complete, not a probe.
+    bad = many; bad.pop_back();
+    CHECK(reject({{Header(97), ERROR_MORE_DATA}, {bad}}));
+    std::vector<Reply> churn;
+    for (unsigned i = 0; i < 8; ++i) churn.push_back({Header(40 + i), ERROR_MORE_DATA});
+    state.capacities.clear();
+    CHECK(reject(std::move(churn)) && state.capacities.size() == 8);
+
+    state.replies.clear(); state.next = 0; state.snapshot = many; state.capacities.clear();
+    {
+        allocation::FailSize fail(pmkext::wire::kInitialAdapterInfoSize);
+        CHECK(!driver.GetAdapterInfo(out, error) && allocation::failed && unchanged());
+    }
+    CHECK(state.capacities.empty());
+    {
+        allocation::FailSize fail(many.size()); // Header was reaped, then fallible growth fails.
+        CHECK(!driver.GetAdapterInfo(out, error) && allocation::failed && unchanged());
+    }
+    CHECK(state.capacities.size() == 1);
+    state.snapshot = Encode(2);
+    {
+        // Keep the vector allocation below MSVC's large-allocation alignment
+        // threshold so the injected size is the allocator's exact request.
+        static_assert(2 * sizeof(pmkext::AdapterInfo) < 4096);
+        allocation::FailSize fail(2 * sizeof(pmkext::AdapterInfo));
+        CHECK(!driver.GetAdapterInfo(out, error) && allocation::failed && unchanged());
+    }
+    driver.Cleanup();
+    CHECK(!state.active && unchanged());
     return true;
 }
 
@@ -193,7 +464,8 @@ bool CheckOutput() {
 }
 
 int main() {
-    if (!CheckRoundTrip() || !CheckMalformed() || !CheckNames() || !CheckOutput()) return 1;
+    if (!CheckRoundTrip() || !CheckMalformed() || !CheckHeaderBounds() || !CheckQueries() ||
+        !CheckNames() || !CheckOutput()) return 1;
     std::puts("Adapter information codec/name/output tests passed (no driver).");
     return 0;
 }
