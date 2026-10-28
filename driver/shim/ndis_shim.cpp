@@ -6,6 +6,9 @@
 #include "driver_ready.h"
 #include "adapter_info.h"
 
+// C++20 branch attributes are hints only; retain the Rust/NDIS C ABI.
+extern "C" {
+
 #define TAG 'gVHH'
 #define CACHE_TAG 'cVHH'
 #define INFO_TAG 'iVHH'
@@ -238,7 +241,7 @@ static void ReadWorker(PDEVICE_OBJECT device, PVOID context) {
         ExAcquireFastMutex(&IoMutex);
         if (Stopping || !ReadOnline || Client != IoGetCurrentIrpStackLocation(irp)->FileObject)
             status = STATUS_CANCELLED;
-        else bytes = HvRead(irp->AssociatedIrp.SystemBuffer,
+        else bytes = HvRead(static_cast<UCHAR*>(irp->AssociatedIrp.SystemBuffer),
             IoGetCurrentIrpStackLocation(irp)->Parameters.Read.Length);
         ExReleaseFastMutex(&IoMutex);
         if (!NT_SUCCESS(status) || bytes != 0) CompleteRead(irp, status, bytes);
@@ -262,7 +265,7 @@ void hv_unlock(ULONG_PTR irql) { KeReleaseSpinLock(&PolicyLock, (KIRQL)irql); }
 UINT64 hv_now(void) { return KeQueryInterruptTime() / 10000; }
 // Nonpaged allocations are fallible, with no driver-defined byte budget.
 void* hv_allocate(SIZE_T size) {
-    if (size == 0) return NULL;
+    if (size == 0) [[unlikely]] return NULL;
     return ExAllocatePool2(POOL_FLAG_NON_PAGED | POOL_FLAG_UNINITIALIZED, size, TAG);
 }
 void hv_free(void* data, SIZE_T size) {
@@ -271,7 +274,7 @@ void hv_free(void* data, SIZE_T size) {
 }
 // Cache preparation and retirement use a separate allocator outside PolicyLock.
 void* hv_cache_allocate(SIZE_T size) {
-    if (size == 0) return NULL;
+    if (size == 0) [[unlikely]] return NULL;
     return ExAllocatePool2(POOL_FLAG_NON_PAGED | POOL_FLAG_UNINITIALIZED, size, CACHE_TAG);
 }
 void hv_cache_free(void* data, SIZE_T size) {
@@ -290,13 +293,13 @@ static ULONG ReturnFlags(void) {
 // Called with the adapter lock held. Ownership cannot be saturated or wrapped;
 // an impossible representational overflow is fatal rather than losing rundown.
 static void RetainActiveLocked(HV_ADAPTER* a) {
-    if (!HvAddU64(a->Active, 1, &a->Active)) hv_bugcheck();
+    if (!HvAddU64(a->Active, 1, &a->Active)) [[unlikely]] hv_bugcheck();
 }
 static void ReleaseActive(HV_ADAPTER* a, UINT64 count) {
     BOOLEAN complete = FALSE;
     NDIS_HANDLE filter = a->Filter;
     NdisAcquireSpinLock(&a->Lock);
-    if (!HvSubtractU64(a->Active, count, &a->Active)) hv_bugcheck();
+    if (!HvSubtractU64(a->Active, count, &a->Active)) [[unlikely]] hv_bugcheck();
     if (a->Active == 0 && a->PausePending) { a->PausePending = FALSE; complete = TRUE; }
     NdisReleaseSpinLock(&a->Lock);
     // Last access to a: PauseComplete may synchronously cause detach/free.
@@ -372,7 +375,7 @@ static PNET_BUFFER_LIST CopyReceive(HV_ADAPTER* a, PNET_BUFFER_LIST source) {
     PNET_BUFFER_LIST copy;
     if (!CopyMetadataSupported(source) || NET_BUFFER_LIST_FIRST_NB(source) == NULL) return NULL;
     copy = NdisAllocateNetBufferList(a->NblPool, 0, 0);
-    if (copy == NULL) return NULL;
+    if (copy == NULL) [[unlikely]] return NULL;
     NET_BUFFER_LIST_FIRST_NB(copy) = NULL;
     NET_BUFFER_LIST_NEXT_NBL(copy) = NULL;
     for (nb = NET_BUFFER_LIST_FIRST_NB(source); nb != NULL; nb = NET_BUFFER_NEXT_NB(nb)) {
@@ -381,17 +384,17 @@ static PNET_BUFFER_LIST CopyReceive(HV_ADAPTER* a, PNET_BUFFER_LIST source) {
         void* data;
         PMDL mdl;
         PNET_BUFFER created;
-        if (length == 0) goto Fail;
+        if (length == 0) [[unlikely]] goto Fail;
         storage = ExAllocatePool2(POOL_FLAG_NON_PAGED, length, TAG);
-        if (storage == NULL) goto Fail;
+        if (storage == NULL) [[unlikely]] goto Fail;
         data = NdisGetDataBuffer(nb, length, storage, 1, 0);
-        if (data == NULL) { ExFreePoolWithTag(storage, TAG); goto Fail; }
+        if (data == NULL) [[unlikely]] { ExFreePoolWithTag(storage, TAG); goto Fail; }
         if (data != storage) RtlCopyMemory(storage, data, length);
         mdl = IoAllocateMdl(storage, length, FALSE, FALSE, NULL);
-        if (mdl == NULL) { ExFreePoolWithTag(storage, TAG); goto Fail; }
+        if (mdl == NULL) [[unlikely]] { ExFreePoolWithTag(storage, TAG); goto Fail; }
         MmBuildMdlForNonPagedPool(mdl);
         created = NdisAllocateNetBuffer(a->NbPool, mdl, 0, length);
-        if (created == NULL) { IoFreeMdl(mdl); ExFreePoolWithTag(storage, TAG); goto Fail; }
+        if (created == NULL) [[unlikely]] { IoFreeMdl(mdl); ExFreePoolWithTag(storage, TAG); goto Fail; }
         NET_BUFFER_NEXT_NB(created) = NULL;
         if (tail != NULL) NET_BUFFER_NEXT_NB(tail) = created;
         else NET_BUFFER_LIST_FIRST_NB(copy) = created;
@@ -424,13 +427,13 @@ static HV_TOKEN* CreateToken(HV_ADAPTER* a, PNET_BUFFER_LIST nbl, NDIS_PORT_NUMB
     ULONG flags, ULONG direction, BOOLEAN resources) {
     HV_TOKEN* t;
     NdisAcquireSpinLock(&a->Lock);
-    if (!a->Running) { NdisReleaseSpinLock(&a->Lock); return NULL; }
+    if (!a->Running) [[unlikely]] { NdisReleaseSpinLock(&a->Lock); return NULL; }
     RetainActiveLocked(a);
     NdisReleaseSpinLock(&a->Lock);
     // Tokens grow fallibly without a count or byte quota.
     // Allocation failure preserves the existing drop path.
-    t = hv_allocate(sizeof(*t));
-    if (t == NULL) { ReleaseActive(a, 1); return NULL; }
+    t = static_cast<HV_TOKEN*>(hv_allocate(sizeof(*t)));
+    if (t == NULL) [[unlikely]] { ReleaseActive(a, 1); return NULL; }
     RtlZeroMemory(t, sizeof(*t));
     t->Adapter = a; t->Nbl = nbl; t->Port = port; t->Flags = flags;
     t->Direction = direction;
@@ -495,9 +498,9 @@ ULONG hv_snapshot(PNET_BUFFER nb, ULONG_PTR token, UCHAR* out, ULONG cap,
         (t->Direction == HV_DIRECTION_SEND ?
             NET_BUFFER_LIST_INFO(t->Nbl, TcpLargeSendNetBufferListInfo) != NULL :
             NET_BUFFER_LIST_INFO(t->Nbl, TcpReceiveBytesTransferred) != NULL);
-    if (n == 0) return 0;
+    if (n == 0) [[unlikely]] return 0;
     data = NdisGetDataBuffer(nb, n, out, 1, 0);
-    if (data == NULL) return 0;
+    if (data == NULL) [[unlikely]] return 0;
     if (data != out) RtlCopyMemory(out, data, n);
     *copied = n; *trusted = n; return 1;
 }
@@ -529,7 +532,7 @@ static void ClassifyChain(HV_ADAPTER* a, PNET_BUFFER_LIST chain, NDIS_PORT_NUMBE
         if (HvClassifyAdmission(admitted, session)) {
             NdisAcquireRWLockRead(a->ClassificationLock, &state, 0);
             t = CreateToken(a, nbl, port, flags, direction, resources);
-            if (t != NULL) {
+            if (t != NULL) [[likely]] {
                 ULONG_PTR cancel = direction == HV_DIRECTION_SEND ?
                     (ULONG_PTR)NDIS_GET_NET_BUFFER_LIST_CANCEL_ID(nbl) : 0;
                 result = HvClassify((ULONG_PTR)t, a->InterfaceIndex, direction, cancel,
@@ -548,7 +551,7 @@ static void ClassifyChain(HV_ADAPTER* a, PNET_BUFFER_LIST chain, NDIS_PORT_NUMBE
 }
 _Use_decl_annotations_
 void HvSend(NDIS_HANDLE context, PNET_BUFFER_LIST chain, NDIS_PORT_NUMBER port, ULONG flags) {
-    HV_ADAPTER* a = context;
+    HV_ADAPTER* a = static_cast<HV_ADAPTER*>(context);
     BOOLEAN session;
     BOOLEAN admitted = BeginIo(a, &session);
     ClassifyChain(a, chain, port, flags, HV_DIRECTION_SEND, FALSE, admitted, session);
@@ -556,7 +559,7 @@ void HvSend(NDIS_HANDLE context, PNET_BUFFER_LIST chain, NDIS_PORT_NUMBER port, 
 }
 _Use_decl_annotations_
 void HvSendComplete(NDIS_HANDLE context, PNET_BUFFER_LIST chain, ULONG flags) {
-    HV_ADAPTER* a = context;
+    HV_ADAPTER* a = static_cast<HV_ADAPTER*>(context);
     NdisAcquireSpinLock(&a->Lock); RetainActiveLocked(a); NdisReleaseSpinLock(&a->Lock);
     while (chain != NULL) {
         PNET_BUFFER_LIST nbl = chain;
@@ -564,13 +567,13 @@ void HvSendComplete(NDIS_HANDLE context, PNET_BUFFER_LIST chain, ULONG flags) {
         chain = NET_BUFFER_LIST_NEXT_NBL(nbl); NET_BUFFER_LIST_NEXT_NBL(nbl) = NULL;
         t = TakeForwarded(a, nbl, HV_DIRECTION_SEND);
         NdisFSendNetBufferListsComplete(a->Filter, nbl, flags);
-        if (t != NULL) ReleaseToken(t);
+        if (t != NULL) [[likely]] ReleaseToken(t);
     }
     ReleaseActive(a, 1);
 }
 _Use_decl_annotations_
 void HvCancelSend(NDIS_HANDLE context, PVOID cancel) {
-    HV_ADAPTER* a = context;
+    HV_ADAPTER* a = static_cast<HV_ADAPTER*>(context);
     NdisAcquireSpinLock(&a->Lock); RetainActiveLocked(a); NdisReleaseSpinLock(&a->Lock);
     HvCancel(a->InterfaceIndex, (ULONG_PTR)cancel);
     NdisFCancelSendNetBufferLists(a->Filter, cancel);
@@ -578,7 +581,7 @@ void HvCancelSend(NDIS_HANDLE context, PVOID cancel) {
 }
 _Use_decl_annotations_
 void HvReceive(NDIS_HANDLE context, PNET_BUFFER_LIST chain, NDIS_PORT_NUMBER port, ULONG count, ULONG flags) {
-    HV_ADAPTER* a = context;
+    HV_ADAPTER* a = static_cast<HV_ADAPTER*>(context);
     BOOLEAN session;
     BOOLEAN admitted = BeginIo(a, &session);
     UNREFERENCED_PARAMETER(count);
@@ -588,7 +591,7 @@ void HvReceive(NDIS_HANDLE context, PNET_BUFFER_LIST chain, NDIS_PORT_NUMBER por
 }
 _Use_decl_annotations_
 void HvReturn(NDIS_HANDLE context, PNET_BUFFER_LIST chain, ULONG flags) {
-    HV_ADAPTER* a = context;
+    HV_ADAPTER* a = static_cast<HV_ADAPTER*>(context);
     NdisAcquireSpinLock(&a->Lock); RetainActiveLocked(a); NdisReleaseSpinLock(&a->Lock);
     while (chain != NULL) {
         PNET_BUFFER_LIST nbl = chain;
@@ -597,7 +600,7 @@ void HvReturn(NDIS_HANDLE context, PNET_BUFFER_LIST chain, ULONG flags) {
         t = TakeForwarded(a, nbl, HV_DIRECTION_RECEIVE);
         if (t != NULL && t->Copied) FreeReceiveCopy(nbl);
         else NdisFReturnNetBufferLists(a->Filter, nbl, flags);
-        if (t != NULL) ReleaseToken(t);
+        if (t != NULL) [[likely]] ReleaseToken(t);
     }
     ReleaseActive(a, 1);
 }
@@ -627,19 +630,19 @@ static void HvOidCopyResult(PNDIS_OID_REQUEST original, PNDIS_OID_REQUEST clone)
     }
 }
 static PNDIS_OID_REQUEST HvOidFreeClone(HV_ADAPTER* a, PNDIS_OID_REQUEST clone) {
-    PNDIS_OID_REQUEST original = *(PVOID*)&clone->SourceReserved[0];
+    PNDIS_OID_REQUEST original = static_cast<PNDIS_OID_REQUEST>(*(PVOID*)&clone->SourceReserved[0]);
     HvOidCopyResult(original, clone);
     NdisFreeCloneOidRequest(a->Filter, clone);
     return original;
 }
 _Use_decl_annotations_
 NDIS_STATUS HvOid(NDIS_HANDLE context, PNDIS_OID_REQUEST r) {
-    HV_ADAPTER* a = context;
+    HV_ADAPTER* a = static_cast<HV_ADAPTER*>(context);
     PNDIS_OID_REQUEST clone;
     NDIS_STATUS status;
     if (!ExAcquireRundownProtection(&a->OidRundown)) return NDIS_STATUS_CLOSING;
     status = NdisAllocateCloneOidRequest(a->Filter, r, TAG, &clone);
-    if (status != NDIS_STATUS_SUCCESS) {ExReleaseRundownProtection(&a->OidRundown); return status;}
+    if (status != NDIS_STATUS_SUCCESS) [[unlikely]] {ExReleaseRundownProtection(&a->OidRundown); return status;}
     *(PVOID*)&clone->SourceReserved[0] = r;
     status = NdisFOidRequest(a->Filter, clone);
     if (status != NDIS_STATUS_PENDING) {
@@ -651,7 +654,7 @@ NDIS_STATUS HvOid(NDIS_HANDLE context, PNDIS_OID_REQUEST r) {
 }
 _Use_decl_annotations_
 void HvOidComplete(NDIS_HANDLE context, PNDIS_OID_REQUEST clone, NDIS_STATUS status) {
-    HV_ADAPTER* a = context;
+    HV_ADAPTER* a = static_cast<HV_ADAPTER*>(context);
     PNDIS_OID_REQUEST original = HvOidFreeClone(a, clone);
     NdisFOidRequestComplete(a->Filter, original, status);
     ExReleaseRundownProtection(&a->OidRundown);
@@ -789,8 +792,9 @@ static NTSTATUS QueryAdapterInfo(UCHAR* out, ULONG capacity, ULONG_PTR* transfer
                 status = STATUS_INTEGER_OVERFLOW;
                 break;
             }
-            snapshot = ExAllocatePool2(POOL_FLAG_NON_PAGED | POOL_FLAG_UNINITIALIZED, (SIZE_T)bytes, INFO_TAG);
-            if (snapshot == NULL) { status = STATUS_INSUFFICIENT_RESOURCES; break; }
+            snapshot = static_cast<HV_ADAPTER_INFO*>(ExAllocatePool2(
+                POOL_FLAG_NON_PAGED | POOL_FLAG_UNINITIALIZED, (SIZE_T)bytes, INFO_TAG));
+            if (snapshot == NULL) [[unlikely]] { status = STATUS_INSUFFICIENT_RESOURCES; break; }
             allocatedCount = count;
             continue;
         }
@@ -816,10 +820,10 @@ static NTSTATUS QueryAdapterInfo(UCHAR* out, ULONG capacity, ULONG_PTR* transfer
 }
 _Use_decl_annotations_
 void HvStatus(NDIS_HANDLE context, PNDIS_STATUS_INDICATION status) {
-    HV_ADAPTER* a = context;
+    HV_ADAPTER* a = static_cast<HV_ADAPTER*>(context);
     if (status->StatusCode == NDIS_STATUS_LINK_STATE && status->StatusBuffer != NULL &&
         status->StatusBufferSize >= NDIS_SIZEOF_LINK_STATE_REVISION_1) {
-        const NDIS_LINK_STATE* link = status->StatusBuffer;
+        const NDIS_LINK_STATE* link = static_cast<const NDIS_LINK_STATE*>(status->StatusBuffer);
         if (link->Header.Type == NDIS_OBJECT_TYPE_DEFAULT && link->Header.Revision >= NDIS_LINK_STATE_REVISION_1 &&
             link->Header.Size >= NDIS_SIZEOF_LINK_STATE_REVISION_1 && link->Header.Size <= status->StatusBufferSize) {
             KIRQL irql;
@@ -850,8 +854,8 @@ NDIS_STATUS HvFilterAttach(NDIS_HANDLE filter, NDIS_HANDLE context, PNDIS_FILTER
     // configuration means no adapter attaches; optional LWFs are bypassed by NDIS.
     if (p->MiniportMediaType != NdisMedium802_3 ||
         !TargetAdapter(p, &interfaceGuid)) return NDIS_STATUS_NOT_SUPPORTED;
-    a = ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(*a), TAG);
-    if (a == NULL) return NDIS_STATUS_RESOURCES;
+    a = static_cast<HV_ADAPTER*>(ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(*a), TAG));
+    if (a == NULL) [[unlikely]] return NDIS_STATUS_RESOURCES;
     a->Filter = filter; a->InterfaceIndex = p->BaseMiniportIfIndex;
     a->Id = (UINT64)InterlockedIncrement64(&NextAdapter);
     CaptureAttachInfo(a, p, &interfaceGuid);
@@ -859,20 +863,20 @@ NDIS_STATUS HvFilterAttach(NDIS_HANDLE filter, NDIS_HANDLE context, PNDIS_FILTER
     for (bucket = 0; bucket < HV_TOKEN_BUCKET_COUNT; ++bucket) InitializeListHead(&a->Tokens[bucket]);
     ExInitializeRundownProtection(&a->OidRundown);
     a->ClassificationLock = NdisAllocateRWLock(filter);
-    if (a->ClassificationLock == NULL) goto FreeLock;
+    if (a->ClassificationLock == NULL) [[unlikely]] goto FreeLock;
     nblPool.Header.Type = NDIS_OBJECT_TYPE_DEFAULT;
     nblPool.Header.Revision = NET_BUFFER_LIST_POOL_PARAMETERS_REVISION_1;
     nblPool.Header.Size = NDIS_SIZEOF_NET_BUFFER_LIST_POOL_PARAMETERS_REVISION_1;
     nblPool.ProtocolId = NDIS_PROTOCOL_ID_DEFAULT;
     nblPool.PoolTag = TAG;
     a->NblPool = NdisAllocateNetBufferListPool(filter, &nblPool);
-    if (a->NblPool == NULL) goto FreeRw;
+    if (a->NblPool == NULL) [[unlikely]] goto FreeRw;
     nbPool.Header.Type = NDIS_OBJECT_TYPE_DEFAULT;
     nbPool.Header.Revision = NET_BUFFER_POOL_PARAMETERS_REVISION_1;
     nbPool.Header.Size = NDIS_SIZEOF_NET_BUFFER_POOL_PARAMETERS_REVISION_1;
     nbPool.PoolTag = TAG;
     a->NbPool = NdisAllocateNetBufferPool(filter, &nbPool);
-    if (a->NbPool == NULL) goto FreeNblPool;
+    if (a->NbPool == NULL) [[unlikely]] goto FreeNblPool;
     if (!HvAttach(a->InterfaceIndex)) goto FreeNbPool;
     attributes.Header.Type = NDIS_OBJECT_TYPE_FILTER_ATTRIBUTES;
     attributes.Header.Revision = NDIS_FILTER_ATTRIBUTES_REVISION_1;
@@ -897,7 +901,7 @@ FreeLock:
 }
 _Use_decl_annotations_
 NDIS_STATUS HvFilterRestart(NDIS_HANDLE context, PNDIS_FILTER_RESTART_PARAMETERS parameters) {
-    HV_ADAPTER* a = context;
+    HV_ADAPTER* a = static_cast<HV_ADAPTER*>(context);
     if (!HvRestart(a->InterfaceIndex)) return NDIS_STATUS_FAILURE;
     CaptureRestartInfo(a, parameters);
     SetFilterRunning(a, TRUE);
@@ -905,7 +909,7 @@ NDIS_STATUS HvFilterRestart(NDIS_HANDLE context, PNDIS_FILTER_RESTART_PARAMETERS
 }
 _Use_decl_annotations_
 NDIS_STATUS HvFilterPause(NDIS_HANDLE context, PNDIS_FILTER_PAUSE_PARAMETERS parameters) {
-    HV_ADAPTER* a = context;
+    HV_ADAPTER* a = static_cast<HV_ADAPTER*>(context);
     NDIS_STATUS status;
     KIRQL irql;
     SetFilterRunning(a, FALSE);
@@ -923,7 +927,7 @@ NDIS_STATUS HvFilterPause(NDIS_HANDLE context, PNDIS_FILTER_PAUSE_PARAMETERS par
 }
 _Use_decl_annotations_
 void HvFilterDetach(NDIS_HANDLE context) {
-    HV_ADAPTER* a = context;
+    HV_ADAPTER* a = static_cast<HV_ADAPTER*>(context);
     KIRQL irql;
     if (a->Running || a->Active != 0 || !TokensEmpty(a)) hv_bugcheck();
     KeAcquireSpinLock(&AdapterInfoLock, &irql);
@@ -965,7 +969,7 @@ NTSTATUS HvDispatch(PDEVICE_OBJECT device, PIRP irp) {
                 else queueRead = TRUE;
             }
         } else if (stack->MajorFunction == IRP_MJ_WRITE) {
-            status = HvWrite(irp->AssociatedIrp.SystemBuffer, stack->Parameters.Write.Length);
+            status = HvWrite(static_cast<const UCHAR*>(irp->AssociatedIrp.SystemBuffer), stack->Parameters.Write.Length);
             if (NT_SUCCESS(status)) transferred = stack->Parameters.Write.Length;
             if (!ReadOnline) cancelReads = TRUE;
         } else if (stack->MajorFunction == IRP_MJ_DEVICE_CONTROL) {
@@ -986,13 +990,13 @@ NTSTATUS HvDispatch(PDEVICE_OBJECT device, PIRP irp) {
                     UINT64 count = (UINT64)InterlockedCompareExchange64(&FilteredDeviceCount, 0, 0);
                     if (count > MAXULONG) status = STATUS_INTEGER_OVERFLOW;
                     else {
-                        HvInfoWrite32(irp->AssociatedIrp.SystemBuffer, (ULONG)count);
+                        HvInfoWrite32(static_cast<UCHAR*>(irp->AssociatedIrp.SystemBuffer), (ULONG)count);
                         transferred = sizeof(ULONG);
                     }
                 }
             } else if (code == ADAPTER_INFO_IOCTL) {
                 if (!HvIoctlInputEmpty(stack->Parameters.DeviceIoControl.InputBufferLength)) status = STATUS_INVALID_PARAMETER;
-                else status = QueryAdapterInfo(irp->AssociatedIrp.SystemBuffer,
+                else status = QueryAdapterInfo(static_cast<UCHAR*>(irp->AssociatedIrp.SystemBuffer),
                     stack->Parameters.DeviceIoControl.OutputBufferLength, &transferred);
             } else status = STATUS_NOT_SUPPORTED;
         } else status = STATUS_INVALID_DEVICE_REQUEST;
@@ -1174,7 +1178,7 @@ NTSTATUS hv_initialize(PDRIVER_OBJECT driver, PUNICODE_STRING registry) {
     if (status != NDIS_STATUS_SUCCESS) {NdisFDeregisterFilterDriver(DriverHandle); DriverHandle = NULL; return status;}
     ReadWorkItem = IoAllocateWorkItem(ControlDevice);
     CacheWorkItem = IoAllocateWorkItem(ControlDevice);
-    if (ReadWorkItem == NULL || CacheWorkItem == NULL) {
+    if (ReadWorkItem == NULL || CacheWorkItem == NULL) [[unlikely]] {
         if (ReadWorkItem != NULL) {IoFreeWorkItem(ReadWorkItem); ReadWorkItem = NULL;}
         if (CacheWorkItem != NULL) {IoFreeWorkItem(CacheWorkItem); CacheWorkItem = NULL;}
         NdisDeregisterDeviceEx(DeviceHandle); NdisFDeregisterFilterDriver(DriverHandle);
@@ -1203,3 +1207,5 @@ void HvUnload(PDRIVER_OBJECT driver) {
     if (ReadyEvent != NULL) {ObDereferenceObject(ReadyEvent); ReadyEvent = NULL;}
     if (ReadyEventHandle != NULL) {ZwClose(ReadyEventHandle); ReadyEventHandle = NULL;}
 }
+
+} // extern "C"

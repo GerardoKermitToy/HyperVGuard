@@ -1,5 +1,6 @@
 use alloc::alloc::{alloc, dealloc};
 use core::{alloc::Layout, marker::PhantomData, ptr::NonNull};
+use likely_stable::unlikely;
 
 struct Node<T> {
     previous: Option<Handle<T>>,
@@ -53,10 +54,12 @@ impl<T> List<T> {
         };
         // SAFETY: this is a nonzero layout, freed with the same layout below.
         // The driver supplies fallible, nonpaged GlobalAlloc at DISPATCH_LEVEL.
-        let Some(node) = NonNull::new(unsafe { alloc(Layout::new::<Node<T>>()) }.cast::<Node<T>>())
-        else {
+        let node = unsafe { alloc(Layout::new::<Node<T>>()) }.cast::<Node<T>>();
+        if unlikely(node.is_null()) {
             return Err(value);
-        };
+        }
+        // SAFETY: the fallible allocation was checked for null above.
+        let node = unsafe { NonNull::new_unchecked(node) };
         let handle = Handle(node);
         unsafe {
             node.as_ptr().write(Node {

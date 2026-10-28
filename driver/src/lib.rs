@@ -21,6 +21,7 @@ use hyperv_policy::{
     packet::{self, NdisPath, Packet, SNAPSHOT},
 };
 use hyperv_protocol::{self as wire, Command};
+use likely_stable::unlikely;
 
 type Handle = *mut c_void;
 const SUCCESS: i32 = 0;
@@ -61,7 +62,7 @@ struct NonPagedAllocator;
 // fallible allocation without a driver-defined aggregate byte quota.
 unsafe impl GlobalAlloc for NonPagedAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if layout.align() > 16 {
+        if unlikely(layout.align() > 16) {
             return core::ptr::null_mut();
         }
         unsafe { hv_allocate(layout.size()) }
@@ -292,7 +293,9 @@ fn capture_packet(nb: Handle, token: usize, packet: &Packet) -> Result<Option<Ve
             &mut offload,
         )
     };
-    if ok == 0 || copied as usize != layout.frame_len || trusted < copied || frame_len < copied {
+    if unlikely(
+        ok == 0 || copied as usize != layout.frame_len || trusted < copied || frame_len < copied,
+    ) {
         return Err(());
     }
     Ok(Some(data))
@@ -316,7 +319,7 @@ pub extern "C" fn HvClassify(
     let mut first: Option<Packet> = None;
     let mut saw_non_ip = false;
     let mut nb = unsafe { hv_first_nb(token) };
-    if nb.is_null() {
+    if unlikely(nb.is_null()) {
         with_state(|e| e.malformed());
         return 1;
     }
@@ -340,7 +343,7 @@ pub extern "C" fn HvClassify(
                 &mut offload,
             )
         };
-        if ok == 0 || copied as usize > SNAPSHOT {
+        if unlikely(ok == 0 || copied as usize > SNAPSHOT) {
             with_state(|e| e.malformed());
             return 1;
         }
@@ -352,13 +355,13 @@ pub extern "C" fn HvClassify(
         );
         match parsed {
             Ok(Some(p)) => {
-                if saw_non_ip {
+                if unlikely(saw_non_ip) {
                     with_state(|e| e.malformed());
                     return 1;
                 }
                 if let Some(f) = &mut first {
                     // A single legacy request cannot describe two different flows.
-                    if f.merge(&p).is_err() {
+                    if unlikely(f.merge(&p).is_err()) {
                         with_state(|e| e.malformed());
                         return 1;
                     }
@@ -367,7 +370,7 @@ pub extern "C" fn HvClassify(
                 }
             }
             Ok(None) => {
-                if first.is_some() {
+                if unlikely(first.is_some()) {
                     with_state(|e| e.malformed());
                     return 1;
                 }
@@ -441,7 +444,7 @@ pub extern "C" fn HvResourceDrop() {
 /// bytes, valid for the entire call, supplied by the buffered IRP shim.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn HvRead(out: *mut u8, len: u32) -> u32 {
-    if out.is_null() || len == 0 {
+    if unlikely(out.is_null() || len == 0) {
         return 0;
     }
     // SAFETY: the shim provides the system buffer and its exact validated size.
@@ -463,7 +466,7 @@ pub unsafe extern "C" fn HvRead(out: *mut u8, len: u32) -> u32 {
 /// for the call and serialized with client cleanup by the C shim's I/O mutex.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn HvWrite(data: *const u8, len: u32) -> i32 {
-    if data.is_null() || len == 0 {
+    if unlikely(data.is_null() || len == 0) {
         return INVALID_PARAMETER;
     }
     let bytes = unsafe { core::slice::from_raw_parts(data, len as usize) };

@@ -12,6 +12,8 @@ use hyperv_protocol::{
     encode_connection_header, encode_log,
 };
 
+use likely_stable::{likely, unlikely};
+
 pub use crate::bandwidth::{BandwidthPlan, BandwidthWork};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -62,14 +64,16 @@ struct Event {
 // Only fallible allocation is used. Records and metadata have no aggregate
 // byte quota; the per-record payload limit remains part of the wire contract.
 pub fn allocate_record(len: usize) -> Option<Vec<u8>> {
-    if len > MAX_RECORD {
+    if unlikely(len > MAX_RECORD) {
         return None;
     }
     allocate_event(len)
 }
 fn allocate_event(len: usize) -> Option<Vec<u8>> {
     let mut data = Vec::new();
-    data.try_reserve_exact(len).ok()?;
+    if unlikely(data.try_reserve_exact(len).is_err()) {
+        return None;
+    }
     data.resize(len, 0);
     Some(data)
 }
@@ -517,7 +521,7 @@ impl Engine {
     }
     fn cache_bank(&self, interface_index: u32, packet: &Packet) -> Option<Handle<Interface>> {
         if !packet.cacheable
-            || !matches!(packet.connection.protocol, 6 | 17)
+            || unlikely(!matches!(packet.connection.protocol, 6 | 17))
             || packet.flow.protocol != packet.connection.protocol
             || packet.flow.ipv6 != packet.connection.ipv6
         {
@@ -562,7 +566,7 @@ impl Engine {
     ) {
         if allow {
             self.stats.allowed = self.stats.allowed.saturating_add(1);
-            if self.online && matches!(packet.connection.protocol, 6 | 17) {
+            if self.online && likely(matches!(packet.connection.protocol, 6 | 17)) {
                 self.bandwidth_add_with_work(interface_index, packet, work);
             }
         } else {
@@ -706,7 +710,9 @@ impl Engine {
         self.stats.received = self.stats.received.saturating_add(1);
         let payload_len = packet.payload_len as usize;
         let expected = connection_header_len(&packet.connection) + payload_len;
-        if payload_len > MAX_PAYLOAD || record.as_ref().is_some_and(|data| data.len() != expected) {
+        if unlikely(
+            payload_len > MAX_PAYLOAD || record.as_ref().is_some_and(|data| data.len() != expected),
+        ) {
             self.stats.malformed = self.stats.malformed.saturating_add(1);
             self.account(interface_index, &packet, false, work);
             return Submission::Finish(Action {
@@ -714,20 +720,21 @@ impl Engine {
                 finish: Finish::Drop,
             });
         }
-        if !self.has_room(expected) || self.next_id == u64::MAX || record.is_none() {
+        if unlikely(!self.has_room(expected) || self.next_id == u64::MAX || record.is_none()) {
             return self.overflow(interface_index, &packet, token, work);
         }
         let id = self.next_id;
         let mut data = record.unwrap_or_default();
-        if encode_connection_header(
-            &mut data,
-            id,
-            interface_index,
-            &packet.connection,
-            payload_len,
-        )
-        .is_err()
-        {
+        if unlikely(
+            encode_connection_header(
+                &mut data,
+                id,
+                interface_index,
+                &packet.connection,
+                payload_len,
+            )
+            .is_err(),
+        ) {
             self.stats.malformed = self.stats.malformed.saturating_add(1);
             self.account(interface_index, &packet, false, work);
             return Submission::Finish(Action {
@@ -827,7 +834,7 @@ impl Engine {
             && let Some(bank) = self.cache_bank(p.interface_index, &p.packet)
         {
             // SAFETY: cache_bank returned this live node; insertion cannot detach it.
-            if !unsafe { self.interfaces.get_mut(bank) }.caches.insert(
+            if unlikely(!unsafe { self.interfaces.get_mut(bank) }.caches.insert(
                 &p.packet.connection,
                 Decision {
                     allow: verdict.allows(),
@@ -835,7 +842,7 @@ impl Engine {
                 },
                 now,
                 work,
-            ) {
+            )) {
                 self.stats.cache_allocation_failures =
                     self.stats.cache_allocation_failures.saturating_add(1);
             }

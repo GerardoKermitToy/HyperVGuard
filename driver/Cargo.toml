@@ -13,3 +13,4 @@ doctest = false
 [dependencies]
 hyperv-protocol = { path = "../protocol" }
 hyperv-policy = { path = "../policy" }
+likely_stable.workspace = true

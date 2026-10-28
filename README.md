@@ -10,6 +10,8 @@ Only traffic passing through the host vNIC is covered; VM-to-VM traffic is not g
 
 Requires Windows x64 **build 25341+**, Hyper-V with Default Switch, Visual Studio C++ x64 tools with CMake/Ninja, Rust with the `x86_64-pc-windows-msvc` target, and WDK/SDK **10.0.28000.0**. Kernel builds are **release-only**.
 
+Cargo resolves the `no_std`-compatible `likely_stable` dependency from crates.io (or its local cache). The [WDK ABI shim](driver/shim/ndis_shim.cpp) uses C++20 branch attributes, with C linkage and exceptions/RTTI disabled. Hints favor IPv4 TCP/UDP and successful allocation; all validation and allocation-failure fallbacks remain in place.
+
 Commands below use Git Bash at the repository root:
 
 ```bash

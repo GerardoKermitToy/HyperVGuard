@@ -1,4 +1,5 @@
 use hyperv_protocol::{Connection, Direction, MAX_PAYLOAD, connection_header_len};
+use likely_stable::{likely, unlikely};
 
 pub const SNAPSHOT: usize = 320;
 
@@ -75,7 +76,7 @@ impl Packet {
     // allocation. Encoding the prefix later overwrites only the Ethernet bytes.
     pub fn capture_layout(&self) -> Option<CaptureLayout> {
         let payload_len = self.payload_len as usize;
-        if payload_len > MAX_PAYLOAD {
+        if unlikely(payload_len > MAX_PAYLOAD) {
             return None;
         }
         let prefix = connection_header_len(&self.connection);
@@ -89,7 +90,7 @@ impl Packet {
     // One verdict covers a homogeneous NBL; only the first NB supplies payload.
     // The chain has no count quota and can account for more than u32::MAX bytes.
     pub fn merge(&mut self, other: &Self) -> Result<(), ParseError> {
-        if self.flow != other.flow {
+        if unlikely(self.flow != other.flow) {
             return Err(ParseError::Malformed);
         }
         self.ip_len = self.ip_len.saturating_add(other.ip_len);
@@ -134,6 +135,7 @@ fn be16(bytes: &[u8], offset: usize) -> u16 {
 // Only read policy fields from the copied NDIS host-memory prefix. Both headers
 // and payload remain untrusted network input and all offsets are checked.
 // None means a non-IP Ethernet control frame, outside the legacy L3 wire API.
+// Hints favor valid IPv4 TCP/UDP, without excluding other traffic or errors.
 pub fn parse(
     data: &[u8],
     trusted_len: usize,
@@ -141,24 +143,24 @@ pub fn parse(
     offload: bool,
 ) -> Result<Option<Packet>, ParseError> {
     let trusted = &data[..trusted_len.min(data.len())];
-    if trusted.len() < 14 || frame_len < 14 {
+    if unlikely(trusted.len() < 14 || frame_len < 14) {
         return Err(ParseError::Truncated);
     }
     let mut offset = 14;
     let mut ether_type = be16(trusted, 12);
     let mut tags = 0;
     while matches!(ether_type, 0x8100 | 0x88a8 | 0x9100) {
-        if tags == 2 {
+        if unlikely(tags == 2) {
             return Err(ParseError::TooManyVlans);
         }
-        if trusted.len() < offset + 4 || frame_len < offset + 4 {
+        if unlikely(trusted.len() < offset + 4 || frame_len < offset + 4) {
             return Err(ParseError::Truncated);
         }
         ether_type = be16(trusted, offset + 2);
         offset += 4;
         tags += 1;
     }
-    if !matches!(ether_type, 0x0800 | 0x86dd) {
+    if unlikely(!matches!(ether_type, 0x0800 | 0x86dd)) {
         return Ok(None);
     }
     let ip = &trusted[offset..];
@@ -166,19 +168,19 @@ pub fn parse(
     let mut p = Packet::EMPTY;
     p.flow.l2[..offset].copy_from_slice(&trusted[..offset]);
     p.flow.l2_len = offset as u8;
-    let (mut transport, mut proto, fragmented, ip_len) = if ether_type == 0x0800 {
-        if ip.len() < 20 {
+    let (mut transport, mut proto, fragmented, ip_len) = if likely(ether_type == 0x0800) {
+        if unlikely(ip.len() < 20) {
             return Err(ParseError::Truncated);
         }
         let ihl = usize::from(ip[0] & 15) * 4;
         let total = usize::from(be16(ip, 2));
-        if ip[0] >> 4 != 4 || ihl < 20 || total < ihl && !offload {
+        if unlikely(ip[0] >> 4 != 4 || ihl < 20 || total < ihl && !offload) {
             return Err(ParseError::Malformed);
         }
-        if ip.len() < ihl || logical < ihl {
+        if unlikely(ip.len() < ihl || logical < ihl) {
             return Err(ParseError::Truncated);
         }
-        if total > logical && !offload {
+        if unlikely(total > logical && !offload) {
             return Err(ParseError::Truncated);
         }
         p.flow.source[..4].copy_from_slice(&ip[12..16]);
@@ -190,10 +192,10 @@ pub fn parse(
             if offload { logical } else { total },
         )
     } else {
-        if ip.len() < 40 || logical < 40 {
+        if unlikely(ip.len() < 40 || logical < 40) {
             return Err(ParseError::Truncated);
         }
-        if ip[0] >> 4 != 6 {
+        if unlikely(ip[0] >> 4 != 6) {
             return Err(ParseError::Malformed);
         }
         let payload = usize::from(be16(ip, 4));
@@ -207,7 +209,7 @@ pub fn parse(
         } else {
             40 + payload
         };
-        if total > logical {
+        if unlikely(total > logical) {
             return Err(ParseError::Truncated);
         }
         p.flow.ipv6 = true;
@@ -215,12 +217,12 @@ pub fn parse(
         p.flow.destination.copy_from_slice(&ip[24..40]);
         (40, ip[6], false, total)
     };
-    if ip_len > MAX_PAYLOAD {
+    if unlikely(ip_len > MAX_PAYLOAD) {
         return Err(ParseError::TooLarge);
     }
     let mut fragment = fragmented;
     let mut fully_parsed = true;
-    if p.flow.ipv6 {
+    if unlikely(p.flow.ipv6) {
         let mut steps = 0;
         while matches!(proto, 0 | 43 | 60 | 44 | 51) {
             steps += 1;
@@ -251,20 +253,20 @@ pub fn parse(
             }
         }
     }
-    if fully_parsed && !fragment && matches!(proto, 6 | 17) {
+    if fully_parsed && !fragment && likely(matches!(proto, 6 | 17)) {
         let min = if proto == 6 { 20 } else { 8 };
-        if transport + min > ip_len {
+        if unlikely(transport + min > ip_len) {
             return Err(ParseError::Malformed);
         }
         if transport + min <= ip.len() {
             if proto == 6 {
                 let tcp_len = usize::from(ip[transport + 12] >> 4) * 4;
-                if tcp_len < 20 || transport + tcp_len > ip_len {
+                if unlikely(tcp_len < 20 || transport + tcp_len > ip_len) {
                     return Err(ParseError::Malformed);
                 }
             } else {
                 let udp_len = usize::from(be16(ip, transport + 4));
-                if !offload && (udp_len < 8 || udp_len > ip_len - transport) {
+                if unlikely(!offload && (udp_len < 8 || udp_len > ip_len - transport)) {
                     return Err(ParseError::Malformed);
                 }
             }

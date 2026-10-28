@@ -6,3 +6,4 @@ license = "GPL-3.0-only"
 
 [dependencies]
 hyperv-protocol = { path = "../protocol" }
+likely_stable.workspace = true

@@ -1,6 +1,7 @@
 use alloc::alloc::{alloc, dealloc};
 use core::{alloc::Layout, mem, ptr};
 use hyperv_protocol::Connection;
+use likely_stable::unlikely;
 
 const INITIAL_CAPACITY: usize = 128;
 const WORK_PER_PASS: usize = 32;
@@ -72,7 +73,7 @@ impl Buffer {
             return None;
         }
         let data = unsafe { (allocator.allocate)(size) };
-        if data.is_null() {
+        if unlikely(data.is_null()) {
             return None;
         }
         // Only control bytes (including the wrap mirror) need initialization.
@@ -136,7 +137,7 @@ impl<const N: usize> Tuple<N> {
 }
 
 pub(crate) fn tuple_hash(connection: &Connection) -> u64 {
-    if connection.ipv6 {
+    if unlikely(connection.ipv6) {
         Tuple::<16>::from_connection(connection).hash()
     } else {
         Tuple::<4>::from_connection(connection).hash()
@@ -322,7 +323,7 @@ struct Allocation {
 }
 impl CachePlan {
     fn allocate(self) -> Option<Allocation> {
-        let layout = if self.ipv6 {
+        let layout = if unlikely(self.ipv6) {
             Table::<16>::layout(self.capacity)?
         } else {
             Table::<4>::layout(self.capacity)?
@@ -560,15 +561,14 @@ impl Caches {
         mem::replace(self, Self::new(self.allocator))
     }
     fn transport(protocol: u8) -> Option<usize> {
-        match protocol {
-            6 => Some(0),
-            17 => Some(1),
-            _ => None,
+        if unlikely(!matches!(protocol, 6 | 17)) {
+            return None;
         }
+        Some(usize::from(protocol == 17))
     }
     pub(crate) fn plan(&self, c: &Connection) -> Option<CachePlan> {
         let protocol = Self::transport(c.protocol)?;
-        if c.ipv6 {
+        if unlikely(c.ipv6) {
             let cache = &self.ipv6[protocol];
             let tuple = Tuple::from_connection(c);
             let hash = tuple.hash();
@@ -594,7 +594,7 @@ impl Caches {
     }
     pub(crate) fn get(&self, c: &Connection, now: u64) -> Option<bool> {
         let protocol = Self::transport(c.protocol)?;
-        if c.ipv6 {
+        if unlikely(c.ipv6) {
             let tuple = Tuple::from_connection(c);
             self.ipv6[protocol].get(&tuple, tuple.hash(), now)
         } else {
@@ -604,7 +604,7 @@ impl Caches {
     }
     pub(crate) fn apply(&mut self, c: &Connection, now: u64, ttl: u64) -> Option<bool> {
         let protocol = Self::transport(c.protocol)?;
-        if c.ipv6 {
+        if unlikely(c.ipv6) {
             let tuple = Tuple::from_connection(c);
             self.ipv6[protocol].apply(&tuple, tuple.hash(), now, ttl)
         } else {
@@ -622,7 +622,7 @@ impl Caches {
         let Some(protocol) = Self::transport(c.protocol) else {
             return false;
         };
-        if c.ipv6 {
+        if unlikely(c.ipv6) {
             self.ipv6[protocol].insert(
                 Entry {
                     tuple: Tuple::from_connection(c),

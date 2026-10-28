@@ -13,6 +13,7 @@ use core::{
     ptr::{self, NonNull},
 };
 use hyperv_protocol::{BandwidthEntry, Connection, Direction};
+use likely_stable::unlikely;
 
 const PAGE_ENTRIES: usize = 128;
 const INITIAL_INDEX_CAPACITY: usize = 64;
@@ -83,7 +84,12 @@ struct PreparedPage(NonNull<Page>);
 impl PreparedPage {
     fn prepare() -> Option<Self> {
         // SAFETY: Page has a nonzero layout and this pointer is uniquely owned.
-        let page = NonNull::new(unsafe { alloc(Layout::new::<Page>()) }.cast::<Page>())?;
+        let page = unsafe { alloc(Layout::new::<Page>()) }.cast::<Page>();
+        if unlikely(page.is_null()) {
+            return None;
+        }
+        // SAFETY: the fallible allocation was checked for null above.
+        let page = unsafe { NonNull::new_unchecked(page) };
         // SAFETY: only the header needs initialization. MaybeUninit<Entry> may
         // remain uninitialized, and no reference to an Entry is created here.
         unsafe {
@@ -260,7 +266,9 @@ impl Index {
         }
         Layout::array::<IndexSlot>(capacity).ok()?;
         let mut slots = Vec::new();
-        slots.try_reserve_exact(capacity).ok()?;
+        if unlikely(slots.try_reserve_exact(capacity).is_err()) {
+            return None;
+        }
         slots.resize(capacity, IndexSlot::EMPTY);
         Some(Self { slots })
     }
@@ -467,7 +475,7 @@ impl Bank {
                 // The operation MUST execute in release builds as well.
                 let inserted = self.current.insert(slot.hash, entry);
                 debug_assert!(inserted, "bandwidth migration index unexpectedly full");
-                if !inserted {
+                if unlikely(!inserted) {
                     // Preserve the old handle and cursor even if an invariant
                     // is violated; lookup can still find every old key.
                     return;
@@ -523,7 +531,7 @@ impl BandwidthWork {
     pub fn prepare(plan: Option<BandwidthPlan>) -> Self {
         let mut work = Self::empty();
         if let Some(plan) = plan {
-            if plan.owner && work.owner.try_push_back(Bank::new()).is_err() {
+            if plan.owner && unlikely(work.owner.try_push_back(Bank::new()).is_err()) {
                 work.failed = true;
             }
             if plan.page {
