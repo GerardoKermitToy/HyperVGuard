@@ -1,18 +1,18 @@
 use crate::{
-    cache::{CacheAllocator, CachePlan, CacheWork, Caches, Decision, tuple_hash},
+    bandwidth::{BandwidthGroup, BandwidthStore},
+    cache::{CacheAllocator, CachePlan, CacheWork, Caches, Decision},
     packet::Packet,
     storage::{Handle, List},
 };
-use alloc::{boxed::Box, vec::Vec};
+use alloc::vec::Vec;
 use core::fmt::{self, Write};
 use hyperv_protocol::{
-    BANDWIDTH_HEADER, BandwidthEntry, Connection, Direction, MAX_LOG_RECORD, MAX_PAYLOAD,
-    MAX_RECORD, Verdict, bandwidth_entry_len, bandwidth_record_len, connection_header_len,
-    encode_bandwidth_entry, encode_bandwidth_header, encode_connection_header, encode_log,
+    BANDWIDTH_HEADER, MAX_LOG_RECORD, MAX_PAYLOAD, MAX_RECORD, Verdict, bandwidth_entry_len,
+    bandwidth_record_len, connection_header_len, encode_bandwidth_entry, encode_bandwidth_header,
+    encode_connection_header, encode_log,
 };
 
-// Bucket count affects lookup work, never admission: every chain grows fallibly.
-const BANDWIDTH_BUCKETS: usize = 256;
+pub use crate::bandwidth::{BandwidthPlan, BandwidthWork};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Finish {
@@ -73,48 +73,8 @@ fn allocate_event(len: usize) -> Option<Vec<u8>> {
     data.resize(len, 0);
     Some(data)
 }
-#[derive(Clone, Copy)]
-struct Bandwidth {
-    interface_index: u32,
-    connection: Connection,
-    tx: u64,
-    rx: u64,
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct BandwidthGroup {
-    interface_index: u32,
-    protocol: u8,
-    ipv6: bool,
-}
-impl Bandwidth {
-    fn report_group(&self) -> BandwidthGroup {
-        BandwidthGroup {
-            interface_index: self.interface_index,
-            protocol: self.connection.protocol,
-            ipv6: self.connection.ipv6,
-        }
-    }
-    fn entry(&self) -> BandwidthEntry {
-        BandwidthEntry {
-            local_ip: self.connection.local_ip,
-            local_port: self.connection.local_port,
-            remote_ip: self.connection.remote_ip,
-            remote_port: self.connection.remote_port,
-            transmitted_bytes: self.tx,
-            received_bytes: self.rx,
-        }
-    }
-}
-fn bandwidth_bucket_index(interface_index: u32, connection: &Connection) -> usize {
-    let hash = tuple_hash(connection).rotate_left(5)
-        ^ u64::from(connection.protocol)
-        ^ u64::from(interface_index).wrapping_mul(0x9e37_79b9);
-    hash as usize & (BANDWIDTH_BUCKETS - 1)
-}
-
 pub struct BandwidthTable {
-    buckets: [List<Bandwidth>; BANDWIDTH_BUCKETS],
-    count: usize,
+    store: BandwidthStore,
     epoch: u64,
 }
 impl Default for BandwidthTable {
@@ -125,8 +85,7 @@ impl Default for BandwidthTable {
 impl BandwidthTable {
     pub fn new() -> Self {
         Self {
-            buckets: [const { List::new() }; BANDWIDTH_BUCKETS],
-            count: 0,
+            store: BandwidthStore::new(),
             epoch: 0,
         }
     }
@@ -134,22 +93,13 @@ impl BandwidthTable {
         self.epoch
     }
     fn next_group(&self, after: Option<BandwidthGroup>) -> Option<BandwidthGroup> {
-        self.buckets
-            .iter()
-            .flat_map(List::iter)
-            .map(Bandwidth::report_group)
-            .filter(|key| after.is_none_or(|after| *key > after))
-            .min()
+        self.store.next_group(after)
     }
     fn encode_group(&self, group: BandwidthGroup) -> Option<Vec<u8>> {
-        let count = self
-            .buckets
-            .iter()
-            .flat_map(List::iter)
-            .filter(|bandwidth| bandwidth.report_group() == group)
-            .count();
+        let mut count = 0;
+        self.store.visit_group(group, &mut |_| count += 1);
         let len = bandwidth_record_len(group.ipv6, count)?;
-        let mut data = allocate_event(len).expect("bandwidth event allocation");
+        let mut data = allocate_event(len)?;
         encode_bandwidth_header(
             &mut data,
             group.interface_index,
@@ -158,44 +108,29 @@ impl BandwidthTable {
             count,
         )
         .expect("valid bandwidth event layout");
-        for (out, bandwidth) in data[BANDWIDTH_HEADER..]
-            .chunks_exact_mut(bandwidth_entry_len(group.ipv6))
-            .zip(
-                self.buckets
-                    .iter()
-                    .flat_map(List::iter)
-                    .filter(|bandwidth| bandwidth.report_group() == group),
-            )
-        {
-            encode_bandwidth_entry(out, group.ipv6, &bandwidth.entry())
+        let entry_size = bandwidth_entry_len(group.ipv6);
+        let mut offset = BANDWIDTH_HEADER;
+        self.store.visit_group(group, &mut |entry| {
+            encode_bandwidth_entry(&mut data[offset..offset + entry_size], group.ipv6, &entry)
                 .expect("valid bandwidth entry layout");
-        }
+            offset += entry_size;
+        });
         Some(data)
     }
     fn remove_group(&mut self, group: BandwidthGroup) {
-        for bucket in &mut self.buckets {
-            let mut next = bucket.first_handle();
-            while let Some(handle) = next {
-                // SAFETY: the handle belongs to this bucket and remains live
-                // until it is removed below.
-                next = unsafe { bucket.next_handle(handle) };
-                if unsafe { bucket.get(handle) }.report_group() == group {
-                    // This table is detached from Engine, so destruction is
-                    // deliberately outside PolicyLock.
-                    unsafe { bucket.remove(handle) };
-                    self.count -= 1;
-                }
-            }
-        }
+        self.store.remove_group(group);
     }
-    // The callback runs outside PolicyLock in the driver path. Returning false
-    // leaves the current and later groups in the table for the merge step.
+    // Reporting and any detached-bank consolidation run outside PolicyLock in
+    // the driver path. A failed consolidation leaves all deltas retryable.
     pub fn report(&mut self, mut submit: impl FnMut(Vec<u8>) -> bool) {
+        if !self.store.consolidate() {
+            return;
+        }
         let mut after = None;
         while let Some(group) = self.next_group(after) {
             after = Some(group);
             let Some(data) = self.encode_group(group) else {
-                continue;
+                break;
             };
             if !submit(data) {
                 break;
@@ -204,16 +139,11 @@ impl BandwidthTable {
         }
     }
 }
+
 // Opaque ownership returned to the driver for destruction outside PolicyLock.
 pub struct RetiredStorage {
-    events: List<Event>,
-    bandwidth: List<Bandwidth>,
-}
-impl Drop for RetiredStorage {
-    fn drop(&mut self) {
-        self.events.clear();
-        self.bandwidth.clear();
-    }
+    _events: List<Event>,
+    _bandwidth: BandwidthStore,
 }
 #[derive(Default, Clone, Copy, Debug)]
 pub struct Stats {
@@ -258,8 +188,9 @@ pub struct Engine {
     cache_allocator: CacheAllocator,
     events: List<Event>,
     retired_events: List<Event>,
-    bandwidth: [List<Bandwidth>; BANDWIDTH_BUCKETS],
-    retired_bandwidth: [List<Bandwidth>; BANDWIDTH_BUCKETS],
+    bandwidth: BandwidthStore,
+    retry_bandwidth: BandwidthStore,
+    retired_bandwidth: BandwidthStore,
     bandwidth_count: usize,
     bandwidth_epoch: u64,
     queued_bytes: usize,
@@ -288,8 +219,9 @@ impl Engine {
             cache_allocator: allocator,
             events: List::new(),
             retired_events: List::new(),
-            bandwidth: [const { List::new() }; BANDWIDTH_BUCKETS],
-            retired_bandwidth: [const { List::new() }; BANDWIDTH_BUCKETS],
+            bandwidth: BandwidthStore::new(),
+            retry_bandwidth: BandwidthStore::new(),
+            retired_bandwidth: BandwidthStore::new(),
             bandwidth_count: 0,
             bandwidth_epoch: 0,
             queued_bytes: 0,
@@ -360,18 +292,16 @@ impl Engine {
     pub fn take_retired_storage(&mut self) -> Option<RetiredStorage> {
         if !self.retired_events.is_empty() {
             return Some(RetiredStorage {
-                events: core::mem::replace(&mut self.retired_events, List::new()),
-                bandwidth: List::new(),
+                _events: core::mem::replace(&mut self.retired_events, List::new()),
+                _bandwidth: BandwidthStore::new(),
             });
         }
-        let bucket = self
-            .retired_bandwidth
-            .iter_mut()
-            .find(|bucket| !bucket.is_empty())?;
-        Some(RetiredStorage {
-            events: List::new(),
-            bandwidth: core::mem::replace(bucket, List::new()),
-        })
+        self.retired_bandwidth
+            .has_storage()
+            .then(|| RetiredStorage {
+                _events: List::new(),
+                _bandwidth: core::mem::replace(&mut self.retired_bandwidth, BandwidthStore::new()),
+            })
     }
     fn has_room(&self, len: usize) -> bool {
         self.queued_bytes.checked_add(len).is_some()
@@ -623,11 +553,17 @@ impl Engine {
     fn cache_bytes(&self) -> usize {
         self.interfaces.iter().map(|c| c.caches.bytes()).sum()
     }
-    fn account(&mut self, interface_index: u32, packet: &Packet, allow: bool) {
+    fn account(
+        &mut self,
+        interface_index: u32,
+        packet: &Packet,
+        allow: bool,
+        work: &mut BandwidthWork,
+    ) {
         if allow {
             self.stats.allowed = self.stats.allowed.saturating_add(1);
             if self.online && matches!(packet.connection.protocol, 6 | 17) {
-                self.bandwidth_add(interface_index, packet);
+                self.bandwidth_add_with_work(interface_index, packet, work);
             }
         } else {
             self.stats.dropped = self.stats.dropped.saturating_add(1);
@@ -671,6 +607,7 @@ impl Engine {
         packet: &Packet,
         token: usize,
         now: u64,
+        work: &mut BandwidthWork,
     ) -> Option<Action> {
         let allow = if !self.running(interface_index) {
             false
@@ -688,7 +625,7 @@ impl Engine {
             allow
         };
         self.stats.received = self.stats.received.saturating_add(1);
-        self.account(interface_index, packet, allow);
+        self.account(interface_index, packet, allow, work);
         Some(Action {
             token,
             finish: if allow { Finish::Allow } else { Finish::Drop },
@@ -703,16 +640,33 @@ impl Engine {
         token: usize,
         now: u64,
     ) -> Result<bool, Action> {
-        if let Some(action) = self.immediate(interface_index, packet, token, now) {
+        let mut work = BandwidthWork::prepare(self.bandwidth_plan());
+        self.preflight_with_work(interface_index, packet, token, now, &mut work)
+    }
+    pub fn preflight_with_work(
+        &mut self,
+        interface_index: u32,
+        packet: &Packet,
+        token: usize,
+        now: u64,
+        work: &mut BandwidthWork,
+    ) -> Result<bool, Action> {
+        if let Some(action) = self.immediate(interface_index, packet, token, now, work) {
             Err(action)
         } else {
             Ok(self.event_room(packet))
         }
     }
-    fn overflow(&mut self, interface_index: u32, packet: &Packet, token: usize) -> Submission {
+    fn overflow(
+        &mut self,
+        interface_index: u32,
+        packet: &Packet,
+        token: usize,
+        work: &mut BandwidthWork,
+    ) -> Submission {
         self.stats.overflow = self.stats.overflow.saturating_add(1);
         let finish = self.fallback();
-        self.account(interface_index, packet, finish == Finish::Allow);
+        self.account(interface_index, packet, finish == Finish::Allow, work);
         Submission::Finish(Action { token, finish })
     }
     pub fn submit(
@@ -724,7 +678,29 @@ impl Engine {
         now: u64,
         record: Option<Vec<u8>>,
     ) -> Submission {
-        if let Some(action) = self.immediate(interface_index, &packet, token, now) {
+        let mut work = BandwidthWork::prepare(self.bandwidth_plan());
+        self.submit_with_work(
+            interface_index,
+            packet,
+            token,
+            cancel,
+            now,
+            record,
+            &mut work,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn submit_with_work(
+        &mut self,
+        interface_index: u32,
+        packet: Packet,
+        token: usize,
+        cancel: Option<usize>,
+        now: u64,
+        record: Option<Vec<u8>>,
+        work: &mut BandwidthWork,
+    ) -> Submission {
+        if let Some(action) = self.immediate(interface_index, &packet, token, now, work) {
             return Submission::Finish(action);
         }
         self.stats.received = self.stats.received.saturating_add(1);
@@ -732,14 +708,14 @@ impl Engine {
         let expected = connection_header_len(&packet.connection) + payload_len;
         if payload_len > MAX_PAYLOAD || record.as_ref().is_some_and(|data| data.len() != expected) {
             self.stats.malformed = self.stats.malformed.saturating_add(1);
-            self.account(interface_index, &packet, false);
+            self.account(interface_index, &packet, false, work);
             return Submission::Finish(Action {
                 token,
                 finish: Finish::Drop,
             });
         }
         if !self.has_room(expected) || self.next_id == u64::MAX || record.is_none() {
-            return self.overflow(interface_index, &packet, token);
+            return self.overflow(interface_index, &packet, token, work);
         }
         let id = self.next_id;
         let mut data = record.unwrap_or_default();
@@ -753,7 +729,7 @@ impl Engine {
         .is_err()
         {
             self.stats.malformed = self.stats.malformed.saturating_add(1);
-            self.account(interface_index, &packet, false);
+            self.account(interface_index, &packet, false, work);
             return Submission::Finish(Action {
                 token,
                 finish: Finish::Drop,
@@ -769,12 +745,12 @@ impl Engine {
             event: None,
             packet,
         }) else {
-            return self.overflow(interface_index, &packet, token);
+            return self.overflow(interface_index, &packet, token, work);
         };
         let Some(event) = self.push_event(data, Some(handle)) else {
             // SAFETY: the event was not published, so only this new handle exists.
             unsafe { self.pending.remove(handle) };
-            return self.overflow(interface_index, &packet, token);
+            return self.overflow(interface_index, &packet, token, work);
         };
         // SAFETY: both nodes are live and no handles escape the locked engine.
         unsafe { self.pending.get_mut(handle) }.event = Some(event);
@@ -783,7 +759,12 @@ impl Engine {
         self.stats.queued = self.stats.queued.saturating_add(1);
         Submission::Pending(id)
     }
-    fn claim(&mut self, handle: Handle<Pending>, finish: Finish) -> Action {
+    fn claim(
+        &mut self,
+        handle: Handle<Pending>,
+        finish: Finish,
+        bandwidth: &mut BandwidthWork,
+    ) -> Action {
         // SAFETY: callers found a live, active node under exclusive engine access.
         let pending = unsafe { self.pending.get_mut(handle) };
         let p = *pending;
@@ -806,7 +787,12 @@ impl Engine {
             unsafe { self.pending.remove(handle) };
         }
         self.pending_count -= 1;
-        self.account(p.interface_index, &p.packet, finish == Finish::Allow);
+        self.account(
+            p.interface_index,
+            &p.packet,
+            finish == Finish::Allow,
+            bandwidth,
+        );
         Action {
             token: p.token,
             finish,
@@ -817,7 +803,8 @@ impl Engine {
             drop(retired);
         }
         let mut work = CacheWork::prepare(self.cache_plan(id, verdict, now));
-        self.verdict_with_work(id, verdict, now, &mut work)
+        let mut bandwidth = BandwidthWork::prepare(self.bandwidth_plan());
+        self.verdict_with_work(id, verdict, now, &mut work, &mut bandwidth)
     }
     pub fn verdict_with_work(
         &mut self,
@@ -825,6 +812,7 @@ impl Engine {
         verdict: Verdict,
         now: u64,
         work: &mut CacheWork,
+        bandwidth: &mut BandwidthWork,
     ) -> Result<Action, VerdictError> {
         let handle = self
             .pending
@@ -860,10 +848,15 @@ impl Engine {
             } else {
                 Finish::Drop
             },
+            bandwidth,
         ))
     }
     // One owned token at a time, never an unbounded array on the kernel stack.
     pub fn take_due(&mut self, now: u64) -> Option<Action> {
+        let mut work = BandwidthWork::prepare(self.bandwidth_plan());
+        self.take_due_with_work(now, &mut work)
+    }
+    pub fn take_due_with_work(&mut self, now: u64, work: &mut BandwidthWork) -> Option<Action> {
         if self.pending_count == 0 {
             return None;
         }
@@ -881,14 +874,15 @@ impl Engine {
             self.stats.timeouts = self.stats.timeouts.saturating_add(1);
             self.fallback()
         };
-        Some(self.claim(handle, finish))
+        Some(self.claim(handle, finish, work))
     }
     pub fn cancel(&mut self, interface_index: u32, cancel: usize) -> Option<Action> {
         let handle = self.pending.find(|p| {
             p.id != 0 && p.interface_index == interface_index && p.cancel == Some(cancel)
         })?;
         self.stats.cancelled = self.stats.cancelled.saturating_add(1);
-        Some(self.claim(handle, Finish::Cancel))
+        // Cancellation never admits bytes and cannot consume bandwidth storage.
+        Some(self.claim(handle, Finish::Cancel, &mut BandwidthWork::empty()))
     }
     pub fn read(&mut self, out: &mut [u8]) -> usize {
         let mut written = 0;
@@ -933,64 +927,48 @@ impl Engine {
         }
     }
     fn clear_bandwidth(&mut self) {
-        for (retired, bucket) in self.retired_bandwidth.iter_mut().zip(&mut self.bandwidth) {
-            retired.append(bucket);
-        }
+        self.retired_bandwidth.append(&mut self.bandwidth);
+        self.retired_bandwidth.append(&mut self.retry_bandwidth);
         self.bandwidth_count = 0;
     }
+    // Read-only capacity hint. The driver prepares these allocations unlocked,
+    // then rechecks the hint before invoking a single accounting operation.
+    pub fn bandwidth_plan(&self) -> Option<BandwidthPlan> {
+        self.online.then(|| self.bandwidth.plan()).flatten()
+    }
+    pub fn install_bandwidth_work(&mut self, work: &mut BandwidthWork) {
+        if self.online {
+            self.bandwidth.install(work);
+        }
+    }
+    #[cfg(test)]
     fn bandwidth_add(&mut self, interface_index: u32, p: &Packet) {
-        let bucket = &mut self.bandwidth[bandwidth_bucket_index(interface_index, &p.connection)];
-        let same = |b: &&mut Bandwidth| {
-            let a = &b.connection;
-            let c = &p.connection;
-            b.interface_index == interface_index
-                && a.ipv6 == c.ipv6
-                && a.protocol == c.protocol
-                && a.local_ip == c.local_ip
-                && a.remote_ip == c.remote_ip
-                && a.local_port == c.local_port
-                && a.remote_port == c.remote_port
-        };
-        if let Some(b) = bucket.iter_mut().find(same) {
-            match p.connection.direction {
-                Direction::Outbound => b.tx = b.tx.saturating_add(p.ip_len),
-                Direction::Inbound => b.rx = b.rx.saturating_add(p.ip_len),
-            }
-        } else {
-            let bytes = p.ip_len;
-            if bucket
-                .try_push_back(Bandwidth {
-                    interface_index,
-                    connection: p.connection,
-                    tx: if p.connection.direction == Direction::Outbound {
-                        bytes
-                    } else {
-                        0
-                    },
-                    rx: if p.connection.direction == Direction::Inbound {
-                        bytes
-                    } else {
-                        0
-                    },
-                })
-                .is_err()
-            {
-                self.stats.overflow = self.stats.overflow.saturating_add(1);
-            } else {
-                self.bandwidth_count += 1;
-            }
+        let mut work = BandwidthWork::prepare(self.bandwidth_plan());
+        self.bandwidth_add_with_work(interface_index, p, &mut work);
+    }
+    fn bandwidth_add_with_work(
+        &mut self,
+        interface_index: u32,
+        p: &Packet,
+        work: &mut BandwidthWork,
+    ) {
+        match self
+            .bandwidth
+            .add(interface_index, &p.connection, p.ip_len, work)
+        {
+            Some(added) => self.bandwidth_count += usize::from(added),
+            None => self.stats.overflow = self.stats.overflow.saturating_add(1),
         }
     }
     pub fn begin_bandwidth(&mut self, table: &mut BandwidthTable) -> bool {
-        if self.bandwidth_count == 0 {
+        if (self.bandwidth_count == 0 && self.retry_bandwidth.is_empty())
+            || table.store.has_storage()
+        {
             return false;
         }
-        // Only fixed-size list headers move under PolicyLock. The entries stay
-        // in the detached table while they are scanned and encoded.
-        for (live, detached) in self.bandwidth.iter_mut().zip(&mut table.buckets) {
-            core::mem::swap(live, detached);
-        }
-        table.count = self.bandwidth_count;
+        // Move only ownership headers. Pages/entries/index buffers never move.
+        core::mem::swap(&mut self.bandwidth, &mut table.store);
+        table.store.append(&mut self.retry_bandwidth);
         table.epoch = self.bandwidth_epoch;
         self.bandwidth_count = 0;
         true
@@ -999,23 +977,34 @@ impl Engine {
         if !self.online || epoch != self.bandwidth_epoch || !self.has_room(data.len()) {
             return Err(data);
         }
-        assert!(self.push_event(data, None).is_some());
-        Ok(())
+        let queued_bytes = self.queued_bytes + data.len();
+        match self.events.try_push_back(Event {
+            read: 0,
+            pending: None,
+            data,
+        }) {
+            Ok(_) => {
+                self.queued_bytes = queued_bytes;
+                Ok(())
+            }
+            Err(event) => Err(event.data),
+        }
     }
     pub fn finish_bandwidth(&mut self, table: &mut BandwidthTable) -> bool {
         if !self.online || table.epoch != self.bandwidth_epoch {
             return false;
         }
-        for (live, detached) in self.bandwidth.iter_mut().zip(&mut table.buckets) {
-            live.append(detached);
+        // Keep unqueued deltas as whole retry banks, without a bulk locked
+        // merge. The next detached report combines duplicate keys unlocked.
+        if !table.store.is_empty() {
+            self.retry_bandwidth.append(&mut table.store);
         }
-        self.bandwidth_count += table.count;
-        table.count = 0;
+        self.bandwidth_count = self.bandwidth.len() + self.retry_bandwidth.len();
         true
     }
     // Offline policy tests use the same detached-table path as the kernel bridge.
     pub fn bandwidth(&mut self) {
-        let mut table = Box::new(BandwidthTable::new());
+        let mut table = BandwidthTable::new();
         if !self.begin_bandwidth(&mut table) {
             return;
         }
@@ -1038,7 +1027,8 @@ impl Engine {
         let metadata = self.pending.bytes()
             + self.events.bytes()
             + self.interfaces.bytes()
-            + self.bandwidth.iter().map(List::bytes).sum::<usize>();
+            + self.bandwidth.bytes()
+            + self.retry_bandwidth.bytes();
         let _ = write!(
             text,
             "HyperVXNdisFilter: fixed_bytes={} metadata_bytes={} event_bytes={} pending={} events={} bandwidth={} cached_v4={} cached_v6={} cache_bytes={} cache_alloc_fail={} rx={} allow={} drop={} queued={} cache_hits={} timeout={} overflow={} cancel={} invalidated={} malformed={} non_ip={}",
@@ -1094,6 +1084,7 @@ mod tests {
     extern crate std;
     use super::*;
     use crate::packet::NdisPath;
+    use hyperv_protocol::Direction;
     use std::{boxed::Box, vec};
     fn engine() -> Box<Engine> {
         let mut e = default_engine();
@@ -1315,7 +1306,7 @@ mod tests {
             p.connection.local_port = port;
             e.bandwidth_add(101, &p);
         }
-        let mut table = Box::new(BandwidthTable::new());
+        let mut table = BandwidthTable::new();
         assert!(e.begin_bandwidth(&mut table));
         assert_eq!(e.bandwidth_count, 0);
         let epoch = table.epoch();
@@ -1336,6 +1327,135 @@ mod tests {
         );
     }
 
+    fn bandwidth_rows(e: &mut Engine) -> Vec<(u32, u8, bool, u16, u64, u64)> {
+        let mut out = vec![0; 4096];
+        let len = e.read(&mut out);
+        let mut offset = 0;
+        let mut rows = Vec::new();
+        while offset < len {
+            let data = &out[offset..len];
+            assert!(matches!(data[0], 5 | 6));
+            let ipv6 = data[0] == 6;
+            let record_len = 5 + u32::from_le_bytes(data[1..5].try_into().unwrap()) as usize;
+            let index = u32::from_le_bytes(data[6..10].try_into().unwrap());
+            let count = u32::from_le_bytes(data[10..14].try_into().unwrap()) as usize;
+            let size = bandwidth_entry_len(ipv6);
+            assert_eq!(record_len, BANDWIDTH_HEADER + count * size);
+            let address_size = if ipv6 { 16 } else { 4 };
+            for entry in data[BANDWIDTH_HEADER..record_len].chunks_exact(size) {
+                rows.push((
+                    index,
+                    data[5],
+                    ipv6,
+                    u16::from_le_bytes(entry[address_size..address_size + 2].try_into().unwrap()),
+                    u64::from_le_bytes(entry[size - 16..size - 8].try_into().unwrap()),
+                    u64::from_le_bytes(entry[size - 8..].try_into().unwrap()),
+                ));
+            }
+            offset += record_len;
+        }
+        assert_eq!(offset, len);
+        rows.sort_unstable();
+        rows
+    }
+
+    #[test]
+    fn partial_bandwidth_report_retains_deltas_and_merges_concurrent_full_keys() {
+        let mut e = engine();
+        e.read(&mut [0; MAX_LOG_RECORD]);
+        let mut tcp = packet();
+        tcp.connection.protocol = 6;
+        tcp.connection.local_port = 11;
+        let mut udp = packet();
+        udp.connection.local_port = 22;
+        e.bandwidth_add(101, &tcp);
+        e.bandwidth_add(101, &udp);
+        let mut table = BandwidthTable::new();
+        assert!(e.begin_bandwidth(&mut table));
+
+        tcp.ip_len = 7;
+        e.bandwidth_add(101, &tcp);
+        udp.connection.direction = Direction::Inbound;
+        udp.ip_len = 13;
+        e.bandwidth_add(101, &udp);
+        let mut new_udp = udp;
+        new_udp.connection.local_port = 33;
+        new_udp.ip_len = 19;
+        e.bandwidth_add(101, &new_udp);
+
+        let epoch = table.epoch();
+        let mut groups = 0;
+        table.report(|data| {
+            groups += 1;
+            if groups == 2 {
+                return false;
+            }
+            e.queue_bandwidth(epoch, data).unwrap();
+            true
+        });
+        assert_eq!(groups, 2);
+        assert!(e.finish_bandwidth(&mut table));
+        assert_eq!(bandwidth_rows(&mut e), [(101, 6, false, 11, 100, 0)]);
+        // The retry bank can contain the same UDP key as new live traffic. It
+        // must become one entry, not two rows or a lost/duplicated delta.
+        e.bandwidth();
+        assert_eq!(
+            bandwidth_rows(&mut e),
+            [
+                (101, 6, false, 11, 7, 0),
+                (101, 17, false, 22, 100, 13),
+                (101, 17, false, 33, 0, 19),
+            ]
+        );
+        assert_eq!(e.bandwidth_count, 0);
+        e.bandwidth();
+        assert!(!e.has_events());
+    }
+
+    #[test]
+    fn bandwidth_queue_rejection_keeps_every_delta_for_a_later_report() {
+        let mut e = engine();
+        e.read(&mut [0; MAX_LOG_RECORD]);
+        let p = packet();
+        e.bandwidth_add(101, &p);
+        e.events.fail_allocations = true;
+        e.bandwidth();
+        assert!(!e.has_events());
+        assert_eq!(e.bandwidth_count, 1);
+        e.bandwidth(); // Repeated failure must neither lose nor duplicate deltas.
+        assert_eq!(e.bandwidth_count, 1);
+        e.events.fail_allocations = false;
+        e.bandwidth();
+        assert_eq!(bandwidth_rows(&mut e), [(101, 17, false, 0, 100, 0)]);
+        assert_eq!(e.bandwidth_count, 0);
+    }
+
+    #[test]
+    fn detached_bandwidth_cannot_cross_a_controller_session_reset() {
+        let mut e = engine();
+        e.read(&mut [0; MAX_LOG_RECORD]);
+        let mut p = packet();
+        e.bandwidth_add(101, &p);
+        let mut table = BandwidthTable::new();
+        assert!(e.begin_bandwidth(&mut table));
+        let old_epoch = table.epoch();
+        e.disconnect();
+        e.connect();
+        e.read(&mut [0; MAX_LOG_RECORD]);
+        p.ip_len = 17;
+        e.bandwidth_add(101, &p);
+        let mut attempted = false;
+        table.report(|data| {
+            attempted = true;
+            assert!(e.queue_bandwidth(old_epoch, data).is_err());
+            false
+        });
+        assert!(attempted);
+        assert!(!e.finish_bandwidth(&mut table));
+        e.bandwidth();
+        assert_eq!(bandwidth_rows(&mut e), [(101, 17, false, 0, 17, 0)]);
+    }
+
     #[test]
     fn bandwidth_queues_the_entire_large_group_without_count_caps_or_splitting() {
         const COUNT: usize = 40000;
@@ -1354,7 +1474,7 @@ mod tests {
             assert_eq!(e.events.len(), 1);
             // Successfully queued reports release their detached nodes after
             // serialization, so no large list is retired under the policy lock.
-            assert!(e.retired_bandwidth.iter().all(List::is_empty));
+            assert!(!e.retired_bandwidth.has_storage());
             while let Some(retired) = e.take_retired_storage() {
                 drop(retired);
             }
@@ -1588,9 +1708,7 @@ mod tests {
     fn bandwidth_oom_does_not_change_a_verdict_or_cached_allow() {
         let mut e = engine();
         let id = submit(&mut e, 101, 1);
-        for bucket in &mut e.bandwidth {
-            bucket.fail_allocations = true;
-        }
+        e.bandwidth.fail_allocations = true;
         assert_eq!(
             e.verdict(id, Verdict::PermanentAccept, 101).unwrap().finish,
             Finish::Allow
@@ -1605,9 +1723,7 @@ mod tests {
         assert_eq!(e.stats().overflow, 2);
         assert_eq!(e.stats().cache_hits, 1);
         assert!(e.bandwidth_count == 0);
-        for bucket in &mut e.bandwidth {
-            bucket.fail_allocations = false;
-        }
+        e.bandwidth.fail_allocations = false;
         assert!(e.preflight(101, &packet(), 3, 103).is_err());
         assert_eq!(e.bandwidth_count, 1);
     }
@@ -1675,7 +1791,7 @@ mod tests {
         assert_eq!(e.pending_count(), 0);
         assert_eq!(e.bandwidth_count, 0);
         assert!(!e.retired_events.is_empty());
-        assert!(e.retired_bandwidth.iter().any(|bucket| !bucket.is_empty()));
+        assert!(e.retired_bandwidth.has_storage());
         // A second reset appends to the retired chain rather than destroying it.
         e.connect();
         e.disconnect();
@@ -1687,7 +1803,7 @@ mod tests {
         }
         assert!(banks > 1);
         assert!(e.retired_events.is_empty());
-        assert!(e.retired_bandwidth.iter().all(List::is_empty));
+        assert!(!e.retired_bandwidth.has_storage());
         assert!(core::mem::size_of::<RetiredStorage>() < 128);
     }
 
@@ -2041,8 +2157,15 @@ mod tests {
         let mut e = engine();
         let k = 101;
         let id = submit(&mut e, k, 1);
-        e.verdict_with_work(id, Verdict::PermanentAccept, 101, &mut CacheWork::empty())
-            .unwrap();
+        let mut bandwidth = BandwidthWork::prepare(e.bandwidth_plan());
+        e.verdict_with_work(
+            id,
+            Verdict::PermanentAccept,
+            101,
+            &mut CacheWork::empty(),
+            &mut bandwidth,
+        )
+        .unwrap();
         assert_eq!(e.pending_count(), 0);
         assert_eq!(e.cache_candidates(), 0);
         assert_eq!(e.stats().cache_allocation_failures, 1);
@@ -2443,7 +2566,7 @@ mod tests {
         assert_eq!(e.queued_bytes, 0);
         assert!(e.events.is_empty());
         let retired = e.take_retired_storage().unwrap();
-        assert_eq!(retired.events.len(), COUNT);
+        assert_eq!(retired._events.len(), COUNT);
         drop(retired);
         let mut released = 0;
         while e.take_due(101).is_some() {
@@ -3146,8 +3269,14 @@ mod tests {
         assert!(e.restart(101));
         let new = submit(&mut e, 101, 3);
         assert!(
-            e.verdict_with_work(old, Verdict::PermanentAccept, 101, &mut work)
-                .is_err()
+            e.verdict_with_work(
+                old,
+                Verdict::PermanentAccept,
+                101,
+                &mut work,
+                &mut BandwidthWork::empty()
+            )
+            .is_err()
         );
         assert_eq!(e.cache_counts(), (0, 0));
         assert_eq!(

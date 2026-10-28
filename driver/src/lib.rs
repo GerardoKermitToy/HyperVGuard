@@ -8,7 +8,7 @@ compile_error!("The driver supports Windows x64 only.");
 
 extern crate alloc;
 
-use alloc::{boxed::Box, vec::Vec};
+use alloc::vec::Vec;
 use core::{
     alloc::{GlobalAlloc, Layout},
     cell::UnsafeCell,
@@ -17,7 +17,7 @@ use core::{
 };
 use hyperv_policy::{
     cache::{CLEANUP_SLOTS_PER_BATCH, CacheAllocator, CacheWork},
-    engine::{Action, BandwidthTable, Engine, Finish, Submission, allocate_record},
+    engine::{Action, BandwidthTable, BandwidthWork, Engine, Finish, Submission, allocate_record},
     packet::{self, NdisPath, Packet, SNAPSHOT},
 };
 use hyperv_protocol::{self as wire, Command};
@@ -106,6 +106,34 @@ fn with_state<R>(f: impl FnOnce(&mut Engine) -> R) -> R {
         result
     }
 }
+// Reserve before the one accounting operation, not while PolicyLock is held.
+// Concurrent insertion/report/reset can invalidate a capacity hint, so recheck
+// under the same lock that invokes the callback. Hits need no extra lock pass.
+fn with_bandwidth<R>(f: impl FnOnce(&mut Engine, &mut BandwidthWork) -> R) -> R {
+    let mut callback = Some(f);
+    let mut work = BandwidthWork::empty();
+    loop {
+        let attempt = with_state(|engine| {
+            if let Some(plan) = engine.bandwidth_plan()
+                && !work.satisfies(plan)
+                && !work.allocation_failed()
+            {
+                return Err(plan);
+            }
+            engine.install_bandwidth_work(&mut work);
+            Ok(callback.take().unwrap()(engine, &mut work))
+        });
+        match attempt {
+            Ok(result) => return result,
+            Err(plan) => {
+                // Unused prepared buffers and migrated indexes are freed here,
+                // after with_state has released PolicyLock.
+                drop(work);
+                work = BandwidthWork::prepare(Some(plan));
+            }
+        }
+    }
+}
 fn finish_value(finish: Finish) -> u32 {
     match finish {
         Finish::Allow => 0,
@@ -133,7 +161,7 @@ fn reclaim_retired() {
 }
 fn drain() {
     loop {
-        let action = with_state(|e| e.take_due(unsafe { hv_now() }));
+        let action = with_bandwidth(|e, work| e.take_due_with_work(unsafe { hv_now() }, work));
         if let Some(action) = action {
             finish(action)
         } else {
@@ -142,7 +170,7 @@ fn drain() {
     }
 }
 fn report_bandwidth() {
-    let mut table = Box::new(BandwidthTable::new());
+    let mut table = BandwidthTable::new();
     if !with_state(|e| e.begin_bandwidth(&mut table)) {
         return;
     }
@@ -369,11 +397,12 @@ pub extern "C" fn HvClassify(
     }
     // Cancellation eligibility is NDIS ownership metadata, not verdict identity.
     let cancel = (path == NdisPath::Send).then_some(cancel);
-    let wants_event =
-        match with_state(|e| e.preflight(interface_index, &packet, token, unsafe { hv_now() })) {
-            Ok(wants_event) => wants_event,
-            Err(action) => return finish_code(action.finish),
-        };
+    let wants_event = match with_bandwidth(|e, work| {
+        e.preflight_with_work(interface_index, &packet, token, unsafe { hv_now() }, work)
+    }) {
+        Ok(wants_event) => wants_event,
+        Err(action) => return finish_code(action.finish),
+    };
     let record = if wants_event {
         match capture_packet(unsafe { hv_first_nb(token) }, token, &packet) {
             Ok(record) => record,
@@ -385,14 +414,15 @@ pub extern "C" fn HvClassify(
     } else {
         None
     };
-    match with_state(|e| {
-        e.submit(
+    match with_bandwidth(|e, work| {
+        e.submit_with_work(
             interface_index,
             packet,
             token,
             cancel,
             unsafe { hv_now() },
             record,
+            work,
         )
     }) {
         Submission::Pending(_) => -1,
@@ -459,8 +489,8 @@ pub unsafe extern "C" fn HvWrite(data: *const u8, len: u32) -> i32 {
                 // harmless no-op (never a cache write), as on asynchronous kext I/O.
                 let plan = with_state(|e| e.cache_plan(id, verdict, unsafe { hv_now() }));
                 let mut work = CacheWork::prepare(plan);
-                let action = with_state(|e| {
-                    e.verdict_with_work(id, verdict, unsafe { hv_now() }, &mut work)
+                let action = with_bandwidth(|e, bandwidth| {
+                    e.verdict_with_work(id, verdict, unsafe { hv_now() }, &mut work, bandwidth)
                         .ok()
                 });
                 drop(work);

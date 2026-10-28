@@ -74,14 +74,6 @@ impl<T> List<T> {
         self.len = len;
         Ok(handle)
     }
-    pub(crate) fn first_handle(&self) -> Option<Handle<T>> {
-        self.head
-    }
-    /// # Safety
-    /// The handle must name a live node in this list.
-    pub(crate) unsafe fn next_handle(&self, handle: Handle<T>) -> Option<Handle<T>> {
-        unsafe { (*handle.0.as_ptr()).next }
-    }
     pub(crate) fn bytes(&self) -> usize {
         self.len.saturating_mul(core::mem::size_of::<Node<T>>())
     }

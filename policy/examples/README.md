@@ -147,3 +147,56 @@ TTL/interface lifecycle semantics. The current grouped adaptation retains these
 requirements; comparing it directly with the frozen legacy implementation
 checks the actual new code, rather than assuming that host HashMap results
 transfer to the kernel. No synthetic result proves live-driver performance.
+
+## Offline bandwidth aggregation benchmark
+
+`bandwidth_stats_bench.rs` measures the kernel-side Rust aggregation path after a
+packet has been admitted. It is not a monitor-side `BandwidthStats`/`std::vector`
+benchmark and never opens, installs, loads, binds, or sends traffic through the
+driver. `driver_indexed_pages_incremental` compiles the actual production
+`policy/src/bandwidth.rs`, `policy/src/storage.rs`, and tuple-hash source with a
+host allocator. The previous 256-list design is frozen as `list_256_legacy`. The
+original `indexed_pages_incremental` page-directory prototype remains a separate
+reference, not the integrated driver implementation.
+
+```bash
+RUSTFLAGS="" cargo test --release -p hyperv-policy --example bandwidth_stats_bench --locked -- --test-threads=1
+```
+
+```bash
+RUSTFLAGS="" cargo run --release -p hyperv-policy --example bandwidth_stats_bench --locked -- --records 1000000 --flows 250000 --rounds 5 --scenario realistic --out build/bandwidth-bench
+```
+
+The default realistic dataset contains one million admitted TCP/UDP observations
+across 250,000 distinct normalized flows. It has bidirectional TX/RX updates,
+IPv4/IPv6, multiple protocol families, burst locality and a heavy-tail hot-flow
+distribution. `--scenario unique --flows 1000000` provides the insertion-heavy
+one-million-key stress case; use a new output directory because results are never
+overwritten. The benchmark compares the production stable-page/handle-index
+implementation, the previous 256 stable lists, wider stable-list directories, a
+paged stable-node table, the original stable-page/open-addressing index prototype,
+and host-only flat/standard hash references. It reports fill time,
+existing-key update latency, complete wire report time, allocation counts and
+requested memory, while checking every full key/counter and decoded bandwidth
+group against an independent oracle.
+
+For a signed standalone benchmark executable, use the repository runner with the
+existing local test-signing inputs (the runner never imports them or changes trust
+settings):
+
+```bash
+powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File 'scripts/Benchmark-Bandwidth.ps1' -Records 1000000 -Flows 250000 -Rounds 5 -PfxPath 'C:\path\to\test-signing.pfx' -RootCertificate 'C:\path\to\test-root.der'
+```
+
+The direct `cargo run` command is useful for an unsigned user-mode iteration;
+release/package artifacts for the local workspace should use the signed runner.
+The host-only flat table and `std::HashMap` are upper-bound references, not kernel
+recommendations: they do not preserve the driver's fallible nonpaged allocator,
+stable entry addresses, detached report/merge-back ownership, or PolicyLock
+constraints. The production adapter includes unlocked prepare/install and retired
+index destruction, but no policy-lock acquisition, NDIS callbacks or live traffic.
+Its report timing is the common host snapshot/explicit-codec adapter, not the
+complete driver detached-report lifecycle. Production policy tests separately
+cover partial-report retry, same-key delta consolidation and session invalidation.
+Results are single-threaded synthetic measurements, not NDIS throughput; actual
+pause/restart, attachment, traffic and Verifier validation remain user-run tests.
