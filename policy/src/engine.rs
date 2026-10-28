@@ -2738,6 +2738,72 @@ mod tests {
         ));
     }
     #[test]
+    fn permanent_accept_ttl_refreshes_on_matching_inbound_and_outbound_packets() {
+        for protocol in [6, 17] {
+            for ipv6 in [false, true] {
+                let mut e = engine();
+                e.configure(2000, 1000, false);
+                let mut guest = [0; 16];
+                let mut peer = [0; 16];
+                if ipv6 {
+                    guest = [0x11; 16];
+                    peer = [0x22; 16];
+                } else {
+                    guest[..4].copy_from_slice(&[10, 0, 0, 2]);
+                    peer[..4].copy_from_slice(&[192, 0, 2, 1]);
+                }
+                let mut outbound = packet();
+                outbound.flow.protocol = protocol;
+                outbound.connection.protocol = protocol;
+                outbound.flow.ipv6 = ipv6;
+                outbound.connection.ipv6 = ipv6;
+                outbound.flow.source = guest;
+                outbound.flow.destination = peer;
+                outbound.flow.source_port = 40000;
+                outbound.flow.destination_port = 443;
+                // Host receive is guest outbound.
+                outbound.orient(NdisPath::Receive);
+
+                let mut inbound = outbound;
+                inbound.flow.source = peer;
+                inbound.flow.destination = guest;
+                inbound.flow.source_port = 443;
+                inbound.flow.destination_port = 40000;
+                // Host send is guest inbound and must normalize to the same tuple.
+                inbound.orient(NdisPath::Send);
+
+                let k = 101;
+                let Submission::Pending(id) =
+                    e.submit(k, outbound, 1, None, 100, record(&outbound))
+                else {
+                    panic!("expected initial decision");
+                };
+                e.verdict(id, Verdict::PermanentAccept, 101).unwrap();
+                e.read(&mut [0; 512]);
+
+                for (token, p, now) in [
+                    (2, inbound, 1100),
+                    (3, outbound, 2099),
+                    (4, inbound, 3098),
+                    (5, outbound, 4097),
+                ] {
+                    assert!(!e.wants_event(k, &p, now));
+                    let action = e.preflight(k, &p, token, now).unwrap_err();
+                    assert_eq!(
+                        action,
+                        Action {
+                            token,
+                            finish: Finish::Allow,
+                        }
+                    );
+                }
+                assert_eq!(e.stats().cache_hits, 4);
+                assert!(e.wants_event(k, &inbound, 5097));
+            }
+        }
+    }
+
+    #[test]
     fn permanent_accept_tcp_udp_ttl_tracks_last_cache_hit() {
         for protocol in [6, 17] {
             for ipv6 in [false, true] {
