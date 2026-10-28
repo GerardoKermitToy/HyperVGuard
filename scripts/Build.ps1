@@ -6,6 +6,7 @@ param(
     [string]$CertificateThumbprint,
     [string]$PfxPath,
     [string]$RootCertificate,
+    [ValidateNotNullOrEmpty()][string]$TimestampUrl = 'http://timestamp.digicert.com',
     [string]$PfxPassword = $(if ($env:HYPERVXNDISFILTER_PFX_PASSWORD) { $env:HYPERVXNDISFILTER_PFX_PASSWORD } else { '1' })
 )
 $ErrorActionPreference = 'Stop'
@@ -32,16 +33,21 @@ $build = Join-Path $root 'build'
 $dist = Join-Path $root 'dist'
 New-Item -ItemType Directory -Force $build, $dist | Out-Null
 $oldFlags = $env:RUSTFLAGS
+$oldEncodedFlags = $env:CARGO_ENCODED_RUSTFLAGS
 $oldDir = Get-Location
 try {
     Set-Location $root
-    $env:RUSTFLAGS = '-C panic=abort -C no-redzone=yes -C debuginfo=2'
+    $env:RUSTFLAGS = '-C panic=abort -C no-redzone=yes -C debuginfo=2 -C link-arg=/DEBUG:FULL -C link-arg=/PDBALTPATH:%_PDB%'
+    $env:CARGO_ENCODED_RUSTFLAGS = $null
     & cargo build --release --target x86_64-pc-windows-msvc -p hyperv-driver --locked
     if ($LASTEXITCODE) { throw 'Rust driver build failed.' }
     $object = Join-Path $build 'ndis_shim.obj'
     & cl.exe /nologo /c /TP /std:c++20 /GR- /EHs-c- /O2 /W4 /WX /wd4324 /GS /kernel /Zl /Zi /D_AMD64_ /DAMD64 /DNDIS640 /DNDIS_SUPPORT_NDIS640=1 /D_WIN64 /DWINVER=0x0A00 /D_WIN32_WINNT=0x0A00 /DNTDDI_VERSION=0x0A00000C "/I$include\km" "/I$include\shared" "/I$include\ucrt" "/Fo$object" "/Fd$build\shim.pdb" "$root\driver\shim\ndis_shim.cpp"
     if ($LASTEXITCODE) { throw 'WDK ABI shim compilation failed.' }
-    & link.exe /NOLOGO /DRIVER /SUBSYSTEM:NATIVE,10.00 /ENTRY:GsDriverEntry /MACHINE:X64 /MANIFEST:NO /NODEFAULTLIB /INCREMENTAL:NO /INTEGRITYCHECK /DYNAMICBASE /NXCOMPAT /OPT:REF /OPT:ICF /DEBUG:FULL /RELEASE "/OUT:$dist\HyperVXNdisFilter.sys" "/PDB:$dist\HyperVXNdisFilter.pdb" $object "$root\target\x86_64-pc-windows-msvc\release\hyperv_driver.lib" "$lib\ndis.lib" "$lib\netio.lib" "$lib\ntoskrnl.lib" "$lib\hal.lib" "$lib\BufferOverflowK.lib"
+    $resource = Join-Path $build 'driver_version.res'
+    & "$bin\rc.exe" /nologo "/I$include\um" "/I$include\shared" "/fo$resource" "$root\driver\version.rc"
+    if ($LASTEXITCODE) { throw 'Driver version resource compilation failed.' }
+    & link.exe /NOLOGO /DRIVER /SUBSYSTEM:NATIVE,10.00 /ENTRY:GsDriverEntry /MACHINE:X64 /MANIFEST:NO /NODEFAULTLIB /INCREMENTAL:NO /INTEGRITYCHECK /DYNAMICBASE /NXCOMPAT /OPT:REF /OPT:ICF /DEBUG:FULL '/PDBALTPATH:%_PDB%' /RELEASE "/OUT:$dist\HyperVXNdisFilter.sys" "/PDB:$dist\HyperVXNdisFilter.pdb" $object $resource "$root\target\x86_64-pc-windows-msvc\release\hyperv_driver.lib" "$lib\ndis.lib" "$lib\netio.lib" "$lib\ntoskrnl.lib" "$lib\hal.lib" "$lib\BufferOverflowK.lib"
     if ($LASTEXITCODE) { throw 'Kernel image link failed.' }
     $cmake = Join-Path $vs 'Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe'
     $ninja = Join-Path $vs 'Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe'
@@ -50,10 +56,14 @@ try {
     if ($SkipMonitor) { & $cmake --build "$build\monitor" --target hyperv_xndis_filter_notify hyperv_Install hyperv_Uninstall }
     else { & $cmake --build "$build\monitor" }
     if ($LASTEXITCODE) { throw 'User-mode build failed.' }
-    Copy-Item "$build\monitor\HyperVXNdisFilterNotify.dll" $dist -Force
-    foreach ($tool in @('Install.exe', 'Uninstall.exe')) { Copy-Item (Join-Path "$build\monitor" $tool) $dist -Force }
+    foreach ($file in @('HyperVXNdisFilterNotify.dll', 'HyperVXNdisFilterNotify.pdb',
+                        'Install.exe', 'Install.pdb', 'Uninstall.exe', 'Uninstall.pdb')) {
+        Copy-Item (Join-Path "$build\monitor" $file) $dist -Force
+    }
     if (!$SkipMonitor) {
-        Copy-Item "$build\monitor\hyperv_monitor.exe" $dist -Force
+        foreach ($file in @('hyperv_monitor.exe', 'hyperv_monitor.pdb')) {
+            Copy-Item (Join-Path "$build\monitor" $file) $dist -Force
+        }
         if ($Test) {
             & (Join-Path (Split-Path $cmake -Parent) 'ctest.exe') --test-dir "$build\monitor" --output-on-failure
             if ($LASTEXITCODE) { throw 'Offline user-mode tests failed.' }
@@ -61,7 +71,7 @@ try {
     }
     Copy-Item "$root\install\HyperVXNdisFilter.inf" $dist -Force
     if ($CertificateThumbprint -and $PfxPath) { throw 'Choose a PFX or a certificate-store thumbprint, not both.' }
-    $signArgs = @('sign', '/fd', 'SHA256')
+    $signArgs = @('sign', '/fd', 'SHA256', '/tr', $TimestampUrl, '/td', 'SHA256')
     $sign = $CertificateThumbprint -or $PfxPath
     if ($PfxPath) {
         $PfxPath = (Resolve-Path -LiteralPath $PfxPath).Path
@@ -71,8 +81,8 @@ try {
     $signedFiles = @('HyperVXNdisFilter.sys', 'HyperVXNdisFilterNotify.dll', 'Install.exe', 'Uninstall.exe')
     if (!$SkipMonitor) { $signedFiles += 'hyperv_monitor.exe' }
     if ($sign) {
-        # Local signing only: no timestamp request, key copy, certificate import
-        # or boot/security policy change. The PFX remains at the supplied path.
+        # Timestamp requests send a hash to the selected RFC 3161 service. The
+        # PFX remains local; no key copy, certificate import or security change.
         foreach ($file in $signedFiles) {
             & "$bin\signtool.exe" @signArgs (Join-Path $dist $file)
             if ($LASTEXITCODE) { throw "Signing failed: $file" }
@@ -98,7 +108,7 @@ try {
         & "$bin\signtool.exe" @signArgs "$dist\HyperVXNdisFilter.cat"
         if ($LASTEXITCODE) { throw 'Catalog signing failed.' }
         foreach ($file in ($signedFiles + 'HyperVXNdisFilter.cat')) {
-            & "$bin\signtool.exe" verify /pa (Join-Path $dist $file)
+            & "$bin\signtool.exe" verify /pa /tw (Join-Path $dist $file)
             if ($LASTEXITCODE) { throw "Authenticode verification failed: $file (not a kernel admission test)." }
         }
         foreach ($file in @('HyperVXNdisFilter.sys', 'HyperVXNdisFilterNotify.dll', 'HyperVXNdisFilter.inf')) {
@@ -107,7 +117,8 @@ try {
         }
     }
     if ($Test) {
-        $env:RUSTFLAGS = ''
+        & "$root\scripts\tests\driver_version_tests.ps1" -DriverPath "$dist\HyperVXNdisFilter.sys"
+        $env:RUSTFLAGS = $null
         & cargo test --release -p hyperv-protocol -p hyperv-policy --locked
         if ($LASTEXITCODE) { throw 'Offline Rust tests failed.' }
     }
@@ -115,5 +126,6 @@ try {
     if (!$sign) { Write-Warning 'SYS, notify DLL, CAT and setup tools are unsigned. Driver package signatures must be trusted before installation.' }
 } finally {
     $env:RUSTFLAGS = $oldFlags
+    $env:CARGO_ENCODED_RUSTFLAGS = $oldEncodedFlags
     Set-Location $oldDir
 }

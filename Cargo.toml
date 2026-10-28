@@ -11,6 +11,15 @@ panic = "abort"
 lto = true
 codegen-units = 1
 opt-level = 2
+debug = "full"
+strip = "none"
+
+[profile.release.build-override]
+debug = "full"
 
 [profile.dev]
 panic = "abort"
+debug = "full"
+
+[profile.dev.build-override]
+debug = "full"

@@ -23,6 +23,7 @@ endif()
 foreach(tool IN ITEMS Install Uninstall)
     add_executable(hyperv_${tool} main.cpp)
     set_target_properties(hyperv_${tool} PROPERTIES OUTPUT_NAME ${tool}
+        PDB_NAME ${tool}
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
         MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
     target_link_libraries(hyperv_${tool} PRIVATE hyperv_xndis_filter_setup)

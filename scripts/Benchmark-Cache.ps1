@@ -32,7 +32,7 @@ try {
     Set-Location $root
     # Match release opt-level/LTO/codegen units, with the driver's no-redzone flag.
     # This builds only a user-mode benchmark, not a new kernel/package artifact.
-    $env:RUSTFLAGS = '-C no-redzone=yes -C debuginfo=2'
+    $env:RUSTFLAGS = '-C no-redzone=yes -C debuginfo=2 -C link-arg=/DEBUG:FULL -C link-arg=/PDBALTPATH:%_PDB%'
     $env:CARGO_ENCODED_RUSTFLAGS = $null
     & cargo build --release -p hyperv-policy --example cache_lookup_bench --locked
     if ($LASTEXITCODE) { throw 'Benchmark build failed.' }

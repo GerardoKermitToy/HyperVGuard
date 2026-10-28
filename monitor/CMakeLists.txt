@@ -5,6 +5,17 @@ if(NOT WIN32)
     message(FATAL_ERROR "HyperVXNdisFilter monitor targets Windows only.")
 endif()
 
+if(MSVC)
+    # Apply to every product, static library, example and offline test, including
+    # the setup subdirectory. Keep Release optimized despite enabling the linker
+    # debug option, which otherwise changes the default /OPT settings.
+    add_compile_options(/Zi)
+    add_link_options(/DEBUG:FULL "/PDBALTPATH:%_PDB%"
+        "$<$<NOT:$<CONFIG:Debug>>:/OPT:REF>"
+        "$<$<NOT:$<CONFIG:Debug>>:/OPT:ICF>")
+    set(CMAKE_PDB_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+endif()
+
 # Direct device access only. No transport subproject or installed driver is
 # required to build the monitor and offline tests.
 add_library(pmkext STATIC
@@ -50,6 +61,7 @@ add_library(hyperv_xndis_filter_notify SHARED
     ../install/notify/HyperVXNdisFilterNotify.def
 )
 set_target_properties(hyperv_xndis_filter_notify PROPERTIES OUTPUT_NAME HyperVXNdisFilterNotify
+    PDB_NAME HyperVXNdisFilterNotify
     MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 target_compile_features(hyperv_xndis_filter_notify PRIVATE cxx_std_20)
 target_compile_definitions(hyperv_xndis_filter_notify PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN)
@@ -124,4 +136,8 @@ if(BUILD_TESTING)
         COMMAND "${POWERSHELL_EXECUTABLE}" -NoProfile -NonInteractive -ExecutionPolicy Bypass
                 -File "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/tests/build_options_tests.ps1")
     set_tests_properties(build_options_tests PROPERTIES TIMEOUT 15 LABELS "no-driver")
+    add_test(NAME driver_version_tests
+        COMMAND "${POWERSHELL_EXECUTABLE}" -NoProfile -NonInteractive -ExecutionPolicy Bypass
+                -File "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/tests/driver_version_tests.ps1")
+    set_tests_properties(driver_version_tests PROPERTIES TIMEOUT 15 LABELS "no-driver")
 endif()

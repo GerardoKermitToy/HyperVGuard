@@ -33,7 +33,7 @@ $oldDir = Get-Location
 try {
     Set-Location $root
     # User-mode example only. No kernel/package build or installation occurs.
-    $env:RUSTFLAGS = '-C no-redzone=yes -C debuginfo=2'
+    $env:RUSTFLAGS = '-C no-redzone=yes -C debuginfo=2 -C link-arg=/DEBUG:FULL -C link-arg=/PDBALTPATH:%_PDB%'
     $env:CARGO_ENCODED_RUSTFLAGS = $null
     & cargo build --release -p hyperv-policy --example bandwidth_stats_bench --locked
     if ($LASTEXITCODE) { throw 'Bandwidth benchmark build failed.' }

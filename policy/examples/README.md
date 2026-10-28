@@ -43,7 +43,9 @@ not AVX/x87 or extra extended-state management. See the [Microsoft x64 WDM guida
 Use Git Bash in the repository root, with Rust's MSVC target and the Windows SDK
 available. The runner builds **release only**, signs the standalone benchmark
 using the supplied existing certificates, verifies its Authenticode signature,
-and runs it. It never imports/copies certificates or changes security settings.
+and runs it. Both benchmark runners retain full debug information and a matching
+PDB beside the executable under `target/release/examples/`, using `/DEBUG:FULL`
+and `/PDBALTPATH:%_PDB%`. They never import/copy certificates or change security settings.
 Use the signing inputs authorized for the local workspace; the paths below are
 placeholders, not bundled certificates.
 
@@ -116,7 +118,7 @@ unit, panic abort) plus the driver's `no-redzone` flag.
 The benchmark generator and container adapters also have offline regression tests (including disjoint datasets, the exact 90/10 mix, TTL behavior, and forced hash collisions):
 
 ```bash
-RUSTFLAGS="" cargo test --release -p hyperv-policy --example cache_lookup_bench --locked
+env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS cargo test --release -p hyperv-policy --example cache_lookup_bench --locked
 ```
 
 ## Interpretation and limits
@@ -160,11 +162,11 @@ original `indexed_pages_incremental` page-directory prototype remains a separate
 reference, not the integrated driver implementation.
 
 ```bash
-RUSTFLAGS="" cargo test --release -p hyperv-policy --example bandwidth_stats_bench --locked -- --test-threads=1
+env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS cargo test --release -p hyperv-policy --example bandwidth_stats_bench --locked -- --test-threads=1
 ```
 
 ```bash
-RUSTFLAGS="" cargo run --release -p hyperv-policy --example bandwidth_stats_bench --locked -- --records 1000000 --flows 250000 --rounds 5 --scenario realistic --out build/bandwidth-bench
+env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS cargo run --release -p hyperv-policy --example bandwidth_stats_bench --locked -- --records 1000000 --flows 250000 --rounds 5 --scenario realistic --out build/bandwidth-bench
 ```
 
 The default realistic dataset contains one million admitted TCP/UDP observations
