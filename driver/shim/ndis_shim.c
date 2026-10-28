@@ -608,26 +608,7 @@ static void Invalidate(HV_ADAPTER* a) {
     NdisReleaseRWLock(a->ClassificationLock, &state);
     HvDrain(); // No NDIS call under the classification/policy locks.
 }
-_Use_decl_annotations_
-NDIS_STATUS HvOid(NDIS_HANDLE context, PNDIS_OID_REQUEST r) {
-    HV_ADAPTER* a = context;
-    PNDIS_OID_REQUEST clone;
-    NDIS_STATUS status;
-    if (!ExAcquireRundownProtection(&a->OidRundown)) return NDIS_STATUS_CLOSING;
-    status = NdisAllocateCloneOidRequest(a->Filter, r, TAG, &clone);
-    if (status != NDIS_STATUS_SUCCESS) {ExReleaseRundownProtection(&a->OidRundown); return status;}
-    *(PVOID*)&clone->SourceReserved[0] = r;
-    status = NdisFOidRequest(a->Filter, clone);
-    if (status != NDIS_STATUS_PENDING) {
-        HvOidComplete(a, clone, status);
-        return (NDIS_STATUS)HvOidHandlerReturn(status);
-    }
-    return status;
-}
-_Use_decl_annotations_
-void HvOidComplete(NDIS_HANDLE context, PNDIS_OID_REQUEST clone, NDIS_STATUS status) {
-    HV_ADAPTER* a = context;
-    PNDIS_OID_REQUEST original = *(PVOID*)&clone->SourceReserved[0];
+static void HvOidCopyResult(PNDIS_OID_REQUEST original, PNDIS_OID_REQUEST clone) {
     switch (clone->RequestType) {
     case NdisRequestMethod:
         original->DATA.METHOD_INFORMATION.OutputBufferLength = clone->DATA.METHOD_INFORMATION.OutputBufferLength;
@@ -644,7 +625,34 @@ void HvOidComplete(NDIS_HANDLE context, PNDIS_OID_REQUEST clone, NDIS_STATUS sta
         original->DATA.QUERY_INFORMATION.BytesNeeded = clone->DATA.QUERY_INFORMATION.BytesNeeded;
         break;
     }
+}
+static PNDIS_OID_REQUEST HvOidFreeClone(HV_ADAPTER* a, PNDIS_OID_REQUEST clone) {
+    PNDIS_OID_REQUEST original = *(PVOID*)&clone->SourceReserved[0];
+    HvOidCopyResult(original, clone);
     NdisFreeCloneOidRequest(a->Filter, clone);
+    return original;
+}
+_Use_decl_annotations_
+NDIS_STATUS HvOid(NDIS_HANDLE context, PNDIS_OID_REQUEST r) {
+    HV_ADAPTER* a = context;
+    PNDIS_OID_REQUEST clone;
+    NDIS_STATUS status;
+    if (!ExAcquireRundownProtection(&a->OidRundown)) return NDIS_STATUS_CLOSING;
+    status = NdisAllocateCloneOidRequest(a->Filter, r, TAG, &clone);
+    if (status != NDIS_STATUS_SUCCESS) {ExReleaseRundownProtection(&a->OidRundown); return status;}
+    *(PVOID*)&clone->SourceReserved[0] = r;
+    status = NdisFOidRequest(a->Filter, clone);
+    if (status != NDIS_STATUS_PENDING) {
+        (void)HvOidFreeClone(a, clone);
+        ExReleaseRundownProtection(&a->OidRundown);
+        return (NDIS_STATUS)HvOidHandlerReturn(status);
+    }
+    return status;
+}
+_Use_decl_annotations_
+void HvOidComplete(NDIS_HANDLE context, PNDIS_OID_REQUEST clone, NDIS_STATUS status) {
+    HV_ADAPTER* a = context;
+    PNDIS_OID_REQUEST original = HvOidFreeClone(a, clone);
     NdisFOidRequestComplete(a->Filter, original, status);
     ExReleaseRundownProtection(&a->OidRundown);
 }
