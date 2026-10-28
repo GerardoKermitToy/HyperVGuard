@@ -44,6 +44,11 @@ static int HvClassifyAdmission(int admitted, int session) {
     (void)session;
     return admitted != 0;
 }
+// A synchronous lower OID completion is returned with that same status; it is
+// not converted into a second pending completion.
+static int HvOidHandlerReturn(int status) {
+    return status;
+}
 // Caller holds the adapter lock and adds the returned delta to the global count.
 static int HvSetFilterRunning(unsigned char* state, int running) {
     int previous = *state != 0;

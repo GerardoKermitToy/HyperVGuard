@@ -618,8 +618,11 @@ NDIS_STATUS HvOid(NDIS_HANDLE context, PNDIS_OID_REQUEST r) {
     if (status != NDIS_STATUS_SUCCESS) {ExReleaseRundownProtection(&a->OidRundown); return status;}
     *(PVOID*)&clone->SourceReserved[0] = r;
     status = NdisFOidRequest(a->Filter, clone);
-    if (status != NDIS_STATUS_PENDING) HvOidComplete(a, clone, status);
-    return NDIS_STATUS_PENDING;
+    if (status != NDIS_STATUS_PENDING) {
+        HvOidComplete(a, clone, status);
+        return (NDIS_STATUS)HvOidHandlerReturn(status);
+    }
+    return status;
 }
 _Use_decl_annotations_
 void HvOidComplete(NDIS_HANDLE context, PNDIS_OID_REQUEST clone, NDIS_STATUS status) {

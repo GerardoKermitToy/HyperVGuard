@@ -22,6 +22,10 @@ int main() {
     CHECK(HvClassifyAdmission(1, 0));
     CHECK(HvClassifyAdmission(1, 1));
     CHECK(!HvClassifyAdmission(0, 0));
+    // Synchronous OID forwarding returns the lower driver's status rather
+    // than reporting a second pending completion.
+    CHECK(HvOidHandlerReturn(0) == 0);
+    CHECK(HvOidHandlerReturn(-1) == -1);
 
     CHECK(!HvTargetMatches(0, 0));
     CHECK(!HvTargetMatches(0, 123));
