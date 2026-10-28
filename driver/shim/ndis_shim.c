@@ -49,7 +49,7 @@ extern void HvCleanCaches(void);
 extern void HvConnect(void);
 extern void HvDisconnect(void);
 extern void HvCancel(ULONG, ULONG_PTR);
-extern int HvClassify(ULONG_PTR, ULONG, ULONG, ULONG_PTR);
+extern int HvClassify(ULONG_PTR, ULONG, ULONG, ULONG_PTR, ULONG);
 extern void HvResourceDrop(void);
 extern ULONG HvRead(UCHAR*, ULONG);
 extern NTSTATUS HvWrite(const UCHAR*, ULONG);
@@ -526,13 +526,14 @@ static void ClassifyChain(HV_ADAPTER* a, PNET_BUFFER_LIST chain, NDIS_PORT_NUMBE
         chain = NET_BUFFER_LIST_NEXT_NBL(nbl);
         // RESOURCES originals and their chain must be unchanged at callback exit.
         if (!resources) NET_BUFFER_LIST_NEXT_NBL(nbl) = NULL;
-        if (admitted && session) {
+        if (HvClassifyAdmission(admitted, session)) {
             NdisAcquireRWLockRead(a->ClassificationLock, &state, 0);
             t = CreateToken(a, nbl, port, flags, direction, resources);
             if (t != NULL) {
                 ULONG_PTR cancel = direction == HV_DIRECTION_SEND ?
                     (ULONG_PTR)NDIS_GET_NET_BUFFER_LIST_CANCEL_ID(nbl) : 0;
-                result = HvClassify((ULONG_PTR)t, a->InterfaceIndex, direction, cancel);
+                result = HvClassify((ULONG_PTR)t, a->InterfaceIndex, direction, cancel,
+                    session ? 1u : 0u);
             }
             NdisReleaseRWLock(a->ClassificationLock, &state);
         }

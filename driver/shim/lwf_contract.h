@@ -38,6 +38,12 @@ static int HvSessionGateReopen(unsigned char* closed) {
     *closed = 0;
     return 1;
 }
+// A closed policy session selects Rust's immediate fallback mode; it does not
+// suppress packet parsing or the non-IP bypass while the LWF remains attached.
+static int HvClassifyAdmission(int admitted, int session) {
+    (void)session;
+    return admitted != 0;
+}
 // Caller holds the adapter lock and adds the returned delta to the global count.
 static int HvSetFilterRunning(unsigned char* state, int running) {
     int previous = *state != 0;

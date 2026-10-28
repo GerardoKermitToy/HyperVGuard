@@ -106,19 +106,20 @@ fn with_state<R>(f: impl FnOnce(&mut Engine) -> R) -> R {
         result
     }
 }
+fn finish_value(finish: Finish) -> u32 {
+    match finish {
+        Finish::Allow => 0,
+        Finish::Drop => 1,
+        Finish::Cancel => 2,
+    }
+}
+fn finish_code(finish: Finish) -> i32 {
+    finish_value(finish) as i32
+}
 fn finish(a: Action) {
     // SAFETY: claiming a pending entry transfers its one owned NBL token. The C
     // shim retains the filter module until its eventual completion/return.
-    unsafe {
-        hv_finish(
-            a.token,
-            match a.finish {
-                Finish::Allow => 0,
-                Finish::Drop => 1,
-                Finish::Cancel => 2,
-            },
-        )
-    }
+    unsafe { hv_finish(a.token, finish_value(a.finish)) }
 }
 // Old per-interface cache banks move out one at a time, keeping the kernel
 // stack fixed-size. No cache pool allocation/free occurs under PolicyLock.
@@ -273,7 +274,13 @@ fn capture_packet(nb: Handle, token: usize, packet: &Packet) -> Result<Option<Ve
 // releasing the per-module classification lock. No NDIS calls occur under the
 // global policy lock. Only the host interface index identifies the policy path.
 #[unsafe(no_mangle)]
-pub extern "C" fn HvClassify(token: usize, interface_index: u32, path: u32, cancel: usize) -> i32 {
+pub extern "C" fn HvClassify(
+    token: usize,
+    interface_index: u32,
+    path: u32,
+    cancel: usize,
+    session: u32,
+) -> i32 {
     let Some(path) = NdisPath::decode(path) else {
         with_state(|e| e.malformed());
         return 1;
@@ -349,18 +356,18 @@ pub extern "C" fn HvClassify(token: usize, interface_index: u32, path: u32, canc
         return 0;
     };
     packet.orient(path);
+    if session == 0 {
+        // The C shim can close the policy rundown while the LWF remains bound.
+        // Do not publish a pending event into a session that is being torn down;
+        // use the configured immediate fallback instead.
+        return with_state(|e| finish_code(e.fallback()));
+    }
     // Cancellation eligibility is NDIS ownership metadata, not verdict identity.
     let cancel = (path == NdisPath::Send).then_some(cancel);
     let wants_event =
         match with_state(|e| e.preflight(interface_index, &packet, token, unsafe { hv_now() })) {
             Ok(wants_event) => wants_event,
-            Err(action) => {
-                return match action.finish {
-                    Finish::Allow => 0,
-                    Finish::Drop => 1,
-                    Finish::Cancel => 2,
-                };
-            }
+            Err(action) => return finish_code(action.finish),
         };
     let record = if wants_event {
         match capture_packet(unsafe { hv_first_nb(token) }, token, &packet) {
@@ -384,11 +391,7 @@ pub extern "C" fn HvClassify(token: usize, interface_index: u32, path: u32, canc
         )
     }) {
         Submission::Pending(_) => -1,
-        Submission::Finish(a) => match a.finish {
-            Finish::Allow => 0,
-            Finish::Drop => 1,
-            Finish::Cancel => 2,
-        },
+        Submission::Finish(a) => finish_code(a.finish),
     }
 }
 #[unsafe(no_mangle)]

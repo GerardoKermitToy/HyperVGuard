@@ -17,6 +17,11 @@ int main() {
     CHECK(HvSessionGateClose(&session_closed) == 0 && session_closed == 1);
     CHECK(HvSessionGateReopen(&session_closed) == 1 && session_closed == 0);
     CHECK(HvSessionGateReopen(&session_closed) == 0 && session_closed == 0);
+    // A closed policy session selects Rust fallback mode; it must not suppress
+    // the parser/non-IP path while the adapter remains admitted.
+    CHECK(HvClassifyAdmission(1, 0));
+    CHECK(HvClassifyAdmission(1, 1));
+    CHECK(!HvClassifyAdmission(0, 0));
 
     CHECK(!HvTargetMatches(0, 0));
     CHECK(!HvTargetMatches(0, 123));
