@@ -1005,8 +1005,11 @@ NTSTATUS HvDispatch(PDEVICE_OBJECT device, PIRP irp) {
         // inline. Never touch it after successful insertion.
         IoMarkIrpPending(irp);
         status = IoCsqInsertIrpEx(&ReadCsq, irp, NULL, NULL);
-        if (!NT_SUCCESS(status)) CompleteRead(irp, status, 0);
-        else ScheduleRead();
+        if (!NT_SUCCESS(status)) {
+            CompleteRead(irp, status, 0);
+            return status;
+        }
+        ScheduleRead();
         return STATUS_PENDING;
     }
     irp->IoStatus.Status = status; irp->IoStatus.Information = transferred;
