@@ -721,6 +721,7 @@ static void CaptureRestartInfo(HV_ADAPTER* a, PNDIS_FILTER_RESTART_PARAMETERS p)
     a->Info.PhysicalMedium = physicalMedium;
     a->Info.LowerInterfaceIndex = lowerIndex;
     a->Info.LowerInterfaceLuid = lowerLuid;
+    HvClearGeneralAttributes(&a->Info);
     if (haveGeneral) {
         a->Info.Flags |= HV_ADAPTER_GENERAL_VALID;
         a->Info.Mtu = general.MtuSize;

@@ -48,6 +48,26 @@ typedef struct _HV_ADAPTER_INFO {
     uint16_t FilterModuleName[HV_ADAPTER_INFO_NAME_CAPACITY];
 } HV_ADAPTER_INFO;
 
+// A restart replaces the optional general-attributes snapshot. Clear every
+// value before applying the current restart's attributes so a missing entry
+// cannot leave old values marked as valid.
+static inline void HvClearGeneralAttributes(HV_ADAPTER_INFO* info) {
+    info->Flags &= ~HV_ADAPTER_GENERAL_VALID;
+    info->Mtu = 0;
+    info->MaxXmitLinkSpeed = 0;
+    info->MaxRcvLinkSpeed = 0;
+    info->LookaheadSize = 0;
+    info->MacOptions = 0;
+    info->SupportedPacketFilters = 0;
+    info->MaxMulticastListSize = 0;
+    info->AccessType = 0;
+    info->RestartFlags = 0;
+    info->ConnectionType = 0;
+    info->SupportedStatistics = 0;
+    info->DataBackFillSize = 0;
+    info->ContextBackFillSize = 0;
+}
+
 // Counted UTF-16 input; always terminate/zero the bounded destination and never
 // cut a surrogate pair at the truncation boundary. Returns the stored length.
 static inline uint32_t HvCopyAdapterName(uint16_t* out, const uint16_t* source,

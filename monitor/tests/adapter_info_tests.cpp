@@ -433,6 +433,21 @@ bool CheckNames() {
     return true;
 }
 
+bool CheckRestartGeneralReset() {
+    HV_ADAPTER_INFO info = Fixture();
+    const uint32_t preservedFlags = info.Flags & ~HV_ADAPTER_GENERAL_VALID;
+    // A later restart without general attributes must not publish the prior
+    // restart's values as current.
+    HvClearGeneralAttributes(&info);
+    CHECK(info.Flags == preservedFlags);
+    CHECK(info.Mtu == 0 && info.MaxXmitLinkSpeed == 0 && info.MaxRcvLinkSpeed == 0);
+    CHECK(info.LookaheadSize == 0 && info.MacOptions == 0 && info.SupportedPacketFilters == 0);
+    CHECK(info.MaxMulticastListSize == 0 && info.AccessType == 0 && info.RestartFlags == 0);
+    CHECK(info.ConnectionType == 0 && info.SupportedStatistics == 0);
+    CHECK(info.DataBackFillSize == 0 && info.ContextBackFillSize == 0);
+    return true;
+}
+
 bool CheckOutput() {
     using File = std::unique_ptr<FILE, decltype(&std::fclose)>;
     File file(std::fopen("adapter_info_tests.tmp", "w+b"), std::fclose);
@@ -465,7 +480,7 @@ bool CheckOutput() {
 
 int main() {
     if (!CheckRoundTrip() || !CheckMalformed() || !CheckHeaderBounds() || !CheckQueries() ||
-        !CheckNames() || !CheckOutput()) return 1;
+        !CheckNames() || !CheckRestartGeneralReset() || !CheckOutput()) return 1;
     std::puts("Adapter information codec/name/output tests passed (no driver).");
     return 0;
 }
