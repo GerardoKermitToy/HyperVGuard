@@ -292,8 +292,13 @@ pub extern "C" fn HvClassify(
         with_state(|e| e.malformed());
         return 1;
     }
+    // Parser scratch is nonpaged-heap-backed; packet-sized buffers must not use
+    // the kernel stack on the NDIS callback path.
+    let Some(mut bytes) = allocate_record(SNAPSHOT) else {
+        with_state(|e| e.resource_drop());
+        return 1;
+    };
     while !nb.is_null() {
-        let mut bytes = [0u8; SNAPSHOT];
         let (mut copied, mut trusted, mut frame_len, mut offload) = (0, 0, 0, 0);
         let ok = unsafe {
             hv_snapshot(
